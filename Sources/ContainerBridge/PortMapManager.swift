@@ -74,13 +74,32 @@ public actor PortMapManager {
             guard !bindings.isEmpty else { continue }
 
             // Parse port/protocol (e.g., "80/tcp" -> port=80, protocol="tcp")
+            // Docker may send just "80" without protocol - default to "tcp"
             let components = portProto.split(separator: "/")
-            guard components.count == 2,
-                  let containerPort = UInt16(components[0]) else {
+            let containerPort: UInt16
+            let proto: String
+
+            if components.count == 2 {
+                // Format: "port/protocol" (e.g., "80/tcp")
+                guard let port = UInt16(components[0]) else {
+                    logger.warning("Invalid port number", metadata: ["portProto": "\(portProto)"])
+                    continue
+                }
+                containerPort = port
+                proto = String(components[1])
+            } else if components.count == 1 {
+                // Format: "port" without protocol - default to tcp
+                guard let port = UInt16(components[0]) else {
+                    logger.warning("Invalid port number", metadata: ["portProto": "\(portProto)"])
+                    continue
+                }
+                containerPort = port
+                proto = "tcp"
+                logger.debug("Port without protocol, defaulting to tcp", metadata: ["port": "\(containerPort)"])
+            } else {
                 logger.warning("Invalid port/protocol format", metadata: ["portProto": "\(portProto)"])
                 continue
             }
-            let proto = String(components[1])
 
             // Process each binding for this port
             for binding in bindings {

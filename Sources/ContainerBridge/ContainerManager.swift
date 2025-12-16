@@ -66,6 +66,17 @@ public actor ContainerManager {
     // Layer unpacker for OverlayFS
     private var overlayUnpacker: OverlayFSUnpacker?
 
+    /// Configuration for a volume needing direct EXT4 mount
+    /// Used for local volumes that need POSIX compliance (Unix sockets, chmod, etc.)
+    /// Direct mount uses the existing writable.ext4 instead of OverlayFS to avoid nested overlay issues
+    private struct DirectMountConfig {
+        let volumeName: String     // Volume name - Go uses this to create directory
+        let targetPath: String     // Container path where EXT4 dir should be mounted
+    }
+
+    // Pending direct mounts that need to be set up after container starts
+    private var pendingDirectMounts: [String: [DirectMountConfig]] = [:]  // Docker ID -> Direct Mounts
+
     /// Configuration for a container whose .create() was deferred
     private struct DeferredContainerConfig {
         let image: Containerization.Image
@@ -101,6 +112,12 @@ public actor ContainerManager {
 
         // Health Check (Phase 6 - Task 6.2)
         let healthcheck: HealthConfig?
+
+        // Unix Socket Relays (k3d/kind support)
+        let socketConfigs: [Containerization.UnixSocketConfiguration]
+
+        // Extra block device for helper containers (stopped container filesystem access)
+        let extraBlockDevice: String?
     }
 
     /// Complete configuration for creating a native Container object
@@ -144,6 +161,12 @@ public actor ContainerManager {
         let privileged: Bool            // --privileged (grant all capabilities)
         let capAdd: [String]?           // --cap-add (add Linux capabilities)
         let capDrop: [String]?          // --cap-drop (drop Linux capabilities)
+
+        // Unix Socket Relays (k3d/kind support)
+        let socketConfigs: [Containerization.UnixSocketConfiguration]
+
+        // Extra block device for helper containers (stopped container filesystem access)
+        let extraBlockDevice: String?
     }
 
     /// Handles for an attached container (stdin/stdout/stderr streams)
@@ -342,14 +365,13 @@ public actor ContainerManager {
                 actualFinishedAt = containerData.finishedAt
             }
 
-            // Extract native ID from Docker ID FIRST
-            // Docker IDs are 64-char (doubled UUID): c93479e4...c93479e4...
-            // Native IDs are 32-char UUIDs: c93479e47c794541bd26d758b43497a0
-            // To reverse generateDockerID(), take first 32 chars
-            let nativeID = String(containerData.id.prefix(32))
+            // Native ID is the same as Docker ID for container storage paths
+            // We pass the full 64-char Docker ID to manager.create(), so containers
+            // are stored at ~/Library/Application Support/com.apple.containerization/containers/{dockerID}/
+            let nativeID = containerData.id
 
             let containerInfo = ContainerInfo(
-                nativeID: nativeID,  // Use extracted native ID, not Docker ID!
+                nativeID: nativeID,  // Same as Docker ID for storage path lookups
                 name: containerData.name,
                 image: containerData.image,
                 imageID: containerData.imageID,
@@ -588,11 +610,27 @@ public actor ContainerManager {
                 return nil
             }
 
-            // Apply name filter (partial match on container name)
+            // Apply name filter (supports regex patterns like Docker's API)
+            // Docker name filter supports regex: ^name$ for exact match, name for partial match
             if let nameFilters = filters["name"], !nameFilters.isEmpty {
                 let containerName = info.name ?? ""
+                // Docker's name filter is case-insensitive and supports regex
                 let matchesName = nameFilters.contains { filterName in
-                    containerName.contains(filterName)
+                    // Check if filter looks like a regex pattern (contains ^ or $)
+                    if filterName.contains("^") || filterName.contains("$") {
+                        // Use regex matching
+                        do {
+                            let regex = try NSRegularExpression(pattern: filterName, options: .caseInsensitive)
+                            let range = NSRange(containerName.startIndex..., in: containerName)
+                            return regex.firstMatch(in: containerName, options: [], range: range) != nil
+                        } catch {
+                            // If regex fails, fall back to substring match
+                            return containerName.lowercased().contains(filterName.lowercased())
+                        }
+                    } else {
+                        // Simple substring match (case insensitive like Docker)
+                        return containerName.lowercased().contains(filterName.lowercased())
+                    }
                 }
                 if !matchesName {
                     return nil
@@ -1349,6 +1387,40 @@ public actor ContainerManager {
                 ])
             }
 
+            // Configure extra block device mount (for helper containers)
+            // Share the writable.ext4 file via VirtioFS so the helper can loop-mount it
+            // We share the parent directory to allow access to the ext4 file
+            if let extraBlockDevice = config.extraBlockDevice {
+                // Share the directory containing writable.ext4 via VirtioFS
+                let extURL = URL(fileURLWithPath: extraBlockDevice)
+                let parentDir = extURL.deletingLastPathComponent().path
+                let fileName = extURL.lastPathComponent
+
+                let shareMount = Containerization.Mount.share(
+                    source: parentDir,
+                    destination: "/mnt/target-host",
+                    options: [],  // Read-write
+                    runtimeOptions: []
+                )
+                containerConfig.mounts.append(shareMount)
+                configLogger.info("Configured VirtioFS share for helper container block device", metadata: [
+                    "docker_id": "\(dockerID)",
+                    "source_dir": "\(parentDir)",
+                    "file_name": "\(fileName)",
+                    "destination": "/mnt/target-host"
+                ])
+            }
+
+            // Configure Unix socket relays (k3d/kind support)
+            // Uses Apple's UnixSocketConfiguration for vsock-based relay between host and guest
+            if !config.socketConfigs.isEmpty {
+                containerConfig.sockets.append(contentsOf: config.socketConfigs)
+                configLogger.info("Configured Unix socket relays for k3d/kind support", metadata: [
+                    "docker_id": "\(dockerID)",
+                    "socket_relay_count": "\(config.socketConfigs.count)"
+                ])
+            }
+
             // Configure memory limits (Phase 5 - Task 5.1)
             // Wire Docker API memory parameters to Apple's Containerization framework
             // The framework uses cgroup v2 for enforcement via Cgroup2Manager
@@ -1565,14 +1637,19 @@ public actor ContainerManager {
         // Health Check (Phase 6 - Task 6.2)
         healthcheck: HealthConfig? = nil,
         // Extra Hosts (Issue #34)
-        extraHosts: [String]? = nil
+        extraHosts: [String]? = nil,
+        // Extra block device for helper containers (stopped container filesystem access)
+        extraBlockDevice: String? = nil,
+        // Tmpfs mounts (k3d support)
+        tmpfs: [String: String]? = nil
     ) async throws -> String {
         logger.info("Creating container", metadata: [
             "image": "\(image)",
             "name": "\(name ?? "auto")",
             "attach": "\(attachStdin || attachStdout || attachStderr)",
             "tty": "\(tty)",
-            "mounts": "\(binds?.count ?? 0)"
+            "mounts": "\(binds?.count ?? 0)",
+            "networkMode_param": "\(networkMode ?? "nil")"
         ])
 
         // Generate Docker-compatible ID
@@ -1643,6 +1720,16 @@ public actor ContainerManager {
         let imageEntrypoint = imageConfig.config?.entrypoint ?? []
         let imageCmd = imageConfig.config?.cmd ?? []
 
+        // Extract image-defined volumes (VOLUME directives in Dockerfile)
+        // These become anonymous volumes unless overridden by user mounts
+        let imageVolumes = imageConfig.config?.volumes?.keys.map { String($0) } ?? []
+        if !imageVolumes.isEmpty {
+            logger.debug("Image defines volumes", metadata: [
+                "docker_id": "\(dockerID)",
+                "image_volumes": "\(imageVolumes.joined(separator: ", "))"
+            ])
+        }
+
         // Calculate effective command (matches Docker behavior and what actually gets executed)
         let effectiveEntrypoint = entrypoint ?? imageEntrypoint
         let effectiveCmd = command ?? imageCmd
@@ -1676,13 +1763,58 @@ public actor ContainerManager {
         }
 
         // Create anonymous volumes if specified
+        // Merge user-specified volumes with image-defined volumes (from VOLUME directives)
         var anonymousVolumeNames: [String] = []
         var effectiveBinds = binds ?? []
 
-        if let volumes = volumes, !volumes.isEmpty {
+        // Build set of paths already covered by user mounts
+        var coveredPaths: Set<String> = []
+
+        // Add paths from bind mounts (format: "source:target" or "source:target:ro")
+        for bind in effectiveBinds {
+            let parts = bind.split(separator: ":", maxSplits: 2)
+            if parts.count >= 2 {
+                coveredPaths.insert(String(parts[1]))
+            }
+        }
+
+        // Add paths from user-specified volumes
+        if let userVolumes = volumes {
+            for path in userVolumes.keys {
+                coveredPaths.insert(path)
+            }
+        }
+
+        // Add paths from tmpfs mounts
+        if let tmpfsMounts = tmpfs {
+            for path in tmpfsMounts.keys {
+                coveredPaths.insert(path)
+            }
+        }
+
+        // Merge user volumes with image-defined volumes (image volumes only if not covered)
+        var effectiveVolumes: [String: Any] = volumes ?? [:]
+        for imagePath in imageVolumes {
+            if !coveredPaths.contains(imagePath) {
+                effectiveVolumes[imagePath] = [:]
+                logger.debug("Adding image-defined volume", metadata: [
+                    "docker_id": "\(dockerID)",
+                    "path": "\(imagePath)"
+                ])
+            } else {
+                logger.debug("Image-defined volume path already covered by user mount", metadata: [
+                    "docker_id": "\(dockerID)",
+                    "path": "\(imagePath)"
+                ])
+            }
+        }
+
+        if !effectiveVolumes.isEmpty {
             logger.info("Creating anonymous volumes", metadata: [
                 "docker_id": "\(dockerID)",
-                "volume_count": "\(volumes.count)"
+                "volume_count": "\(effectiveVolumes.count)",
+                "user_volumes": "\(volumes?.count ?? 0)",
+                "image_volumes": "\(imageVolumes.count)"
             ])
 
             guard let volumeManager = volumeManager else {
@@ -1690,7 +1822,7 @@ public actor ContainerManager {
                 throw ContainerManagerError.volumeManagerNotAvailable
             }
 
-            for (containerPath, _) in volumes {
+            for (containerPath, _) in effectiveVolumes {
                 // Create anonymous volume with auto-generated name
                 let volumeMetadata = try await volumeManager.createVolume(
                     name: nil,  // Auto-generate name
@@ -1712,118 +1844,125 @@ public actor ContainerManager {
             }
         }
 
-        // Parse bind mounts and named volumes (includes file bind mount handling)
-        let mounts = try await parseVolumeMounts(effectiveBinds, dockerID: dockerID)
-        if !mounts.isEmpty {
+        // Parse bind mounts and named volumes (includes file bind mount handling and socket detection)
+        var (mounts, socketConfigs, directMounts) = try await parseVolumeMounts(effectiveBinds, dockerID: dockerID)
+        if !mounts.isEmpty || !socketConfigs.isEmpty || !directMounts.isEmpty {
             logger.info("Container has volume mounts", metadata: [
                 "docker_id": "\(dockerID)",
-                "mount_count": "\(mounts.count)"
+                "mount_count": "\(mounts.count)",
+                "socket_relay_count": "\(socketConfigs.count)",
+                "direct_mount_count": "\(directMounts.count)"
             ])
         }
 
-        // For attached containers (docker run -it), defer container creation until start
-        // This allows us to configure stdio with attach handles when they're provided
-        let isAttached = (attachStdin || attachStdout || attachStderr) && openStdin
-        let shouldDeferCreate = isAttached
-
-        let nativeID: String
-        let linuxContainer: LinuxContainer?
-
-        if shouldDeferCreate {
-            // Deferred containers: Don't create LinuxContainer yet
-            logger.info("Deferring container creation for attached container", metadata: [
+        // Store pending direct mounts for post-start setup
+        if !directMounts.isEmpty {
+            pendingDirectMounts[dockerID] = directMounts
+            logger.debug("Stored pending direct mounts", metadata: [
                 "docker_id": "\(dockerID)",
-                "hostname": "\(containerName)"
+                "count": "\(directMounts.count)"
             ])
+        }
 
-            // Store deferred config for later use during start
-            // Hostname priority: user-specified (non-empty) > first 12 chars of container ID (Docker default)
-            // Note: Docker CLI sends empty string "" when hostname not specified, not nil
-            let effectiveHostname = (hostname?.isEmpty == false) ? hostname! : String(dockerID.prefix(12))
-            deferredConfigs[dockerID] = DeferredContainerConfig(
-                image: containerImage,
-                entrypoint: entrypoint,
-                command: command,
-                env: env,
-                workingDir: workingDir,
-                hostname: effectiveHostname,
-                mounts: mounts,  // Store mounts for deferred creation
-                // Memory Limits (Phase 5 - Task 5.1)
-                memory: memory,
-                memoryReservation: memoryReservation,
-                memorySwap: memorySwap,
-                memorySwappiness: memorySwappiness,
-                // CPU Limits (Phase 5 - Task 5.2)
-                nanoCpus: nanoCpus,
-                cpuShares: cpuShares,
-                cpuPeriod: cpuPeriod,
-                cpuQuota: cpuQuota,
-                cpusetCpus: cpusetCpus,
-                cpusetMems: cpusetMems,
-                // User/UID Support (Phase 5 - Task 5.3)
-                user: user,
-                groupAdd: groupAdd,
-                // Security Capabilities (Phase 5 - Task 5.5)
-                privileged: privileged,
-                capAdd: capAdd,
-                capDrop: capDrop,
-                // Health Check (Phase 6 - Task 6.2)
-                healthcheck: healthcheck
-            )
+        // Process tmpfs mounts (k3d support)
+        // Docker format: {"container_path": "options"} e.g., {"/run": "", "/var/run": "size=123"}
+        if let tmpfsMounts = tmpfs {
+            for (containerPath, options) in tmpfsMounts {
+                // Parse options string into array (comma-separated)
+                var mountOptions: [String] = ["noexec", "nosuid", "nodev"]  // Default tmpfs options
+                if !options.isEmpty {
+                    mountOptions = options.split(separator: ",").map { String($0) }
+                }
 
-            // Use Docker ID as native ID for deferred containers
-            // The actual LinuxContainer will be created during start
-            nativeID = dockerID
-            linuxContainer = nil
-        } else {
-            // Non-deferred containers: Create LinuxContainer immediately using helper
-            // Use broadcast writers to support dynamic attach
-            // Hostname priority: user-specified (non-empty) > first 12 chars of container ID (Docker default)
-            // Note: Docker CLI sends empty string "" when hostname not specified, not nil
-            let effectiveHostname = (hostname?.isEmpty == false) ? hostname! : String(dockerID.prefix(12))
-            let container = try await createNativeContainer(
-                config: NativeContainerConfig(
-                    dockerID: dockerID,
-                    image: containerImage,
-                    entrypoint: entrypoint,
-                    command: command,
-                    env: env,
-                    workingDir: workingDir,
-                    hostname: effectiveHostname,
-                    tty: tty,
-                    stdoutWriter: stdoutBroadcast,
-                    stderrWriter: stderrBroadcast,
-                    stdinReader: nil,  // Not attached
-                    mounts: mounts,
-                    overlayConfig: nil,  // Will be unpacked in createNativeContainer
-                    networkMode: networkMode,
-                    labels: labels ?? [:],
-                    memory: memory,
-                    memoryReservation: memoryReservation,
-                    memorySwap: memorySwap,
-                    memorySwappiness: memorySwappiness,
-                    nanoCpus: nanoCpus,
-                    cpuShares: cpuShares,
-                    cpuPeriod: cpuPeriod,
-                    cpuQuota: cpuQuota,
-                    cpusetCpus: cpusetCpus,
-                    cpusetMems: cpusetMems,
-                    user: user,
-                    groupAdd: groupAdd,
-                    privileged: privileged,
-                    capAdd: capAdd,
-                    capDrop: capDrop
+                // Create tmpfs mount
+                let tmpfsMount = Containerization.Mount.any(
+                    type: "tmpfs",
+                    source: "tmpfs",
+                    destination: containerPath,
+                    options: mountOptions
                 )
-            )
+                mounts.append(tmpfsMount)
 
-            nativeID = container.id
-            linuxContainer = container
+                logger.info("Added tmpfs mount", metadata: [
+                    "docker_id": "\(dockerID)",
+                    "container_path": "\(containerPath)",
+                    "options": "\(mountOptions)"
+                ])
+            }
         }
 
-        // Store the native container object for later operations (if created)
-        if let container = linuxContainer {
-            nativeContainers[dockerID] = container
+        // Create writable filesystem early (before deferring LinuxContainer creation)
+        // This is needed for docker cp to work on never-started containers
+        // The writable.ext4 must exist before docker cp tries to write to it
+        let appleStorePath = NSString(string: "~/Library/Application Support/com.apple.containerization").expandingTildeInPath
+        let containerRoot = URL(fileURLWithPath: appleStorePath).appendingPathComponent("containers")
+        let containerPath = containerRoot.appendingPathComponent(dockerID)
+
+        // Ensure container directory exists
+        try FileManager.default.createDirectory(at: containerPath, withIntermediateDirectories: true)
+
+        // Create writable filesystem if it doesn't exist
+        let writablePath = containerPath.appendingPathComponent("writable.ext4")
+        if !FileManager.default.fileExists(atPath: writablePath.path) {
+            let mounter = OverlayFSMounter(logger: logger)
+            // 64 GB provides sufficient space for build caches and large workloads
+            // Thin-provisioned (sparse file) so only actual data consumes disk space
+            try mounter.createWritableFilesystem(at: writablePath.path, sizeMB: 65536)
+            logger.info("Created writable filesystem during docker create", metadata: [
+                "docker_id": "\(dockerID)",
+                "path": "\(writablePath.path)"
+            ])
         }
+
+        // Always defer LinuxContainer creation until docker start
+        // This ensures docker cp changes made between docker create and docker start are visible
+        // The writable.ext4 is already created above, so docker cp will work
+        logger.info("Deferring LinuxContainer creation until docker start", metadata: [
+            "docker_id": "\(dockerID)",
+            "container_name": "\(containerName)"
+        ])
+
+        // Store deferred config for later use during start
+        // Hostname priority: user-specified (non-empty) > first 12 chars of container ID (Docker default)
+        // Note: Docker CLI sends empty string "" when hostname not specified, not nil
+        let effectiveHostname = (hostname?.isEmpty == false) ? hostname! : String(dockerID.prefix(12))
+        deferredConfigs[dockerID] = DeferredContainerConfig(
+            image: containerImage,
+            entrypoint: entrypoint,
+            command: command,
+            env: env,
+            workingDir: workingDir,
+            hostname: effectiveHostname,
+            mounts: mounts,  // Store mounts for deferred creation
+            // Memory Limits (Phase 5 - Task 5.1)
+            memory: memory,
+            memoryReservation: memoryReservation,
+            memorySwap: memorySwap,
+            memorySwappiness: memorySwappiness,
+            // CPU Limits (Phase 5 - Task 5.2)
+            nanoCpus: nanoCpus,
+            cpuShares: cpuShares,
+            cpuPeriod: cpuPeriod,
+            cpuQuota: cpuQuota,
+            cpusetCpus: cpusetCpus,
+            cpusetMems: cpusetMems,
+            // User/UID Support (Phase 5 - Task 5.3)
+            user: user,
+            groupAdd: groupAdd,
+            // Security Capabilities (Phase 5 - Task 5.5)
+            privileged: privileged,
+            capAdd: capAdd,
+            capDrop: capDrop,
+            // Health Check (Phase 6 - Task 6.2)
+            healthcheck: healthcheck,
+            // Unix Socket Relays (k3d/kind support)
+            socketConfigs: socketConfigs,
+            // Extra block device for helper containers
+            extraBlockDevice: extraBlockDevice
+        )
+
+        // Use Docker ID as native ID - the actual LinuxContainer will be created during start
+        let nativeID = dockerID
 
         // Register ID mapping
         registerIDMapping(dockerID: dockerID, nativeID: nativeID)
@@ -1874,6 +2013,7 @@ public actor ContainerManager {
                 cmd: effectiveCmd,  // Use effective cmd (request.cmd ?? image.cmd)
                 image: image,
                 workingDir: workingDir ?? "",
+                entrypoint: effectiveEntrypoint,  // Store effective entrypoint for container restart
                 labels: labels ?? [:],
                 healthcheck: healthcheck
             ),
@@ -1883,7 +2023,7 @@ public actor ContainerManager {
             startedAt: nil,
             finishedAt: nil,
             tty: tty,
-            needsCreate: shouldDeferCreate,
+            needsCreate: true,  // Always defer LinuxContainer creation to docker start
             networkAttachments: [:],  // Start with no network attachments
             anonymousVolumes: anonymousVolumeNames,  // Track anonymous volumes for cleanup
             initialNetworkUserIP: initialNetworkUserIP,  // User-specified IP for initial network
@@ -1996,6 +2136,77 @@ public actor ContainerManager {
         stderrBroadcast.addSubscriber(handles.stderr)
     }
 
+    // MARK: - Helper Container Support
+
+    /// Create a helper container for filesystem operations on stopped containers
+    /// Helper containers mount the target container's writable.ext4 and image layers to set up OverlayFS
+    public func createHelperContainer(
+        name: String,
+        image: String,
+        targetWritablePath: String,
+        targetImageRef: String?,
+        layerPaths: [String],  // Paths to image layer.ext4 files for OverlayFS lower layers
+        isHelper: Bool
+    ) async throws -> String {
+        logger.info("Creating helper container", metadata: [
+            "name": "\(name)",
+            "image": "\(image)",
+            "target_writable": "\(targetWritablePath)",
+            "layer_count": "\(layerPaths.count)"
+        ])
+
+        // Helper containers have special labels to identify them and enable filtering
+        var labels = [String: String]()
+        labels["com.arca.internal"] = "helper"
+        labels["com.arca.helper.target_writable"] = targetWritablePath
+        if let targetImage = targetImageRef {
+            labels["com.arca.helper.target_image"] = targetImage
+        }
+
+        // Build bind mounts for helper:
+        // - Target container's directory (contains writable.ext4 with upper/work)
+        // - Each image layer directory (contains layer.ext4)
+        let targetDir = URL(fileURLWithPath: targetWritablePath).deletingLastPathComponent().path
+        var binds = ["\(targetDir):/mnt/target-host"]
+
+        // Add layer mounts - each layer directory contains layer.ext4
+        // Mount at /mnt/layers/0, /mnt/layers/1, etc.
+        for (index, layerPath) in layerPaths.enumerated() {
+            let layerDir = URL(fileURLWithPath: layerPath).deletingLastPathComponent().path
+            binds.append("\(layerDir):/mnt/layers/\(index):ro")
+        }
+
+        logger.debug("Helper container bind mounts", metadata: [
+            "binds": "\(binds.joined(separator: ", "))"
+        ])
+
+        // Create container with helper labels
+        // The helper runs a simple sleep command to keep it alive while we perform operations
+        // Use networkMode: "none" - helpers don't need networking
+        // Use privileged: true - helpers need losetup and mount for block device/overlayfs access
+        let helperID = try await createContainer(
+            image: image,
+            name: name,
+            entrypoint: ["/bin/sh", "-c"],
+            command: ["sleep infinity"],
+            env: nil,
+            workingDir: nil,
+            labels: labels,
+            tty: false,
+            networkMode: "none",
+            binds: binds,
+            privileged: true
+        )
+
+        logger.info("Helper container created", metadata: [
+            "id": "\(helperID)",
+            "name": "\(name)",
+            "layer_count": "\(layerPaths.count)"
+        ])
+
+        return helperID
+    }
+
     // MARK: - Container Lifecycle
 
     /// Start a container
@@ -2083,7 +2294,11 @@ public actor ContainerManager {
                     // Security Capabilities (Phase 5 - Task 5.5)
                     privileged: config.privileged,
                     capAdd: config.capAdd,
-                    capDrop: config.capDrop
+                    capDrop: config.capDrop,
+                    // Unix Socket Relays (k3d/kind support)
+                    socketConfigs: config.socketConfigs,
+                    // Extra block device for helper containers
+                    extraBlockDevice: config.extraBlockDevice
                 )
             )
 
@@ -2173,8 +2388,17 @@ public actor ContainerManager {
                     broadcastWriters[dockerID] = (stdoutBroadcast, stderrBroadcast)
                 }
 
-                // Parse volume mounts from persisted binds (includes both bind mounts and named volumes)
-                let recreatedMounts = try await parseVolumeMounts(info.hostConfig.binds, dockerID: dockerID)
+                // Parse volume mounts from persisted binds (includes both bind mounts, named volumes, and socket relays)
+                let (recreatedMounts, recreatedSocketConfigs, recreatedDirectMounts) = try await parseVolumeMounts(info.hostConfig.binds, dockerID: dockerID)
+
+                // Store pending direct mounts for post-start setup
+                if !recreatedDirectMounts.isEmpty {
+                    pendingDirectMounts[dockerID] = recreatedDirectMounts
+                    logger.debug("Stored pending direct mounts for recreated container", metadata: [
+                        "docker_id": "\(dockerID)",
+                        "count": "\(recreatedDirectMounts.count)"
+                    ])
+                }
 
                 // Resolve command and entrypoint: use persisted if provided, otherwise use image defaults
                 // Empty array means "no override, use image defaults" in Docker semantics
@@ -2217,7 +2441,11 @@ public actor ContainerManager {
                         // Security Capabilities (Phase 5 - Task 5.5)
                         privileged: info.hostConfig.privileged,
                         capAdd: !info.hostConfig.capAdd.isEmpty ? info.hostConfig.capAdd : nil,
-                        capDrop: !info.hostConfig.capDrop.isEmpty ? info.hostConfig.capDrop : nil
+                        capDrop: !info.hostConfig.capDrop.isEmpty ? info.hostConfig.capDrop : nil,
+                        // Unix Socket Relays (k3d/kind support)
+                        socketConfigs: recreatedSocketConfigs,
+                        // Extra block device - nil for recreated containers (helper containers are ephemeral)
+                        extraBlockDevice: nil
                     )
                 )
 
@@ -2263,6 +2491,48 @@ public actor ContainerManager {
         logger.debug("Created FilesystemClient", metadata: ["container": "\(dockerID)"])
 
         // ===================================================================================
+        // DIRECT EXT4 MOUNT SETUP - Create bind mounts for named volumes (local driver)
+        // Direct EXT4 bind mounts are created on /dev/vdb (writable.ext4) and bind mounted
+        // to the container path. This provides full POSIX compliance and allows nested overlays.
+        // ===================================================================================
+        if let directMounts = pendingDirectMounts.removeValue(forKey: dockerID) {
+            logger.info("Setting up direct EXT4 mounts", metadata: [
+                "container": "\(dockerID)",
+                "count": "\(directMounts.count)"
+            ])
+
+            for mount in directMounts {
+                do {
+                    logger.debug("Creating direct mount", metadata: [
+                        "container": "\(dockerID)",
+                        "volumeName": "\(mount.volumeName)",
+                        "targetPath": "\(mount.targetPath)"
+                    ])
+
+                    try await filesystemClient.createDirectMount(
+                        volumeName: mount.volumeName,
+                        target: mount.targetPath
+                    )
+
+                    logger.info("Direct mount created", metadata: [
+                        "container": "\(dockerID)",
+                        "targetPath": "\(mount.targetPath)"
+                    ])
+                } catch {
+                    logger.error("Failed to create direct mount", metadata: [
+                        "container": "\(dockerID)",
+                        "targetPath": "\(mount.targetPath)",
+                        "error": "\(error)"
+                    ])
+                    throw error
+                }
+            }
+        }
+
+        // Note: Archives are now written directly to stopped containers via HelperContainerManager
+        // No staging mechanism needed - files are already in place before container starts
+
+        // ===================================================================================
         // NETWORK SETUP - Creates namespace at /run/netns/arca-{shortID}
         // This MUST complete before start() so vmexec can join the namespace
         // ===================================================================================
@@ -2271,19 +2541,24 @@ public actor ContainerManager {
             "container": "\(dockerID)"
         ])
 
+        // Query database for persisted network attachments (source of truth)
+        // This avoids in-memory sync issues where containers[dockerID] might have stale networkAttachments
+        let persistedAttachments = try await stateStore.loadNetworkAttachments(containerID: dockerID)
+        let hasPersistedAttachments = !persistedAttachments.isEmpty
+
         // DEBUG: Log network attachment state before attachment logic
         logger.debug("Network attachment state before attachment logic", metadata: [
             "container": "\(dockerID)",
-            "networkAttachments_isEmpty": "\(info.networkAttachments.isEmpty)",
-            "networkAttachments_count": "\(info.networkAttachments.count)",
-            "networkAttachments_keys": "\(info.networkAttachments.keys.joined(separator: ", "))",
+            "persistedAttachments_count": "\(persistedAttachments.count)",
+            "persistedAttachments_networks": "\(persistedAttachments.map { $0.networkID }.joined(separator: ", "))",
+            "inMemory_networkAttachments_count": "\(info.networkAttachments.count)",
             "networkMode": "\(info.hostConfig.networkMode)"
         ])
 
-        // Auto-attach to network based on networkMode if no networks are attached
+        // Auto-attach to network based on networkMode if no networks are attached in database
         // Docker CLI sets networkMode in HostConfig and expects the daemon to handle attachment
         if let networkManager = networkManager,
-           info.networkAttachments.isEmpty {
+           !hasPersistedAttachments {
             let networkMode = info.hostConfig.networkMode
 
             // Only auto-attach if networkMode is not "none" or "host"
@@ -2372,21 +2647,21 @@ public actor ContainerManager {
                 ])
             }
         } else if let networkManager = networkManager,
-                  !info.networkAttachments.isEmpty {
-            // Container has persisted network attachments - restore them
-            logger.info("🔵 NETWORK RESTORATION: Restoring persisted network attachments", metadata: [
+                  hasPersistedAttachments {
+            // Container has persisted network attachments in database - restore them
+            logger.info("🔵 NETWORK RESTORATION: Restoring persisted network attachments from database", metadata: [
                 "container": "\(dockerID)",
-                "attachmentCount": "\(info.networkAttachments.count)"
+                "attachmentCount": "\(persistedAttachments.count)"
             ])
 
             let containerName = info.name ?? String(dockerID.prefix(12))
 
-            for (networkID, attachment) in info.networkAttachments {
+            for attachment in persistedAttachments {
                 do {
                     logger.debug("Restoring network attachment", metadata: [
                         "container": "\(dockerID)",
-                        "network": "\(networkID)",
-                        "ip": "\(attachment.ip)"
+                        "network": "\(attachment.networkID)",
+                        "ip": "\(attachment.ipAddress)"
                     ])
 
                     // Reattach to the network with the persisted IP address
@@ -2394,23 +2669,23 @@ public actor ContainerManager {
                     let newAttachment = try await networkManager.attachContainerToNetwork(
                         containerID: dockerID,
                         container: nativeContainer,
-                        networkID: networkID,
+                        networkID: attachment.networkID,
                         containerName: containerName,
                         aliases: attachment.aliases,
-                        userSpecifiedIP: attachment.ip,  // Reuse persisted IP for restoration
+                        userSpecifiedIP: attachment.ipAddress,  // Reuse persisted IP for restoration
                         extraHosts: info.hostConfig.extraHosts  // Pass extra hosts for DNS resolution (Issue #34)
                     )
 
                     logger.info("Network attachment restored successfully", metadata: [
                         "container": "\(dockerID)",
-                        "network": "\(networkID)",
+                        "network": "\(attachment.networkID)",
                         "ip": "\(newAttachment.ip)"
                     ])
                 } catch {
                     // Log the error but continue with other attachments
                     logger.error("Failed to restore network attachment", metadata: [
                         "container": "\(dockerID)",
-                        "network": "\(networkID)",
+                        "network": "\(attachment.networkID)",
                         "error": "\(error)"
                     ])
                 }
@@ -2421,8 +2696,9 @@ public actor ContainerManager {
         await pushDNSTopologyUpdate(to: dockerID)
 
         // Push DNS topology to all other containers on the same networks (to add this container)
-        for networkID in info.networkAttachments.keys {
-            await pushDNSTopologyToNetwork(networkID: networkID)
+        // Use persisted attachments from database as source of truth
+        for attachment in persistedAttachments {
+            await pushDNSTopologyToNetwork(networkID: attachment.networkID)
         }
 
         // Publish ports if configured (Phase 4.1)
@@ -2473,6 +2749,57 @@ public actor ContainerManager {
                     // Don't fail container start on port mapping errors
                 }
             }
+        }
+
+        // ===================================================================================
+        // GENERATE /etc/hosts FILE - Docker generates this file; we need to do the same
+        // Must happen before start() while we still have access to modify the rootfs
+        // ===================================================================================
+        do {
+            // Re-fetch updated container info after network attachment (may have new IP)
+            guard let updatedInfo = containers[dockerID] else {
+                logger.warning("Container disappeared during /etc/hosts generation", metadata: ["container": "\(dockerID)"])
+                return
+            }
+
+            // Get container's IP address from first network attachment
+            let containerIP = updatedInfo.networkAttachments.values.first?.ip ?? ""
+
+            // Get hostname: use configured hostname or short container ID
+            let hostname = info.config.hostname.isEmpty ? String(dockerID.prefix(12)) : info.config.hostname
+
+            // Get container name (without leading slash)
+            let containerName = (info.name ?? String(dockerID.prefix(12))).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+            // Get extra hosts from hostConfig
+            let extraHosts = info.hostConfig.extraHosts
+
+            logger.debug("Generating /etc/hosts file", metadata: [
+                "container": "\(dockerID)",
+                "hostname": "\(hostname)",
+                "ip": "\(containerIP)",
+                "name": "\(containerName)",
+                "extraHostsCount": "\(extraHosts.count)"
+            ])
+
+            try await filesystemClient.generateHostsFile(
+                hostname: hostname,
+                ipAddress: containerIP,
+                containerName: containerName,
+                extraHosts: extraHosts
+            )
+
+            logger.info("/etc/hosts file generated", metadata: [
+                "container": "\(dockerID)",
+                "hostname": "\(hostname)",
+                "ip": "\(containerIP)"
+            ])
+        } catch {
+            // Log error but don't fail container start - /etc/hosts is nice to have but not critical
+            logger.warning("Failed to generate /etc/hosts file", metadata: [
+                "container": "\(dockerID)",
+                "error": "\(error)"
+            ])
         }
 
         // ===================================================================================
@@ -2573,7 +2900,10 @@ public actor ContainerManager {
                     exitCode: Int(exitStatus.exitCode)
                 )
             } catch {
-                logger.warning("Background monitor: error waiting for container", metadata: [
+                // Error waiting for container - this typically means the VM crashed
+                // (e.g., kernel panic) and the vsock connection dropped.
+                // Treat this as an abnormal exit and trigger restart policy.
+                logger.warning("Background monitor: VM appears to have crashed", metadata: [
                     "id": "\(dockerID)",
                     "error": "\(error)"
                 ])
@@ -2589,7 +2919,24 @@ public actor ContainerManager {
                     attach.exitSignal.finish()
                 }
 
-                await self?.cleanupMonitoringTask(dockerID: dockerID)
+                // Try to clean up the crashed VM resources
+                // This may fail if the VM is already gone, but that's fine
+                do {
+                    try await nativeContainer.stop()
+                    logger.debug("Background monitor: cleaned up crashed VM", metadata: ["id": "\(dockerID)"])
+                } catch {
+                    logger.debug("Background monitor: VM cleanup failed (already gone?)", metadata: [
+                        "id": "\(dockerID)",
+                        "error": "\(error)"
+                    ])
+                }
+
+                // Update state and trigger restart policy
+                // Exit code 137 = killed by SIGKILL (appropriate for VM crash)
+                await self?.updateContainerStateAfterExit(
+                    dockerID: dockerID,
+                    exitCode: 137
+                )
             }
         }
 
@@ -3598,6 +3945,44 @@ public actor ContainerManager {
         return containers[dockerID]?.state == "running"
     }
 
+    /// Get container's image reference (for HelperContainerManager to mount layers)
+    public func getContainerImageRef(dockerID: String) async -> String? {
+        return containers[dockerID]?.image
+    }
+
+    /// Get layer paths for a container's image (for HelperContainerManager OverlayFS setup)
+    /// Returns array of layer.ext4 paths from the shared layer cache
+    public func getImageLayerPaths(imageRef: String) async throws -> [String] {
+        // Get image from ImageManager
+        let image = try await imageManager.getImage(nameOrId: imageRef)
+
+        // Get platform
+        let systemPlatform = detectSystemPlatform()
+        let imagePlatform = systemPlatform.ociPlatform()
+
+        // Unpack to get layer config (uses cache, so fast if already unpacked)
+        guard let unpacker = overlayUnpacker else {
+            throw ContainerManagerError.notInitialized
+        }
+
+        // We need to get the layer paths from the cache
+        // The OverlayFSUnpacker stores layers in ~/.arca/layers/{digest}/layer.ext4
+        // We need to unpack to get the paths (uses cache so this is fast)
+        // Create a temp directory for unpacking - we only need the layer paths
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let config = try await unpacker.unpack(image, for: imagePlatform, at: tempDir)
+
+        // Extract layer paths from the config
+        return config.lowerLayers.map { $0.path }
+    }
+
+    /// Get layer cache base path
+    public func getLayerCachePath() -> String {
+        return NSString(string: "~/.arca/layers").expandingTildeInPath
+    }
+
     /// Check if container should continue streaming logs
     /// Returns true for non-terminal states (created, running, restarting, paused)
     /// Returns false for terminal states (exited, dead, removing) or if container doesn't exist
@@ -3635,6 +4020,12 @@ public actor ContainerManager {
         return nativeContainers[dockerID]
     }
 
+    /// Get the native (Apple Containerization) ID for a Docker ID
+    /// Used by HelperContainerManager to locate container storage paths
+    public func getNativeID(forDockerID dockerID: String) -> String? {
+        return idMapping[dockerID]
+    }
+
     // MARK: - Volume/Mount Helpers
 
     /// Parse Docker volume mount strings into Containerization.Mount objects
@@ -3646,11 +4037,21 @@ public actor ContainerManager {
     /// - Parent directory is mounted to unique location (/mnt/arca-file-mounts/<hash>/)
     /// - VirtioFS mounts are deduplicated (same parent dir = one VirtioFS mount)
     /// - VirtioFS mounts are collected first, then bind mounts are added after
-    /// Returns: mounts array
-    private func parseVolumeMounts(_ binds: [String]?, dockerID: String) async throws -> [Containerization.Mount] {
+    ///
+    /// For Unix socket bind mounts (e.g., Docker socket for k3d/kind):
+    /// - VirtioFS cannot relay socket connections
+    /// - Uses Apple's UnixSocketConfiguration for vsock-based relay
+    /// - Socket traffic is proxied through vsock between host and guest
+    ///
+    /// Returns: tuple of (mounts array, socket configurations array, direct mounts for local volumes)
+    private func parseVolumeMounts(_ binds: [String]?, dockerID: String) async throws -> (mounts: [Containerization.Mount], socketConfigs: [Containerization.UnixSocketConfiguration], directMounts: [DirectMountConfig]) {
         guard let binds = binds else {
-            return []
+            return (mounts: [], socketConfigs: [], directMounts: [])
         }
+
+        // Track direct mounts for local volumes (set up after container starts)
+        // Uses EXT4 bind mounts instead of OverlayFS to allow nested overlays (e.g., containerd)
+        var directMounts: [DirectMountConfig] = []
 
         // Track VirtioFS mounts separately to deduplicate and ensure they come before bind mounts
         var virtioFSMounts: [String: Containerization.Mount] = [:]  // parentDir -> mount
@@ -3660,17 +4061,18 @@ public actor ContainerManager {
         // Track volume bind mounts that need VirtioFS mounts to be processed first
         // This is used for local volumes to work around VirtioFS mount point permission issues
         var volumeBindMounts: [(mount: Containerization.Mount, volumeRoot: String)] = []
+        // Track Unix socket configurations for vsock relay (k3d/kind support)
+        var socketConfigs: [Containerization.UnixSocketConfiguration] = []
 
         for bind in binds {
-            let parts = bind.split(separator: ":")
-            guard parts.count >= 2 else {
+            // Parse bind mount string properly, handling colons in paths (e.g., sha256:xxx)
+            // Format: source:destination or source:destination:options
+            // Options: ro, rw, z, Z, nocopy, consistent, delegated, cached, bind, etc.
+            let (source, containerPath, isReadOnly) = parseBindMountString(bind)
+            guard !source.isEmpty && !containerPath.isEmpty else {
                 logger.warning("Invalid bind mount format, skipping", metadata: ["bind": "\(bind)"])
                 continue
             }
-
-            let source = String(parts[0])
-            let containerPath = String(parts[1])
-            let isReadOnly = parts.count >= 3 && parts[2] == "ro"
 
             // Determine if this is a named volume or bind mount
             // Logic follows Docker's behavior:
@@ -3760,64 +4162,31 @@ public actor ContainerManager {
 
                 switch volumeMetadata.driver {
                 case "local":
-                    // Local driver: VirtioFS + bind mount to work around mount point permission issues
-                    // VirtioFS mount points cannot be chmod/chown'd, but subdirectories can.
-                    // Solution: Mount volume root to hidden location, bind mount data/ subdirectory to container path
-                    // This way the container sees a subdirectory (data/) not the mount point root.
+                    // Local driver: Direct EXT4 mount for full POSIX compliance
+                    // VirtioFS doesn't support chmod on Unix sockets (needed for k3d/kind)
+                    // Solution: Use direct EXT4 bind mount from writable.ext4 (/dev/vdb)
+                    // This provides:
+                    // - Full POSIX compliance via EXT4
+                    // - Unix socket support for k3s/kine database sockets
+                    // - Allows nested OverlayFS (containerd can create its own overlays)
+                    //
+                    // Note: This means local volumes don't have host file access anymore.
+                    // For host file access, use bind mounts (-v /host/path:/container/path)
 
-                    // volumeMetadata.mountpoint is ~/.arca/volumes/{name}/data
-                    // We need to mount the parent (volume root) to VirtioFS
-                    let volumeRoot = (volumeMetadata.mountpoint as NSString).deletingLastPathComponent
+                    // Track direct mount config for post-start EXT4 bind mount setup
+                    // Go code creates directory on /dev/vdb at /mnt/writable/volumes/{volumeName}
+                    // and bind mounts it to the container target path
+                    directMounts.append(DirectMountConfig(
+                        volumeName: source,
+                        targetPath: containerPath
+                    ))
 
-                    // Create unique mount point for volume root using deterministic hash
-                    let volumeRootHash = try hashMountSource(source: volumeRoot)
-                    let guestVolumeMount = "/mnt/arca-volumes/\(volumeRootHash)"
-
-                    // 1. Track VirtioFS mount for volume root (deduplicated)
-                    if virtioFSMounts[volumeRoot] == nil {
-                        let virtiofsMount = Containerization.Mount.share(
-                            source: volumeRoot,
-                            destination: guestVolumeMount,
-                            options: []  // Read-write at VirtioFS level
-                        )
-                        virtioFSMounts[volumeRoot] = virtiofsMount
-                        logger.debug("Added VirtioFS mount for local volume root", metadata: [
-                            "volumeRoot": "\(volumeRoot)",
-                            "guestVolumeMount": "\(guestVolumeMount)",
-                            "hash": "\(volumeRootHash)"
-                        ])
-                    }
-
-                    // 2. Create bind mount from VirtioFS data/ subdirectory to container path
-                    // vmexec prefixes mount DESTINATIONS with rootfs path, but NOT sources
-                    // So VirtioFS gets mounted at: /run/container/{id}/rootfs/mnt/arca-volumes/{hash}/
-                    // We need the bind mount source to point there (with rootfs prefix)
-                    let containerRootfs = "/run/container/\(dockerID)/rootfs"
-                    let bindSource = "\(containerRootfs)\(guestVolumeMount)/data"
-
-                    var bindOptions = ["bind"]
-                    if isReadOnly {
-                        bindOptions.append("ro")
-                    }
-                    mount = Containerization.Mount.any(
-                        type: "",  // Bind mounts have no filesystem type
-                        source: bindSource,
-                        destination: containerPath,
-                        options: bindOptions
-                    )
-
-                    // Track volume bind mount to add after VirtioFS mounts
-                    volumeBindMounts.append((mount: mount, volumeRoot: volumeRoot))
-
-                    logger.info("Local volume: VirtioFS share + bind mount for subdirectory mounting", metadata: [
+                    logger.info("Local volume configured for direct EXT4 mount", metadata: [
                         "volume": "\(source)",
-                        "volumeRoot": "\(volumeRoot)",
-                        "guestVolumeMount": "\(guestVolumeMount)",
-                        "bindSource": "\(bindSource)",
-                        "containerPath": "\(containerPath)",
+                        "targetPath": "\(containerPath)",
                         "readOnly": "\(isReadOnly)"
                     ])
-                    continue  // Skip the otherMounts.append below - volume bind mounts are added later
+                    continue  // Skip the otherMounts.append below - direct mounts are set up after start
 
                 case "block":
                     // Block driver: Exclusive EXT4 block device
@@ -3845,13 +4214,23 @@ public actor ContainerManager {
                 let exists = fileManager.fileExists(atPath: expandedHostPath, isDirectory: &isDirectory)
 
                 if !exists {
-                    if isReadOnly {
-                        logger.error("Read-only bind mount source does not exist", metadata: [
-                            "path": "\(expandedHostPath)"
+                    // Check if this looks like a socket path (common patterns)
+                    // Don't try to auto-create sockets or paths in system directories
+                    let isSystemPath = expandedHostPath.hasPrefix("/var/run/") ||
+                                       expandedHostPath.hasPrefix("/run/") ||
+                                       expandedHostPath.hasPrefix("/tmp/") && expandedHostPath.hasSuffix(".sock")
+                    let looksLikeSocket = expandedHostPath.hasSuffix(".sock")
+
+                    if isReadOnly || isSystemPath || looksLikeSocket {
+                        logger.error("Bind mount source does not exist", metadata: [
+                            "path": "\(expandedHostPath)",
+                            "isReadOnly": "\(isReadOnly)",
+                            "isSystemPath": "\(isSystemPath)",
+                            "looksLikeSocket": "\(looksLikeSocket)"
                         ])
                         throw ContainerManagerError.volumeSourceNotFound(expandedHostPath)
                     } else {
-                        // For read-write mounts, create directory if it doesn't exist
+                        // For read-write mounts to non-system paths, create directory if it doesn't exist
                         // (will create as directory, not file)
                         logger.info("Creating host directory for bind mount", metadata: [
                             "path": "\(expandedHostPath)"
@@ -3861,6 +4240,33 @@ public actor ContainerManager {
                             withIntermediateDirectories: true,
                             attributes: nil
                         )
+                    }
+                }
+
+                // Check if this is a Unix socket (e.g., Docker socket for k3d/kind)
+                // Unix sockets require vsock-based relay, not VirtioFS mounting
+                var statInfo = stat()
+                if stat(expandedHostPath, &statInfo) == 0 {
+                    let fileType = statInfo.st_mode & S_IFMT
+                    if fileType == S_IFSOCK {
+                        // Unix socket: Use Apple's UnixSocketConfiguration for vsock relay
+                        // This enables k3d, kind, and other tools that mount the Docker socket
+                        let hostSocketURL = URL(fileURLWithPath: expandedHostPath)
+                        let guestSocketURL = URL(fileURLWithPath: containerPath)
+
+                        let socketConfig = Containerization.UnixSocketConfiguration(
+                            source: hostSocketURL,
+                            destination: guestSocketURL,
+                            permissions: nil,
+                            direction: .into
+                        )
+                        socketConfigs.append(socketConfig)
+
+                        logger.info("Unix socket relay configured for k3d/kind support", metadata: [
+                            "host_socket": "\(expandedHostPath)",
+                            "guest_socket": "\(containerPath)"
+                        ])
+                        continue  // Socket relays are handled separately, skip mount creation
                     }
                 }
 
@@ -3990,10 +4396,61 @@ public actor ContainerManager {
             "virtiofs_mounts": "\(virtioFSMounts.count)",
             "volume_bind_mounts": "\(volumeBindMounts.count)",
             "file_bind_mounts": "\(fileBindMounts.count)",
-            "other_mounts": "\(otherMounts.count)"
+            "other_mounts": "\(otherMounts.count)",
+            "socket_relays": "\(socketConfigs.count)",
+            "direct_mounts": "\(directMounts.count)"
         ])
 
-        return mounts
+        return (mounts: mounts, socketConfigs: socketConfigs, directMounts: directMounts)
+    }
+
+    /// Parse a bind mount string handling colons in paths (e.g., sha256:xxx)
+    /// Format: source:destination or source:destination:options
+    /// Returns: (source, destination, isReadOnly)
+    private func parseBindMountString(_ bind: String) -> (source: String, destination: String, isReadOnly: Bool) {
+        // Known mount options that can appear at the end
+        let knownOptions = Set(["ro", "rw", "z", "Z", "nocopy", "consistent", "delegated", "cached",
+                                "bind", "volume", "tmpfs", "shared", "slave", "private",
+                                "rshared", "rslave", "rprivate"])
+
+        // Split on colons
+        let parts = bind.split(separator: ":", omittingEmptySubsequences: false).map { String($0) }
+
+        // We need at least 2 parts for source:destination
+        guard parts.count >= 2 else {
+            return ("", "", false)
+        }
+
+        // Work backwards from the end to identify options and destination
+        var options: [String] = []
+        var destIndex = parts.count - 1
+
+        // Check if the last part is an option
+        if parts.count >= 3 && knownOptions.contains(parts[parts.count - 1].lowercased()) {
+            options.append(parts[parts.count - 1])
+            destIndex = parts.count - 2
+        }
+
+        // The destination should be a container path (starts with /)
+        // Keep going backwards until we find a path starting with /
+        while destIndex > 0 && !parts[destIndex].hasPrefix("/") {
+            destIndex -= 1
+        }
+
+        // destIndex now points to the destination
+        // Everything before is the source
+        guard destIndex > 0 && parts[destIndex].hasPrefix("/") else {
+            // Fallback: assume first part is source, second is destination
+            let isReadOnly = parts.count >= 3 && parts[2].lowercased() == "ro"
+            return (parts[0], parts[1], isReadOnly)
+        }
+
+        // Source is everything from index 0 to destIndex-1, joined by colons
+        let source = parts[0..<destIndex].joined(separator: ":")
+        let destination = parts[destIndex]
+        let isReadOnly = options.contains { $0.lowercased() == "ro" }
+
+        return (source, destination, isReadOnly)
     }
 
     /// Track volume mounts in StateStore for usage tracking

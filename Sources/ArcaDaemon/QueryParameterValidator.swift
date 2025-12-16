@@ -7,9 +7,9 @@ import DockerAPI
 public struct QueryParameterValidator {
 
     /// Validate and parse a positive integer parameter
-    /// Returns nil if parameter is missing, or throws ValidationError if invalid
+    /// Returns nil if parameter is missing or empty, or throws ValidationError if invalid
     public static func parsePositiveInt(_ value: String?, paramName: String) throws -> Int? {
-        guard let value = value else {
+        guard let value = value, !value.isEmpty else {
             return nil
         }
 
@@ -33,9 +33,9 @@ public struct QueryParameterValidator {
     }
 
     /// Validate and parse a non-negative integer parameter
-    /// Returns nil if parameter is missing, or throws ValidationError if invalid
+    /// Returns nil if parameter is missing or empty, or throws ValidationError if invalid
     public static func parseNonNegativeInt(_ value: String?, paramName: String) throws -> Int? {
-        guard let value = value else {
+        guard let value = value, !value.isEmpty else {
             return nil
         }
 
@@ -59,17 +59,25 @@ public struct QueryParameterValidator {
     }
 
     /// Validate and parse a UNIX timestamp parameter
-    /// Returns nil if parameter is missing, or throws ValidationError if invalid
+    /// Returns nil if parameter is missing or empty, or throws ValidationError if invalid
+    /// Accepts both integer and decimal timestamps (e.g., "1764801953" or "1764801953.000000000")
     public static func parseUnixTimestamp(_ value: String?, paramName: String) throws -> Int? {
-        guard let value = value else {
+        guard let value = value, !value.isEmpty else {
             return nil
         }
 
-        guard let timestamp = Int(value) else {
+        // Try parsing as Double first to handle decimal timestamps like "1764801953.000000000"
+        // Then convert to Int (truncating the decimal portion)
+        let timestamp: Int
+        if let intValue = Int(value) {
+            timestamp = intValue
+        } else if let doubleValue = Double(value) {
+            timestamp = Int(doubleValue)
+        } else {
             throw ValidationError.invalidParameter(
                 paramName: paramName,
                 value: value,
-                reason: "must be a valid UNIX timestamp (integer)"
+                reason: "must be a valid UNIX timestamp"
             )
         }
 
@@ -85,9 +93,9 @@ public struct QueryParameterValidator {
     }
 
     /// Validate and parse tail parameter (positive integer or "all")
-    /// Returns nil if parameter is missing, or throws ValidationError if invalid
+    /// Returns nil if parameter is missing or empty, or throws ValidationError if invalid
     public static func parseTail(_ value: String?, paramName: String = "tail") throws -> String? {
-        guard let value = value else {
+        guard let value = value, !value.isEmpty else {
             return nil
         }
 
@@ -144,14 +152,40 @@ public struct QueryParameterValidator {
     }
 
     /// Parse Docker-format filters and convert to array format
-    /// Docker sends filters as: {"filterName": {"value1": true, "value2": false}}
-    /// Converts to: {"filterName": ["value1"]} (only including true values)
+    /// Docker sends filters in two formats:
+    ///   Old format: {"filterName": {"value1": true, "value2": false}}
+    ///   New format: {"filterName": ["value1", "value2"]}
+    /// Converts both to: {"filterName": ["value1", "value2"]}
     public static func parseDockerFiltersToArray(_ value: String?, paramName: String = "filters") throws -> [String: [String]] {
-        let dockerFilters: [String: [String: Bool]]? = try parseFilters(value, paramName: paramName)
+        guard let value = value, !value.isEmpty else {
+            return [:]
+        }
 
-        return dockerFilters?.mapValues { valueMap in
-            valueMap.compactMap { key, include in include ? key : nil }
-        } ?? [:]
+        guard let data = value.data(using: .utf8) else {
+            throw ValidationError.invalidParameter(
+                paramName: paramName,
+                value: value,
+                reason: "contains invalid UTF-8 characters"
+            )
+        }
+
+        // Try new format first: {"name": ["value1", "value2"]}
+        if let arrayFilters = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            return arrayFilters
+        }
+
+        // Fall back to old format: {"name": {"value1": true, "value2": false}}
+        if let boolFilters = try? JSONDecoder().decode([String: [String: Bool]].self, from: data) {
+            return boolFilters.mapValues { valueMap in
+                valueMap.compactMap { key, include in include ? key : nil }
+            }
+        }
+
+        throw ValidationError.invalidParameter(
+            paramName: paramName,
+            value: value,
+            reason: "must be valid JSON filters in Docker format"
+        )
     }
 
     /// Parse Docker-format filters and convert to single-value format

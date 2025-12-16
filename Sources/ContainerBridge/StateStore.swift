@@ -582,6 +582,16 @@ public actor StateStore {
         logger.debug("Container deleted from database", metadata: ["id": "\(id)"])
     }
 
+    /// Check if a container is running
+    /// Returns true if container exists and has status "running", false otherwise
+    public func isContainerRunning(containerID: String) throws -> Bool {
+        let query = containers.filter(self.id == containerID).select(status)
+        guard let row = try db.pluck(query) else {
+            return false
+        }
+        return row[status] == "running"
+    }
+
     /// Get containers that need to be restarted based on restart policy
     public func getContainersToRestart() throws -> [(id: String, name: String, policy: String, exitCode: Int)] {
         var result: [(id: String, name: String, policy: String, exitCode: Int)] = []

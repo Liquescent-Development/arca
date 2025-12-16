@@ -540,6 +540,24 @@ public actor WireGuardNetworkBackend {
                 continue
             }
 
+            // Skip non-running containers - their VMs aren't active so we can't connect
+            // Check centralized state from StateStore rather than trying to dialVsock and failing
+            do {
+                let isRunning = try await stateStore.isContainerRunning(containerID: otherContainerID)
+                if !isRunning {
+                    logger.debug("Skipping stopped peer container for mesh config", metadata: [
+                        "peer_container_id": "\(otherContainerID)"
+                    ])
+                    continue
+                }
+            } catch {
+                logger.warning("Failed to check peer container status, skipping", metadata: [
+                    "peer_container_id": "\(otherContainerID)",
+                    "error": "\(error)"
+                ])
+                continue
+            }
+
             // Create WireGuard client for peer container
             let otherContainer: Containerization.LinuxContainer
             do {
@@ -744,6 +762,24 @@ public actor WireGuardNetworkBackend {
                 guard let otherNetworkIndex = containerNetworkIndices[otherContainerID]?[networkID] else {
                     logger.warning("Skipping peer removal - missing metadata", metadata: [
                         "other_container_id": "\(otherContainerID)"
+                    ])
+                    continue
+                }
+
+                // Skip non-running containers - their VMs aren't active so we can't connect
+                // Check centralized state from StateStore rather than trying to dialVsock and failing
+                do {
+                    let isRunning = try await stateStore.isContainerRunning(containerID: otherContainerID)
+                    if !isRunning {
+                        logger.debug("Skipping stopped peer container for peer removal", metadata: [
+                            "peer_container_id": "\(otherContainerID)"
+                        ])
+                        continue
+                    }
+                } catch {
+                    logger.warning("Failed to check peer container status, skipping", metadata: [
+                        "peer_container_id": "\(otherContainerID)",
+                        "error": "\(error)"
                     ])
                     continue
                 }

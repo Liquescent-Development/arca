@@ -284,6 +284,13 @@ public struct HostConfigCreate: Codable, Sendable {
     // Extra Hosts (Issue #34)
     public let extraHosts: [String]?       // --add-host (extra hosts in "host:ip" format)
 
+    // Tmpfs mounts (k3d support) - old style
+    public let tmpfs: [String: String]?    // --tmpfs (tmpfs mounts: {"/run": "", "/var/run": "size=123"})
+
+    // Mounts (Docker API v1.25+) - modern style mount specification
+    // Supports bind, volume, tmpfs, npipe, image, cluster mount types
+    public let mounts: [MountCreate]?
+
     enum CodingKeys: String, CodingKey {
         case binds = "Binds"
         case networkMode = "NetworkMode"
@@ -307,6 +314,8 @@ public struct HostConfigCreate: Codable, Sendable {
         case capDrop = "CapDrop"
         case securityOpt = "SecurityOpt"
         case extraHosts = "ExtraHosts"
+        case tmpfs = "Tmpfs"
+        case mounts = "Mounts"
     }
 }
 
@@ -329,6 +338,95 @@ public struct RestartPolicyCreate: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case name = "Name"
         case maximumRetryCount = "MaximumRetryCount"
+    }
+}
+
+/// Mount specification for container creation (Docker API v1.25+)
+/// Used in HostConfig.Mounts - the modern way to specify mounts
+public struct MountCreate: Codable, Sendable {
+    /// Container path (destination)
+    public let target: String
+
+    /// Mount source - volume name, host path, or empty for anonymous volumes/tmpfs
+    public let source: String?
+
+    /// Mount type: "bind", "volume", "tmpfs", "npipe", "image", "cluster"
+    public let type: String
+
+    /// Whether the mount should be read-only
+    public let readOnly: Bool?
+
+    /// Consistency: "default", "consistent", "cached", or "delegated"
+    public let consistency: String?
+
+    /// Optional configuration for bind mounts
+    public let bindOptions: MountBindOptions?
+
+    /// Optional configuration for volume mounts
+    public let volumeOptions: MountVolumeOptions?
+
+    /// Optional configuration for tmpfs mounts
+    public let tmpfsOptions: MountTmpfsOptions?
+
+    enum CodingKeys: String, CodingKey {
+        case target = "Target"
+        case source = "Source"
+        case type = "Type"
+        case readOnly = "ReadOnly"
+        case consistency = "Consistency"
+        case bindOptions = "BindOptions"
+        case volumeOptions = "VolumeOptions"
+        case tmpfsOptions = "TmpfsOptions"
+    }
+}
+
+/// Bind mount options
+public struct MountBindOptions: Codable, Sendable {
+    public let propagation: String?
+    public let nonRecursive: Bool?
+    public let createMountpoint: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case propagation = "Propagation"
+        case nonRecursive = "NonRecursive"
+        case createMountpoint = "CreateMountpoint"
+    }
+}
+
+/// Volume mount options
+public struct MountVolumeOptions: Codable, Sendable {
+    public let noCopy: Bool?
+    public let labels: [String: String]?
+    public let driverConfig: MountVolumeDriverConfig?
+    public let subpath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case noCopy = "NoCopy"
+        case labels = "Labels"
+        case driverConfig = "DriverConfig"
+        case subpath = "Subpath"
+    }
+}
+
+/// Volume driver configuration
+public struct MountVolumeDriverConfig: Codable, Sendable {
+    public let name: String?
+    public let options: [String: String]?
+
+    enum CodingKeys: String, CodingKey {
+        case name = "Name"
+        case options = "Options"
+    }
+}
+
+/// Tmpfs mount options
+public struct MountTmpfsOptions: Codable, Sendable {
+    public let sizeBytes: Int64?
+    public let mode: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case sizeBytes = "SizeBytes"
+        case mode = "Mode"
     }
 }
 

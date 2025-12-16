@@ -387,17 +387,31 @@ public struct NetworkHandlers: Sendable {
     private func applyFilters(_ networks: [NetworkMetadata], filters: [String: [String]]) -> [NetworkMetadata] {
         var filtered = networks
 
-        // Filter by name
+        // Filter by name (supports regex patterns like Docker)
         if let names = filters["name"], !names.isEmpty {
             filtered = filtered.filter { network in
-                names.contains(network.name)
+                names.contains { pattern in
+                    // Try as regex first, fall back to exact match
+                    if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                        let range = NSRange(network.name.startIndex..., in: network.name)
+                        return regex.firstMatch(in: network.name, options: [], range: range) != nil
+                    }
+                    return pattern == network.name
+                }
             }
         }
 
-        // Filter by ID
+        // Filter by ID (supports regex patterns like Docker)
         if let ids = filters["id"], !ids.isEmpty {
             filtered = filtered.filter { network in
-                ids.contains(where: { network.id.hasPrefix($0) })
+                ids.contains { pattern in
+                    // Try as regex first, fall back to prefix match
+                    if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                        let range = NSRange(network.id.startIndex..., in: network.id)
+                        return regex.firstMatch(in: network.id, options: [], range: range) != nil
+                    }
+                    return network.id.hasPrefix(pattern)
+                }
             }
         }
 

@@ -26,12 +26,14 @@ public struct ContainerHandlers: Sendable {
     private let containerManager: ContainerBridge.ContainerManager
     private let imageManager: ImageManager
     private let execManager: ExecManager
+    private let helperContainerManager: HelperContainerManager
     private let logger: Logger
 
-    public init(containerManager: ContainerBridge.ContainerManager, imageManager: ImageManager, execManager: ExecManager, logger: Logger) {
+    public init(containerManager: ContainerBridge.ContainerManager, imageManager: ImageManager, execManager: ExecManager, helperContainerManager: HelperContainerManager, logger: Logger) {
         self.containerManager = containerManager
         self.imageManager = imageManager
         self.execManager = execManager
+        self.helperContainerManager = helperContainerManager
         self.logger = logger
     }
 
@@ -70,6 +72,17 @@ public struct ContainerHandlers: Sendable {
         do {
             // Get containers from ContainerManager
             var containers = try await containerManager.listContainers(all: all, filters: filters)
+
+            // Filter out helper containers (they should be invisible to users)
+            // Helper containers are marked with com.arca.internal=helper label
+            containers = containers.filter { container in
+                // Check if any name starts with the helper prefix
+                let isHelper = container.names.contains { name in
+                    let cleanName = name.hasPrefix("/") ? String(name.dropFirst()) : name
+                    return HelperContainerManager.isHelperContainer(name: cleanName)
+                }
+                return !isHelper
+            }
 
             // Apply limit if specified
             if let limit = limit, limit > 0 {
@@ -177,6 +190,79 @@ public struct ContainerHandlers: Sendable {
                 "nanoCpus": "\(request.hostConfig?.nanoCpus?.description ?? "nil")"
             ])
 
+            // Debug logging for volumes (k3d investigation)
+            let mountsDescription = request.hostConfig?.mounts?.map { "\($0.type):\($0.source ?? "")→\($0.target)" }.joined(separator: ", ") ?? "nil"
+            logger.debug("Container create request volumes", metadata: [
+                "volumes": "\(request.volumes?.keys.joined(separator: ", ") ?? "nil")",
+                "volumes_count": "\(request.volumes?.count ?? 0)",
+                "binds": "\(request.hostConfig?.binds?.joined(separator: ", ") ?? "nil")",
+                "binds_count": "\(request.hostConfig?.binds?.count ?? 0)",
+                "tmpfs": "\(request.hostConfig?.tmpfs?.keys.joined(separator: ", ") ?? "nil")",
+                "tmpfs_count": "\(request.hostConfig?.tmpfs?.count ?? 0)",
+                "mounts": "\(mountsDescription)",
+                "mounts_count": "\(request.hostConfig?.mounts?.count ?? 0)"
+            ])
+
+            // Process HostConfig.Mounts (Docker API v1.25+) and merge with legacy parameters
+            // Mounts can specify bind, volume, tmpfs, etc. We convert them to the formats
+            // that ContainerManager already understands (binds, volumes, tmpfs)
+            var effectiveBinds: [String] = request.hostConfig?.binds ?? []
+            var effectiveVolumes: [String: Any] = request.volumes?.reduce(into: [:]) { result, pair in
+                result[pair.key] = pair.value.value ?? [:]
+            } ?? [:]
+            var effectiveTmpfs: [String: String] = request.hostConfig?.tmpfs ?? [:]
+
+            if let mounts = request.hostConfig?.mounts {
+                for mount in mounts {
+                    let target = mount.target
+                    let source = mount.source ?? ""
+                    let readOnly = mount.readOnly ?? false
+                    let roSuffix = readOnly ? ":ro" : ""
+
+                    switch mount.type.lowercased() {
+                    case "bind":
+                        // Bind mount: "/host/path:/container/path[:ro]"
+                        effectiveBinds.append("\(source):\(target)\(roSuffix)")
+                        logger.debug("Mount: bind", metadata: ["source": "\(source)", "target": "\(target)", "readOnly": "\(readOnly)"])
+
+                    case "volume":
+                        if source.isEmpty {
+                            // Anonymous volume: {"/container/path": {}}
+                            effectiveVolumes[target] = [:]
+                            logger.debug("Mount: anonymous volume", metadata: ["target": "\(target)"])
+                        } else {
+                            // Named volume: "volume_name:/container/path[:ro]"
+                            effectiveBinds.append("\(source):\(target)\(roSuffix)")
+                            logger.debug("Mount: named volume", metadata: ["source": "\(source)", "target": "\(target)", "readOnly": "\(readOnly)"])
+                        }
+
+                    case "tmpfs":
+                        // Tmpfs mount: {"/container/path": "options"}
+                        var options: [String] = []
+                        if let tmpfsOptions = mount.tmpfsOptions {
+                            if let size = tmpfsOptions.sizeBytes {
+                                options.append("size=\(size)")
+                            }
+                            if let mode = tmpfsOptions.mode {
+                                options.append("mode=\(String(mode, radix: 8))")
+                            }
+                        }
+                        effectiveTmpfs[target] = options.joined(separator: ",")
+                        logger.debug("Mount: tmpfs", metadata: ["target": "\(target)", "options": "\(options.joined(separator: ","))"])
+
+                    default:
+                        // Unsupported mount type - log warning and skip
+                        logger.warning("Unsupported mount type", metadata: ["type": "\(mount.type)", "target": "\(target)"])
+                    }
+                }
+            }
+
+            logger.debug("Effective mounts after processing", metadata: [
+                "binds": "\(effectiveBinds.joined(separator: ", "))",
+                "volumes": "\(effectiveVolumes.keys.joined(separator: ", "))",
+                "tmpfs": "\(effectiveTmpfs.keys.joined(separator: ", "))"
+            ])
+
             let containerID = try await containerManager.createContainer(
                 image: request.image,
                 name: name,
@@ -193,8 +279,8 @@ public struct ContainerHandlers: Sendable {
                 openStdin: request.openStdin ?? false,
                 networkMode: request.hostConfig?.networkMode,
                 restartPolicy: restartPolicy,
-                binds: request.hostConfig?.binds,
-                volumes: request.volumes?.mapValues { $0.value },  // Convert AnyCodable to Any
+                binds: effectiveBinds.isEmpty ? nil : effectiveBinds,
+                volumes: effectiveVolumes.isEmpty ? nil : effectiveVolumes,
                 portBindings: portBindings,
                 initialNetworkUserIP: initialNetworkUserIP,
                 initialNetworkAliases: initialNetworkAliases,
@@ -221,7 +307,9 @@ public struct ContainerHandlers: Sendable {
                 // Health Check (Phase 6 - Task 6.2)
                 healthcheck: request.healthcheck,
                 // Extra Hosts (Issue #34)
-                extraHosts: request.hostConfig?.extraHosts
+                extraHosts: request.hostConfig?.extraHosts,
+                // Tmpfs mounts (merged from both old-style Tmpfs and new-style Mounts)
+                tmpfs: effectiveTmpfs.isEmpty ? nil : effectiveTmpfs
             )
 
             logger.info("Container created", metadata: [
@@ -1711,6 +1799,57 @@ public struct ContainerHandlers: Sendable {
         }
     }
 
+    /// Check if a path exists in a container (HEAD /containers/{id}/archive)
+    /// For stopped containers, returns 404 to allow docker cp PUT to proceed
+    /// Docker CLI sends HEAD before PUT to check if destination exists
+    public func handleHeadArchive(id: String, path: String) async -> Result<PathStat, ContainerError> {
+        logger.info("HEAD archive from container", metadata: [
+            "container_id": "\(id)",
+            "path": "\(path)"
+        ])
+
+        // Resolve container ID
+        guard let containerID = await containerManager.resolveContainer(idOrName: id) else {
+            return .failure(.notFound(id))
+        }
+
+        // Get container to check if running
+        guard let containerInfo = try? await containerManager.getContainer(id: containerID) else {
+            return .failure(.notFound(id))
+        }
+
+        // For stopped containers, use helper container to check path
+        guard containerInfo.state.running else {
+            logger.debug("Container not running - using helper container for HEAD archive", metadata: [
+                "container_id": "\(id)",
+                "path": "\(path)"
+            ])
+
+            do {
+                let stat = try await helperContainerManager.pathExists(targetID: containerID, path: path)
+                return .success(stat)
+            } catch {
+                // Path doesn't exist - return 404 which allows docker cp PUT to proceed
+                logger.debug("Path not found in stopped container", metadata: [
+                    "container_id": "\(id)",
+                    "path": "\(path)",
+                    "error": "\(error)"
+                ])
+                return .failure(.pathNotFound(containerId: id, path: path))
+            }
+        }
+
+        // Container is running - delegate to handleGetArchive which returns stat as part of the result
+        // This reuses existing archive logic to verify path exists
+        let getResult = await handleGetArchive(id: id, path: path)
+        switch getResult {
+        case .success(let (_, stat)):
+            return .success(stat)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
     /// Get an archive of a filesystem resource in a container (GET /containers/{id}/archive)
     /// Uses Filesystem RPC to create tar archive via Go's archive/tar library
     /// Works universally without requiring tar in container (Phase 6.5)
@@ -1725,15 +1864,41 @@ public struct ContainerHandlers: Sendable {
             return .failure(.notFound(id))
         }
 
-        // Get container to access native container
-        guard let containerInfo = try? await containerManager.getContainer(id: containerID),
-              let nativeContainer = await containerManager.getNativeContainer(id: containerID) else {
+        // Get container info
+        guard let containerInfo = try? await containerManager.getContainer(id: containerID) else {
             return .failure(.notFound(id))
         }
 
-        // Container must be running to use RPC
+        // For stopped containers, use helper container to read from filesystem
         guard containerInfo.state.running else {
-            return .failure(.invalidRequest("Container must be running to extract archive"))
+            logger.info("Container not running - using helper container for archive read", metadata: [
+                "container_id": "\(id)",
+                "path": "\(path)"
+            ])
+
+            do {
+                let result = try await helperContainerManager.readArchive(targetID: containerID, path: path)
+
+                logger.info("Archive read from stopped container via helper", metadata: [
+                    "container_id": "\(id)",
+                    "path": "\(path)",
+                    "size": "\(result.tarData.count) bytes"
+                ])
+
+                return .success(result)
+            } catch {
+                logger.error("Failed to read archive from stopped container", metadata: [
+                    "container_id": "\(id)",
+                    "path": "\(path)",
+                    "error": "\(error)"
+                ])
+                return .failure(.invalidRequest("Failed to read archive: \(error)"))
+            }
+        }
+
+        // Container is running - read archive directly via RPC
+        guard let nativeContainer = await containerManager.getNativeContainer(id: containerID) else {
+            return .failure(.notFound(id))
         }
 
         // Connect to Filesystem service and read archive via RPC
@@ -1767,6 +1932,7 @@ public struct ContainerHandlers: Sendable {
     /// Extract an archive to a directory in a container (PUT /containers/{id}/archive)
     /// Uses Filesystem RPC to extract tar archive via Go's archive/tar library
     /// Works universally without requiring tar in container (Phase 6.5)
+    /// For stopped containers, archives are staged and applied when the container starts (k3d/kind support)
     public func handlePutArchive(id: String, path: String, tarData: Data) async -> Result<Void, ContainerError> {
         logger.info("Putting archive to container", metadata: [
             "container_id": "\(id)",
@@ -1779,15 +1945,42 @@ public struct ContainerHandlers: Sendable {
             return .failure(.notFound(id))
         }
 
-        // Get container to access native container
-        guard let containerInfo = try? await containerManager.getContainer(id: containerID),
-              let nativeContainer = await containerManager.getNativeContainer(id: containerID) else {
+        // Get container info
+        guard let containerInfo = try? await containerManager.getContainer(id: containerID) else {
             return .failure(.notFound(id))
         }
 
-        // Container must be running to use RPC
+        // For stopped containers, use helper container to write directly to filesystem
+        // Helper container mounts the target's writable.ext4 and performs the operation
         guard containerInfo.state.running else {
-            return .failure(.invalidRequest("Container must be running to write archive"))
+            logger.info("Container not running - using helper container for archive write", metadata: [
+                "container_id": "\(id)",
+                "path": "\(path)",
+                "size": "\(tarData.count)"
+            ])
+
+            do {
+                try await helperContainerManager.writeArchive(targetID: containerID, path: path, tarData: tarData)
+
+                logger.info("Archive written to stopped container via helper", metadata: [
+                    "container_id": "\(id)",
+                    "path": "\(path)"
+                ])
+
+                return .success(())
+            } catch {
+                logger.error("Failed to write archive to stopped container", metadata: [
+                    "container_id": "\(id)",
+                    "path": "\(path)",
+                    "error": "\(error)"
+                ])
+                return .failure(.invalidRequest("Failed to write archive: \(error)"))
+            }
+        }
+
+        // Container is running - apply archive directly via RPC
+        guard let nativeContainer = await containerManager.getNativeContainer(id: containerID) else {
+            return .failure(.notFound(id))
         }
 
         // Connect to Filesystem service and write archive via RPC
@@ -1904,6 +2097,7 @@ public enum ContainerError: Error, CustomStringConvertible {
     case removeFailed(String)
     case inspectFailed(String)
     case notFound(String)
+    case pathNotFound(containerId: String, path: String)
     case invalidRequest(String)
     case imageNotFound(String)
     case nameAlreadyInUse(String)
@@ -1939,6 +2133,8 @@ public enum ContainerError: Error, CustomStringConvertible {
             return "No such image: \(image)"
         case .notFound(let id):
             return "No such container: \(id)"
+        case .pathNotFound(let containerId, let path):
+            return "No such file or directory in container \(containerId): \(path)"
         case .invalidRequest(let msg):
             return "Invalid request: \(msg)"
         case .nameAlreadyInUse(let name):

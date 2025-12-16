@@ -301,6 +301,154 @@ public actor FilesystemClient {
             "readOnly": "\(readOnly)"
         ])
     }
+
+    /// Create volume overlay - create OverlayFS mount for a volume
+    /// This overlays an EXT4 upper layer on top of a VirtioFS lower layer
+    /// Provides full POSIX compliance (Unix sockets, chmod) for volumes
+    /// Used for k3d/kind support where volumes need Unix socket support
+    public func createVolumeOverlay(lowerPath: String, upperDevice: String, target: String, virtiofsTag: String) async throws {
+        logger.debug("Creating volume overlay", metadata: [
+            "container": "\(containerID)",
+            "lowerPath": "\(lowerPath)",
+            "upperDevice": "\(upperDevice)",
+            "target": "\(target)",
+            "virtiofsTag": "\(virtiofsTag)"
+        ])
+
+        let client = try await getClient()
+        var request = Arca_Filesystem_V1_CreateVolumeOverlayRequest()
+        request.containerID = containerID
+        request.lowerPath = lowerPath
+        request.upperDevice = upperDevice
+        request.target = target
+        request.virtiofsTag = virtiofsTag
+
+        let response = try await client.createVolumeOverlay(request)
+
+        guard response.success else {
+            logger.error("Create volume overlay failed", metadata: [
+                "container": "\(containerID)",
+                "lowerPath": "\(lowerPath)",
+                "upperDevice": "\(upperDevice)",
+                "target": "\(target)",
+                "error": "\(response.error)"
+            ])
+            throw FilesystemClientError.createVolumeOverlayFailed(response.error)
+        }
+
+        logger.info("Volume overlay created successfully", metadata: [
+            "container": "\(containerID)",
+            "lowerPath": "\(lowerPath)",
+            "upperDevice": "\(upperDevice)",
+            "target": "\(target)"
+        ])
+    }
+
+    /// Create direct mount - bind mount EXT4 directory to container path
+    /// Creates a directory on the writable EXT4 filesystem and bind mounts it
+    /// Provides full POSIX compliance without OverlayFS (allows nested overlays)
+    /// Used for named volumes (local driver) that don't need host file access
+    public func createDirectMount(volumeName: String, target: String) async throws {
+        logger.debug("Creating direct mount", metadata: [
+            "container": "\(containerID)",
+            "volumeName": "\(volumeName)",
+            "target": "\(target)"
+        ])
+
+        let client = try await getClient()
+        var request = Arca_Filesystem_V1_CreateDirectMountRequest()
+        request.containerID = containerID
+        request.volumeName = volumeName
+        request.target = target
+
+        let response = try await client.createDirectMount(request)
+
+        guard response.success else {
+            logger.error("Create direct mount failed", metadata: [
+                "container": "\(containerID)",
+                "volumeName": "\(volumeName)",
+                "target": "\(target)",
+                "error": "\(response.error)"
+            ])
+            throw FilesystemClientError.createDirectMountFailed(response.error)
+        }
+
+        logger.info("Direct mount created successfully", metadata: [
+            "container": "\(containerID)",
+            "volumeName": "\(volumeName)",
+            "target": "\(target)"
+        ])
+    }
+
+    /// Stat a path (check if it exists and get metadata)
+    /// Used for HEAD requests on archive endpoint
+    public func statPath(path: String) async throws -> PathStat {
+        logger.debug("Stating path", metadata: [
+            "container": "\(containerID)",
+            "path": "\(path)"
+        ])
+
+        let client = try await getClient()
+        var request = Arca_Filesystem_V1_StatPathRequest()
+        request.containerID = containerID
+        request.path = path
+
+        let response = try await client.statPath(request)
+
+        guard response.success else {
+            logger.error("Stat path failed", metadata: [
+                "container": "\(containerID)",
+                "path": "\(path)",
+                "error": "\(response.error)"
+            ])
+            throw FilesystemClientError.statFailed(response.error)
+        }
+
+        return PathStat(
+            name: response.stat.name,
+            size: response.stat.size,
+            mode: response.stat.mode,
+            mtime: response.stat.mtime,
+            linkTarget: response.stat.linkTarget
+        )
+    }
+
+    /// Generate /etc/hosts file for container
+    /// Creates the standard Docker hosts file with localhost entries and container hostname
+    /// Docker generates this file; we need to do the same for compatibility
+    public func generateHostsFile(hostname: String, ipAddress: String, containerName: String, extraHosts: [String]) async throws {
+        logger.debug("Generating /etc/hosts file", metadata: [
+            "container": "\(containerID)",
+            "hostname": "\(hostname)",
+            "ipAddress": "\(ipAddress)",
+            "containerName": "\(containerName)"
+        ])
+
+        let client = try await getClient()
+        var request = Arca_Filesystem_V1_GenerateHostsFileRequest()
+        request.containerID = containerID
+        request.hostname = hostname
+        request.ipAddress = ipAddress
+        request.containerName = containerName
+        request.extraHosts = extraHosts
+
+        let response = try await client.generateHostsFile(request)
+
+        guard response.success else {
+            logger.error("Generate hosts file failed", metadata: [
+                "container": "\(containerID)",
+                "error": "\(response.error)"
+            ])
+            throw FilesystemClientError.generateHostsFileFailed(response.error)
+        }
+
+        logger.info("/etc/hosts file generated successfully", metadata: [
+            "container": "\(containerID)",
+            "hostname": "\(hostname)",
+            "ipAddress": "\(ipAddress)"
+        ])
+    }
+
 }
 
 /// Entry in the OverlayFS upperdir (for docker diff)
@@ -345,6 +493,10 @@ public enum FilesystemClientError: Error, CustomStringConvertible {
     case readArchiveFailed(String)
     case writeArchiveFailed(String)
     case createBindMountFailed(String)
+    case createVolumeOverlayFailed(String)
+    case createDirectMountFailed(String)
+    case statFailed(String)
+    case generateHostsFileFailed(String)
 
     public var description: String {
         switch self {
@@ -360,6 +512,14 @@ public enum FilesystemClientError: Error, CustomStringConvertible {
             return "Write archive failed: \(msg)"
         case .createBindMountFailed(let msg):
             return "Create bind mount failed: \(msg)"
+        case .createVolumeOverlayFailed(let msg):
+            return "Create volume overlay failed: \(msg)"
+        case .createDirectMountFailed(let msg):
+            return "Create direct mount failed: \(msg)"
+        case .statFailed(let msg):
+            return "Stat path failed: \(msg)"
+        case .generateHostsFileFailed(let msg):
+            return "Generate hosts file failed: \(msg)"
         }
     }
 }

@@ -95,6 +95,9 @@ public final class ArcaDaemon: @unchecked Sendable {
             // Without this, the old initfs.ext4 (which may be from a different vminit) gets reused
             let initfsPath = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/com.apple.containerization/initfs.ext4")
+            logger.debug("Checking for cached initfs.ext4", metadata: [
+                "path": "\(initfsPath.path)"
+            ])
             if FileManager.default.fileExists(atPath: initfsPath.path) {
                 logger.debug("Deleting existing initfs.ext4 to force regeneration")
                 do {
@@ -144,7 +147,8 @@ public final class ArcaDaemon: @unchecked Sendable {
         // WireGuard backend runs services directly in each container VM - no central control plane needed
 
         // Initialize StateStore (shared by ContainerManager and NetworkManager)
-        let stateDBPath = NSString(string: "~/.arca/state.db").expandingTildeInPath
+        let stateDBPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".arca/state.db").path
         let stateStore: StateStore
         do {
             stateStore = try StateStore(path: stateDBPath, logger: logger)
@@ -335,8 +339,16 @@ public final class ArcaDaemon: @unchecked Sendable {
     ) {
         logger.info("Registering API routes")
 
+        // Create helper container manager for stopped container filesystem operations
+        let helperContainerManager = HelperContainerManager(logger: logger)
+        Task {
+            await helperContainerManager.setManagers(containerManager: containerManager, imageManager: imageManager, execManager: execManager)
+            // Clean up any orphaned helpers from previous daemon run
+            await helperContainerManager.cleanupOrphanedHelpers()
+        }
+
         // Create handlers
-        let containerHandlers = ContainerHandlers(containerManager: containerManager, imageManager: imageManager, execManager: execManager, logger: logger)
+        let containerHandlers = ContainerHandlers(containerManager: containerManager, imageManager: imageManager, execManager: execManager, helperContainerManager: helperContainerManager, logger: logger)
         let imageHandlers = ImageHandlers(imageManager: imageManager, logger: logger)
         let execHandlers = ExecHandlers(execManager: execManager, logger: logger)
         let networkHandlers = networkManager.map { NetworkHandlers(networkManager: $0, containerManager: containerManager, logger: logger) }
@@ -1012,10 +1024,11 @@ public final class ArcaDaemon: @unchecked Sendable {
                 return .standard(HTTPResponse.badRequest("Missing path parameter"))
             }
 
-            // HEAD endpoint returns same stat header as GET but without body
-            let result = await containerHandlers.handleGetArchive(id: id, path: path)
+            // HEAD endpoint checks if path exists (without returning body)
+            // For stopped containers, returns 404 to allow docker cp PUT to proceed
+            let result = await containerHandlers.handleHeadArchive(id: id, path: path)
             switch result {
-            case .success(let (_, stat)):
+            case .success(let stat):
                 // Create JSON for X-Docker-Container-Path-Stat header
                 let statJSON: [String: Any] = [
                     "name": stat.name,
@@ -1037,14 +1050,11 @@ public final class ArcaDaemon: @unchecked Sendable {
                     headers: headers,
                     body: nil  // HEAD returns no body
                 ))
-            case .failure(let error):
-                let status: HTTPResponseStatus
-                if case .notFound = error {
-                    status = .notFound
-                } else {
-                    status = .internalServerError
-                }
-                return .standard(HTTPResponse.error(error.description, status: status))
+            case .failure:
+                // For stopped containers or non-existent paths, return 404 with NO body
+                // HEAD requests MUST NOT include a body per HTTP spec
+                // This allows docker cp PUT to proceed with staging
+                return .standard(HTTPResponse(status: .notFound, headers: HTTPHeaders(), body: nil))
             }
         }
 

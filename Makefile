@@ -1,4 +1,4 @@
-.PHONY: clean clean-state clean-layers clean-containers clean-all-state clean-dist install uninstall debug release run run-with-setup setup-builder all codesign verify-entitlements help kernel kernel-rebuild install-grpc-plugin test vminit vminit-rebuild vminit-debug gen-grpc gen-buildinfo dist dist-pkg dist-dmg notarize check-publish-env publish install-service uninstall-service start-service stop-service restart-service service-status configure-shell build-assets
+.PHONY: clean clean-state clean-layers clean-containers clean-all-state clean-dist install uninstall debug release run run-debug run-release run-with-setup setup-builder all codesign verify-entitlements help kernel kernel-rebuild install-grpc-plugin test vminit vminit-rebuild vminit-debug gen-grpc gen-buildinfo dist dist-pkg dist-dmg notarize check-publish-env publish install-service uninstall-service start-service stop-service restart-service service-status configure-shell build-assets
 
 # Default build configuration
 CONFIGURATION ?= debug
@@ -123,11 +123,12 @@ run: codesign
 	@rm -f /tmp/arca.sock
 	@$(BUILD_DIR)/$(BINARY) daemon start --socket-path /tmp/arca.sock
 
-# Run the daemon in foreground mode (debug build)
+# Run the daemon in foreground mode (debug build) with logs piped to file
 run-debug: codesign
 	@echo "Starting Arca daemon (debug)..."
+	@echo "Logs: /tmp/arca_daemon.log"
 	@rm -f /tmp/arca.sock
-	@$(BUILD_DIR)/$(BINARY) daemon start --socket-path /tmp/arca.sock --log-level debug
+	@$(BUILD_DIR)/$(BINARY) daemon start --socket-path /tmp/arca.sock --log-level debug 2>&1 | tee /tmp/arca_daemon.log
 
 # Run the daemon in foreground mode (release build)
 run-release:
@@ -619,9 +620,10 @@ help:
 	@echo "  make debug           - Build and codesign debug binary"
 	@echo "  make release         - Build and codesign release binary"
 	@echo "  make run             - Build, sign, and run daemon (debug) at /tmp/arca.sock"
+	@echo "  make run-debug       - Same as 'run' with debug logging (logs to /tmp/arca_daemon.log)"
+	@echo "  make run-release     - Build, sign, and run daemon (release) at /tmp/arca.sock"
 	@echo "  make run-with-setup  - Start daemon in background + auto-configure buildx"
 	@echo "  make setup-builder   - Setup buildx builder with default-load=true"
-	@echo "  make run-release     - Build, sign, and run daemon (release) at /tmp/arca.sock"
 	@echo "  make test            - Run all tests"
 	@echo "  make clean           - Remove all build artifacts"
 	@echo "  make clean-state     - Remove state database only"

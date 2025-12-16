@@ -181,6 +181,22 @@ public struct OverlayFSMounter: Sendable {
             FilePath(path),
             minDiskSize: sizeBytes
         )
+
+        // Pre-create /upper and /work directories for OverlayFS
+        // IMPORTANT: This is critical for docker cp to never-started containers.
+        // When these directories are created through VirtioFS + loop device during
+        // docker cp, the filesystem gets corrupted (directories become 60-byte stubs
+        // with mode d---------). By pre-creating them here as real ext4 directories,
+        // docker cp can write files directly without needing to create these dirs.
+        try formatter.create(
+            path: FilePath("/upper"),
+            mode: EXT4.Inode.Mode(.S_IFDIR, 0o755)
+        )
+        try formatter.create(
+            path: FilePath("/work"),
+            mode: EXT4.Inode.Mode(.S_IFDIR, 0o755)
+        )
+
         try formatter.close()
 
         logger?.info("Writable filesystem created successfully", metadata: [
