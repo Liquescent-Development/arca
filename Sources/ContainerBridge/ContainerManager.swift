@@ -4119,22 +4119,35 @@ public actor ContainerManager {
                         throw ContainerManagerError.volumeManagerNotAvailable
                     }
 
+                    // Try to get existing volume, or auto-create if it doesn't exist
+                    // This matches Docker's behavior of creating volumes on first use
+                    let volumeMetadata: VolumeManager.VolumeMetadata
                     do {
-                        let volumeMetadata = try await volumeManager.inspectVolume(name: source)
-                        expandedHostPath = volumeMetadata.mountpoint
-                        isNamedVolume = true
-                        logger.info("Resolved named volume", metadata: [
+                        volumeMetadata = try await volumeManager.inspectVolume(name: source)
+                        logger.info("Resolved existing named volume", metadata: [
                             "volume": "\(source)",
-                            "mountpoint": "\(expandedHostPath)",
+                            "mountpoint": "\(volumeMetadata.mountpoint)",
                             "format": "\(volumeMetadata.format)"
                         ])
                     } catch {
-                        logger.error("Named volume not found", metadata: [
-                            "volume": "\(source)",
-                            "error": "\(error)"
+                        // Volume doesn't exist - auto-create it (Docker behavior)
+                        logger.info("Auto-creating named volume", metadata: [
+                            "volume": "\(source)"
                         ])
-                        throw ContainerManagerError.volumeNotFound(source)
+                        volumeMetadata = try await volumeManager.createVolume(
+                            name: source,
+                            driver: "local",
+                            driverOpts: [:],
+                            labels: [:]
+                        )
+                        logger.info("Created named volume", metadata: [
+                            "volume": "\(source)",
+                            "mountpoint": "\(volumeMetadata.mountpoint)",
+                            "format": "\(volumeMetadata.format)"
+                        ])
                     }
+                    expandedHostPath = volumeMetadata.mountpoint
+                    isNamedVolume = true
                 }
             }
 

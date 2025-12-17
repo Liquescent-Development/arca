@@ -97,10 +97,23 @@ public struct OverlayFSMounter: Sendable {
             )
             mounts.append(layerMount)
 
+            // Generate device name matching containerization framework's String.blockDeviceTagAllocator()
+            // Layers start at index 2 (vdc): vda=rootfs, vdb=writable, vdc+=layers
+            // Index 0-23 → c-z, 24+ → aa, ab, etc.
+            let deviceIndex = index + 2  // +2 because vda/vdb are reserved
+            let deviceTag: String
+            if deviceIndex < 26 {
+                deviceTag = String(Character(UnicodeScalar(97 + deviceIndex)!))  // 'a' = 97
+            } else {
+                let adjusted = deviceIndex - 26
+                let first = Character(UnicodeScalar(97 + (adjusted / 26))!)
+                let second = Character(UnicodeScalar(97 + (adjusted % 26))!)
+                deviceTag = String(first) + String(second)
+            }
             logger?.debug("Added layer block device mount", metadata: [
                 "index": "\(index)",
                 "source": "\(layerPath.path)",
-                "guest_device": "/dev/vd\(Character(UnicodeScalar(99 + index)!))"  // 'c' = 99, layers start at vdc
+                "guest_device": "/dev/vd\(deviceTag)"
             ])
         }
 
