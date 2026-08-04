@@ -123,6 +123,52 @@ actor UDPProxy {
         return clientMappings[clientAddress]?.outboundChannel
     }
 
+    /// Returns the outbound channel for a client, creating and tracking one if absent.
+    ///
+    /// Channel creation lives on the actor rather than in the calling handler's `Task`
+    /// deliberately. Building the `DatagramBootstrap` involves an escaping
+    /// `channelInitializer` that constructs a non-Sendable `UDPProxyBackendHandler`, and
+    /// awaiting `bind()` on that bootstrap from inside a freshly-created task region makes
+    /// Swift 6.3 fail with "pattern that the region-based isolation checker does not
+    /// understand how to check. Please file a bug". Performing it under actor isolation
+    /// keeps it out of the caller's task region. Awaiting an actor method that returns a
+    /// `Channel` is checkable; doing the bind in the task region is not.
+    ///
+    /// Making this atomic on the actor also closes a check-then-act window in the previous
+    /// arrangement, where two datagrams from the same client could each create a channel
+    /// and the second would overwrite the first's mapping, orphaning it.
+    func outboundChannel(
+        for clientAddress: SocketAddress,
+        eventLoop: EventLoop,
+        inboundChannel: Channel
+    ) async throws -> Channel {
+        if let existing = getOutboundChannel(for: clientAddress) {
+            return existing
+        }
+
+        // Bind the logger so the escaping initializer does not capture the actor.
+        let logger = self.logger
+        let bootstrap = DatagramBootstrap(group: eventLoop)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(
+                    UDPProxyBackendHandler(
+                        inboundChannel: inboundChannel,
+                        clientAddress: clientAddress,
+                        logger: logger
+                    )
+                )
+            }
+
+        let channel = try await bootstrap.bind(host: "0.0.0.0", port: 0).get()
+        trackClient(clientAddress, outboundChannel: channel)
+
+        logger.debug("UDP proxy: Created outbound channel",
+                    metadata: ["clientAddress": "\(clientAddress.description)",
+                              "localPort": "\(channel.localAddress?.port ?? 0)"])
+
+        return channel
+    }
+
     /// Start periodic cleanup task for idle mappings
     private func startCleanupTask() {
         cleanupTask = Task {
@@ -203,37 +249,36 @@ private final class UDPProxyHandler: ChannelInboundHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let envelope = self.unwrapInboundIn(data)
         let clientAddress = envelope.remoteAddress
-        var buffer = envelope.data
+        let buffer = envelope.data
 
         guard let targetAddr = targetSocketAddress else {
             logger.warning("UDP proxy: Target address not resolved, dropping datagram")
             return
         }
 
-        // Use NIO's event loop instead of Task for better concurrency handling
-        context.eventLoop.execute {
-            Task { [weak self, clientAddress, targetAddr, buffer] in
-                // Track client for reply routing
-                guard let self = self, let proxy = self.proxy else { return }
+        guard let proxy = self.proxy else { return }
 
-                // Check if we already have an outbound channel for this client
-                let outboundChannel: Channel
-                if let existing = await proxy.getOutboundChannel(for: clientAddress) {
-                    outboundChannel = existing
-                } else {
-                    // Create new outbound channel for this client
-                    do {
-                        outboundChannel = try await self.createOutboundChannel(context: context, clientAddress: clientAddress)
-                        await proxy.trackClient(clientAddress, outboundChannel: outboundChannel)
-                    } catch {
-                        self.logger.error("Failed to create outbound channel", metadata: ["error": "\(error)"])
-                        return
-                    }
-                }
+        // channelRead already runs on the channel's event loop, so reading the handler's
+        // state here is safe. Bind the Sendable values the Task needs: neither the handler
+        // nor the ChannelHandlerContext is Sendable, and the context in particular is only
+        // valid on this event loop, so neither may be captured by the Task.
+        let eventLoop = context.eventLoop
+        let inboundChannel = context.channel
+        let logger = self.logger
+
+        Task {
+            do {
+                let outbound = try await proxy.outboundChannel(
+                    for: clientAddress,
+                    eventLoop: eventLoop,
+                    inboundChannel: inboundChannel
+                )
 
                 // Forward datagram to target
                 let outboundEnvelope = AddressedEnvelope(remoteAddress: targetAddr, data: buffer)
-                outboundChannel.writeAndFlush(self.wrapOutboundOut(outboundEnvelope), promise: nil)
+                outbound.writeAndFlush(NIOAny(outboundEnvelope), promise: nil)
+            } catch {
+                logger.error("Failed to create outbound channel", metadata: ["error": "\(error)"])
             }
         }
     }
@@ -243,26 +288,6 @@ private final class UDPProxyHandler: ChannelInboundHandler {
                     metadata: ["error": "\(error)"])
     }
 
-    private func createOutboundChannel(context: ChannelHandlerContext, clientAddress: SocketAddress) async throws -> Channel {
-        let bootstrap = DatagramBootstrap(group: context.eventLoop)
-            .channelInitializer { channel in
-                channel.pipeline.addHandler(
-                    UDPProxyBackendHandler(
-                        inboundChannel: context.channel,
-                        clientAddress: clientAddress,
-                        logger: self.logger
-                    )
-                )
-            }
-
-        let channel = try await bootstrap.bind(host: "0.0.0.0", port: 0).get()
-
-        logger.debug("UDP proxy: Created outbound channel",
-                    metadata: ["clientAddress": "\(clientAddress.description)",
-                              "localPort": "\(channel.localAddress?.port ?? 0)"])
-
-        return channel
-    }
 }
 
 // MARK: - UDP Proxy Backend Handler
