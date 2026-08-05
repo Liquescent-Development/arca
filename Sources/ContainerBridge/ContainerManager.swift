@@ -3628,6 +3628,14 @@ public actor ContainerManager {
 
     // MARK: - Volume/Mount Helpers
 
+    /// Where Containerization mounts virtiofs shares inside the VM, one subdirectory per tag.
+    ///
+    /// `LinuxContainer.create()` mounts this before any container mount is applied, and its own
+    /// virtiofs-to-bind transform in `start()` sources from the same path. Bind mounts that read
+    /// from a share must source from here rather than from the share's in-container destination,
+    /// which is only available after that share's own mount has been applied.
+    private static let guestVirtiofsRoot = "/run/virtiofs"
+
     /// The guest-side virtiofs tag Containerization will assign to a share of `source`.
     ///
     /// Arca derives guest paths (/mnt/arca-volumes/<tag>, /mnt/arca-file-mounts/<tag>) from
@@ -3790,12 +3798,15 @@ public actor ContainerManager {
                         ])
                     }
 
-                    // 2. Create bind mount from VirtioFS data/ subdirectory to container path
-                    // vmexec prefixes mount DESTINATIONS with rootfs path, but NOT sources
-                    // So VirtioFS gets mounted at: /run/container/{id}/rootfs/mnt/arca-volumes/{hash}/
-                    // We need the bind mount source to point there (with rootfs prefix)
-                    let containerRootfs = "/run/container/\(dockerID)/rootfs"
-                    let bindSource = "\(containerRootfs)\(guestVolumeMount)/data"
+                    // 2. Create bind mount from the VirtioFS data/ subdirectory to the container path.
+                    // Source from /run/virtiofs/{tag}, which LinuxContainer.create() mounts in the VM
+                    // before any container mount is applied, rather than from the share's own
+                    // in-container destination. Upstream sorts spec.mounts by destination depth
+                    // (sortMountsByDestinationDepth), so a container path shallower than
+                    // /mnt/arca-volumes/{hash} would otherwise be mounted before the share it reads
+                    // from and fail with ENOENT. Sourcing from /run/virtiofs removes the ordering
+                    // dependency instead of trying to satisfy it.
+                    let bindSource = "\(Self.guestVirtiofsRoot)/\(volumeRootHash)/data"
 
                     var bindOptions = ["bind"]
                     if isReadOnly {
@@ -3896,12 +3907,9 @@ public actor ContainerManager {
                         ])
                     }
 
-                    // 2. Create bind mount from VirtioFS location to container path
-                    // vmexec prefixes mount DESTINATIONS with rootfs path, but NOT sources
-                    // So VirtioFS gets mounted at: /run/container/{id}/rootfs/mnt/arca-file-mounts/{hash}/
-                    // We need the bind mount source to point there (with rootfs prefix)
-                    let containerRootfs = "/run/container/\(dockerID)/rootfs"
-                    let bindSource = "\(containerRootfs)\(guestParentMount)/\(filename)"
+                    // 2. Create bind mount from the VirtioFS location to the container path.
+                    // Sourced from /run/virtiofs/{tag} for the same reason as the volume case above.
+                    let bindSource = "\(Self.guestVirtiofsRoot)/\(parentDirHash)/\(filename)"
 
                     // For file bind mounts, we need to signal to vminitd that the target
                     // should be created as an empty file, not a directory
