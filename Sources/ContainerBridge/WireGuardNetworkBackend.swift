@@ -1,7 +1,7 @@
 import Foundation
 import Logging
 import Containerization
-import IP
+import ArcaIP
 
 /// WireGuard backend for Docker bridge networks
 ///
@@ -379,7 +379,7 @@ public actor WireGuardNetworkBackend {
             }
         } else {
             // Auto-allocate IP atomically (prevents race condition)
-            guard let block = IP.Block<IP.V4>(metadata.subnet) else {
+            guard let block = IP.Block(metadata.subnet) else {
                 throw NetworkManagerError.ipAllocationFailed("Invalid subnet format: \(metadata.subnet)")
             }
 
@@ -389,7 +389,7 @@ public actor WireGuardNetworkBackend {
 
             let rangeStart: Int64
             let rangeEnd: Int64
-            if let ipRangeStr = metadata.ipRange, let ipRange = IP.Block<IP.V4>(ipRangeStr) {
+            if let ipRangeStr = metadata.ipRange, let ipRange = IP.Block(ipRangeStr) {
                 rangeStart = Int64(ipRange.range.lowerBound.value)
                 rangeEnd = Int64(ipRange.range.upperBound.value)
             } else {
@@ -1007,7 +1007,7 @@ public actor WireGuardNetworkBackend {
     /// Uses smart IP reclamation - finds first available IP by querying allocated IPs from database
     private func allocateIP(networkID: String, subnet: String) async throws -> String {
         // Parse subnet using swift-ip for type safety
-        guard let block = IP.Block<IP.V4>(subnet) else {
+        guard let block = IP.Block(subnet) else {
             throw NetworkManagerError.ipAllocationFailed("Invalid subnet format: \(subnet)")
         }
 
@@ -1024,14 +1024,18 @@ public actor WireGuardNetworkBackend {
         // Check if ipRange is specified for this network to constrain allocation
         let (rangeStart, rangeEnd): (IP.V4, IP.V4)
         if let metadata = try await loadNetwork(id: networkID), let ipRangeStr = metadata.ipRange,
-           let ipRange = IP.Block<IP.V4>(ipRangeStr) {
+           let ipRange = IP.Block(ipRangeStr) {
             // Use ip-range to constrain allocation
             rangeStart = ipRange.range.lowerBound
             rangeEnd = ipRange.range.upperBound
         } else {
             // Use full subnet range (excluding network address and broadcast)
             rangeStart = startIP
-            rangeEnd = block.range.upperBound  // This is broadcast - 1 already
+            // NOTE: this bound is the broadcast address itself, not broadcast-1
+            // as this comment previously claimed, and the loop below is
+            // inclusive of it. Tracked as a separate defect; behaviour is
+            // deliberately unchanged here.
+            rangeEnd = block.range.upperBound
         }
 
         // Iterate through IP range to find first available
@@ -1070,7 +1074,7 @@ public actor WireGuardNetworkBackend {
     /// Calculate gateway IP from subnet CIDR
     private func calculateGateway(subnet: String) -> String {
         // For Docker compatibility, use .1 as gateway (e.g., 172.18.0.1 for 172.18.0.0/16)
-        guard let block = IP.Block<IP.V4>(subnet) else {
+        guard let block = IP.Block(subnet) else {
             return "172.18.0.1"  // Fallback
         }
 
@@ -1112,7 +1116,7 @@ public actor WireGuardNetworkBackend {
     /// Check if an IP address is within a subnet (CIDR)
     private func isIPInSubnet(_ ip: String, subnet: String) -> Bool {
         // Parse subnet and IP using swift-ip for type-safe checking
-        guard let block = IP.Block<IP.V4>(subnet),
+        guard let block = IP.Block(subnet),
               let address = IP.V4(ip) else {
             return false
         }

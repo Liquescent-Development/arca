@@ -1,5 +1,5 @@
 {
-  "originHash" : "a1cde01c766eaf01b4e27537a079fc75a85d2a2121903530fa599ce75f65b0f4",
+  "originHash" : "4fecaade70bdb045659873fae138e820064d1349413fa6031d6c5aaa9884f022",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -119,15 +119,6 @@
       }
     },
     {
-      "identity" : "swift-bson",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/tayloraswift/swift-bson",
-      "state" : {
-        "revision" : "0d7c9735b726f931a67da00b836e8fd383f43cb3",
-        "version" : "1.0.0"
-      }
-    },
-    {
       "identity" : "swift-certificates",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-certificates.git",
@@ -164,24 +155,6 @@
       }
     },
     {
-      "identity" : "swift-grammar",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/tayloraswift/swift-grammar",
-      "state" : {
-        "revision" : "0dac977b50bf677b2c3adabd7d5586a7b6e09b17",
-        "version" : "0.5.0"
-      }
-    },
-    {
-      "identity" : "swift-hash",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/tayloraswift/swift-hash",
-      "state" : {
-        "revision" : "ea0b9fc3152ed5941dd82e4a01e65f99fe1a75d2",
-        "version" : "0.7.1"
-      }
-    },
-    {
       "identity" : "swift-http-structured-headers",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-http-structured-headers.git",
@@ -197,24 +170,6 @@
       "state" : {
         "revision" : "a0a57e949a8903563aba4615869310c0ebf14c03",
         "version" : "1.4.0"
-      }
-    },
-    {
-      "identity" : "swift-ip",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/tayloraswift/swift-ip.git",
-      "state" : {
-        "revision" : "ba4efb6457f69f5f483094aa1230e8e76cc4999c",
-        "version" : "0.3.3"
-      }
-    },
-    {
-      "identity" : "swift-json",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/tayloraswift/swift-json",
-      "state" : {
-        "revision" : "a349369773603889a915c645cb7b0cf8de255181",
-        "version" : "1.2.0"
       }
     },
     {
@@ -323,15 +278,6 @@
       "state" : {
         "revision" : "b626d3002773b1a1304166643e7f118f724b2132",
         "version" : "1.0.4"
-      }
-    },
-    {
-      "identity" : "swift-unixtime",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/tayloraswift/swift-unixtime",
-      "state" : {
-        "revision" : "0a939dd2b955bf5a0aa5ea2073ee21200e1575a3",
-        "version" : "0.2.0"
       }
     },
     {
