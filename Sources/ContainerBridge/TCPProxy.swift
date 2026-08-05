@@ -185,18 +185,25 @@ private final class TCPProxyHandler: ChannelInboundHandler {
             case .failure(let error):
                 // Dump nftables state on connection failure (for debugging)
                 if let dumpFn = self.onConnectionFailed {
+                    // Bind the Sendable values the Task needs. The handler itself is a
+                    // ChannelInboundHandler bound to this event loop and is not Sendable,
+                    // so capturing self here would let it escape into the concurrent context.
+                    let logger = self.logger
+                    let targetAddress = self.targetAddress
+                    let targetPort = self.targetPort
+                    let errorDescription = "\(error)"
                     Task {
                         if let ruleset = await dumpFn() {
-                            self.logger.error("TCP proxy: Failed to connect to target",
-                                            metadata: ["error": "\(error)",
-                                                      "targetAddress": "\(self.targetAddress)",
-                                                      "targetPort": "\(self.targetPort)",
+                            logger.error("TCP proxy: Failed to connect to target",
+                                            metadata: ["error": "\(errorDescription)",
+                                                      "targetAddress": "\(targetAddress)",
+                                                      "targetPort": "\(targetPort)",
                                                       "nftables": "\n\(ruleset)"])
                         } else {
-                            self.logger.warning("TCP proxy: Failed to connect to target",
-                                              metadata: ["error": "\(error)",
-                                                        "targetAddress": "\(self.targetAddress)",
-                                                        "targetPort": "\(self.targetPort)"])
+                            logger.warning("TCP proxy: Failed to connect to target",
+                                              metadata: ["error": "\(errorDescription)",
+                                                        "targetAddress": "\(targetAddress)",
+                                                        "targetPort": "\(targetPort)"])
                         }
                     }
                 } else {

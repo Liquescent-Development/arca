@@ -123,23 +123,35 @@ VMINIT_DIR="$HOME/.arca/vminit"
 rm -rf "$VMINIT_DIR"
 mkdir -p "$VMINIT_DIR"
 
-# Create rootfs tarball with cctl, adding our custom binaries
-ROOTFS_TAR="$VMINIT_DIR/vminit-rootfs.tar"
+# Create the OCI image from the rootfs tar produced by `make init`.
+#
+# The 2026-08 upstream merge changed this flow. `cctl rootfs create` no longer assembles a
+# rootfs from --vminitd/--vmexec/--add-file; it now consumes a prebuilt gzip tar, which
+# containerization/scripts/build-initfs.sh writes to bin/init.rootfs.tar.gz along with the
+# ext4 initfs. arca-services is staged into both by the --add-file flag that the fork adds
+# to that script, wired in via the Makefile's INITFS_BUILD_CMD.
 OCI_DIR="$VMINIT_DIR/oci"
+ROOTFS_TAR="$VMINITD_DIR/bin/init.rootfs.tar.gz"
 
-echo "  Using cctl to create rootfs with Swift runtime..."
+if [ ! -f "$ROOTFS_TAR" ]; then
+    echo "ERROR: rootfs tar not found at $ROOTFS_TAR"
+    echo "Expected 'make init' to have produced it."
+    exit 1
+fi
+
+# Confirm arca-services actually made it into the rootfs, rather than trusting the flag.
+if ! tar -tzf "$ROOTFS_TAR" | grep -q '^\./sbin/arca-services$'; then
+    echo "ERROR: arca-services missing from $ROOTFS_TAR"
+    echo "Check the --add-file wiring in containerization/Makefile (INITFS_BUILD_CMD)."
+    exit 1
+fi
+echo "  ✓ arca-services present in rootfs tar"
+
+echo "  Creating arca-vminit:latest image from rootfs tar..."
 "$CCTL_BINARY" rootfs create \
-    --vminitd "$VMINITD_BINARY" \
-    --vmexec "$VMEXEC_BINARY" \
-    --add-file "$VMINITD_DIR/vminitd/extensions/arca-services/arca-services:/sbin/arca-services" \
     --image arca-vminit:latest \
     --label org.opencontainers.image.source=https://github.com/Vas-Solutus/arca \
     "$ROOTFS_TAR"
-
-if [ ! -f "$ROOTFS_TAR" ]; then
-    echo "ERROR: cctl failed to create rootfs tarball"
-    exit 1
-fi
 
 echo "  ✓ Rootfs tarball created: $(du -h "$ROOTFS_TAR" | awk '{print $1}')"
 

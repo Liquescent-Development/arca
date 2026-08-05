@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import Containerization
 import ContainerizationOCI
+import ContainerizationOS
 import ContainerizationEXT4
 import SystemPackage
 import Virtualization
@@ -239,7 +240,7 @@ public actor ContainerManager {
         nativeManager = try await Containerization.ContainerManager(
             kernel: kernel,
             initfsReference: "arca-vminit:latest",  // Custom vminit loaded and tagged by ArcaDaemon
-            network: try Containerization.ContainerManager.VmnetNetwork()
+            network: try Containerization.VmnetNetwork()
         )
 
         // Initialize OverlayFS unpacker for parallel layer caching
@@ -791,16 +792,16 @@ public actor ContainerManager {
         // host network containers use Apple's vmnet framework and don't have networkAttachments
         if info.hostConfig.networkMode == "host", let nativeContainer = nativeContainers[dockerID] {
             // Get all vmnet interfaces from native container
-            // Try to cast each interface to ContainerManager.VmnetNetwork.Interface
+            // Try to cast each interface to VmnetNetwork.Interface
             var vmnetIndex = 0
             for iface in nativeContainer.interfaces {
-                if let vmnetInterface = iface as? Containerization.ContainerManager.VmnetNetwork.Interface {
-                    // Parse address string "192.168.81.2/24" into IP and prefix
-                    let addressComponents = vmnetInterface.address.split(separator: "/")
-                    let ipString = String(addressComponents[0])  // "192.168.81.2"
-                    let prefixLen = addressComponents.count > 1 ? Int(addressComponents[1]) ?? 24 : 24
+                if let vmnetInterface = iface as? Containerization.VmnetNetwork.Interface {
+                    // Interface.ipv4Address is a CIDRv4 ("192.168.81.2/24"); take its
+                    // components directly rather than re-parsing a formatted string.
+                    let ipString = vmnetInterface.ipv4Address.address.description  // "192.168.81.2"
+                    let prefixLen = Int(vmnetInterface.ipv4Address.prefix.length)
 
-                    let gatewayString = vmnetInterface.gateway
+                    let gatewayString = vmnetInterface.ipv4Gateway?.description
 
                     // Use "host" for the first interface, "host1", "host2" for additional ones
                     let networkName = vmnetIndex == 0 ? "host" : "host\(vmnetIndex)"
@@ -909,42 +910,30 @@ public actor ContainerManager {
     /// Docker semantics:
     /// - privileged=true: Grant ALL capabilities (CAP_CHOWN, CAP_NET_ADMIN, etc.)
     /// - Otherwise: Start with Docker's default caps, then apply cap-add/cap-drop
+    /// - Note: `CapabilityName(rawValue:)` rejects names Linux does not define, so an
+    ///   unrecognised `--cap-add`/`--cap-drop` value now fails container creation instead
+    ///   of being passed through to the OCI spec verbatim.
     private func buildLinuxCapabilities(
         privileged: Bool,
         capAdd: [String]?,
         capDrop: [String]?
-    ) -> ContainerizationOCI.LinuxCapabilities {
-        // Full list of all Linux capabilities (as of Linux 5.x)
-        let allCapabilities = [
-            "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
-            "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
-            "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST",
-            "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER",
-            "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE",
-            "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE",
-            "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD",
-            "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL", "CAP_SETFCAP",
-            "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG", "CAP_WAKE_ALARM",
-            "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF",
-            "CAP_CHECKPOINT_RESTORE"
-        ]
-
+    ) throws -> Containerization.LinuxCapabilities {
         // Docker's default capabilities (matches Docker 20.10+)
         // These are the capabilities granted to non-privileged containers
-        let dockerDefaultCapabilities = [
-            "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER",
-            "CAP_MKNOD", "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID",
-            "CAP_SETFCAP", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE",
-            "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE"
+        let dockerDefaultCapabilities: [CapabilityName] = [
+            .chown, .dacOverride, .fsetid, .fowner,
+            .mknod, .netRaw, .setgid, .setuid,
+            .setfcap, .setpcap, .netBindService,
+            .sysChroot, .kill, .auditWrite
         ]
 
-        var caps: [String]
+        var caps: [CapabilityName]
 
         if privileged {
             // Privileged mode: Grant ALL capabilities
-            caps = allCapabilities
+            caps = CapabilityName.allCases
             logger.debug("Privileged mode enabled - granting all capabilities", metadata: [
-                "capability_count": "\(allCapabilities.count)"
+                "capability_count": "\(caps.count)"
             ])
         } else {
             // Normal mode: Start with Docker default capabilities
@@ -954,9 +943,10 @@ public actor ContainerManager {
         // Apply cap-add (add capabilities)
         if let add = capAdd, !add.isEmpty {
             for cap in add {
-                let normalizedCap = cap.hasPrefix("CAP_") ? cap : "CAP_\(cap.uppercased())"
-                if !caps.contains(normalizedCap) {
-                    caps.append(normalizedCap)
+                // CapabilityName normalizes case and the "CAP_" prefix itself.
+                let parsed = try CapabilityName(rawValue: cap)
+                if !caps.contains(parsed) {
+                    caps.append(parsed)
                 }
             }
             logger.debug("Added capabilities", metadata: [
@@ -967,8 +957,8 @@ public actor ContainerManager {
         // Apply cap-drop (remove capabilities)
         if let drop = capDrop, !drop.isEmpty {
             for cap in drop {
-                let normalizedCap = cap.hasPrefix("CAP_") ? cap : "CAP_\(cap.uppercased())"
-                caps.removeAll { $0 == normalizedCap }
+                let parsed = try CapabilityName(rawValue: cap)
+                caps.removeAll { $0 == parsed }
             }
             logger.debug("Dropped capabilities", metadata: [
                 "dropped": "\(drop.joined(separator: ", "))"
@@ -977,7 +967,7 @@ public actor ContainerManager {
 
         // LinuxCapabilities has 5 sets: bounding, effective, inheritable, permitted, ambient
         // Docker's behavior: Set the same capabilities in all sets for simplicity
-        return ContainerizationOCI.LinuxCapabilities(
+        return Containerization.LinuxCapabilities(
             bounding: caps,
             effective: caps,
             inheritable: caps,
@@ -1068,7 +1058,7 @@ public actor ContainerManager {
         let imageWorkingDir = imageConfig.config?.workingDir ?? "/"
 
         // Build capabilities before closure for @Sendable capture
-        let capabilities = buildLinuxCapabilities(
+        let capabilities = try buildLinuxCapabilities(
             privileged: config.privileged,
             capAdd: config.capAdd,
             capDrop: config.capDrop
@@ -2771,7 +2761,8 @@ public actor ContainerManager {
         ])
 
         // Send signal to container using Containerization API
-        try await nativeContainer.kill(signalNumber)
+        // `kill` takes a `Signal` rather than a bare Int32 as of upstream 0.40.
+        try await nativeContainer.kill(Containerization.Signal(rawValue: signalNumber))
 
         logger.info("Signal sent to container successfully", metadata: [
             "id": "\(dockerID)",
@@ -2879,8 +2870,8 @@ public actor ContainerManager {
 
         logger.debug("Container statistics retrieved", metadata: [
             "id": "\(dockerID)",
-            "memory_usage": "\(stats.memory.usageBytes)",
-            "cpu_usage": "\(stats.cpu.usageUsec)"
+            "memory_usage": "\(stats.memory?.usageBytes.description ?? "unavailable")",
+            "cpu_usage": "\(stats.cpu?.usageUsec.description ?? "unavailable")"
         ])
 
         return stats
@@ -3637,6 +3628,25 @@ public actor ContainerManager {
 
     // MARK: - Volume/Mount Helpers
 
+    /// Where Containerization mounts virtiofs shares inside the VM, one subdirectory per tag.
+    ///
+    /// `LinuxContainer.create()` mounts this before any container mount is applied, and its own
+    /// virtiofs-to-bind transform in `start()` sources from the same path. Bind mounts that read
+    /// from a share must source from here rather than from the share's in-container destination,
+    /// which is only available after that share's own mount has been applied.
+    private static let guestVirtiofsRoot = "/run/virtiofs"
+
+    /// The guest-side virtiofs tag Containerization will assign to a share of `source`.
+    ///
+    /// Arca derives guest paths (/mnt/arca-volumes/<tag>, /mnt/arca-file-mounts/<tag>) from
+    /// this value, so it must match the tag `AttachedFilesystem` computes for the same share.
+    /// Upstream replaced the free function `hashMountSource(source:)` with `Mount.tagHash` and
+    /// made it resolve symlinks before hashing; delegating keeps the two in step rather than
+    /// re-deriving the hash here.
+    private static func virtiofsTag(forSource source: String) throws -> String {
+        try Containerization.Mount.share(source: source, destination: "/").tagHash
+    }
+
     /// Parse Docker volume mount strings into Containerization.Mount objects
     /// Supports both bind mounts and named volumes:
     /// - Bind mounts: "/host/path:/container/path[:ro]" or "relative/path:/container/path[:ro]"
@@ -3770,7 +3780,7 @@ public actor ContainerManager {
                     let volumeRoot = (volumeMetadata.mountpoint as NSString).deletingLastPathComponent
 
                     // Create unique mount point for volume root using deterministic hash
-                    let volumeRootHash = try hashMountSource(source: volumeRoot)
+                    let volumeRootHash = try Self.virtiofsTag(forSource: volumeRoot)
                     let guestVolumeMount = "/mnt/arca-volumes/\(volumeRootHash)"
 
                     // 1. Track VirtioFS mount for volume root (deduplicated)
@@ -3788,12 +3798,15 @@ public actor ContainerManager {
                         ])
                     }
 
-                    // 2. Create bind mount from VirtioFS data/ subdirectory to container path
-                    // vmexec prefixes mount DESTINATIONS with rootfs path, but NOT sources
-                    // So VirtioFS gets mounted at: /run/container/{id}/rootfs/mnt/arca-volumes/{hash}/
-                    // We need the bind mount source to point there (with rootfs prefix)
-                    let containerRootfs = "/run/container/\(dockerID)/rootfs"
-                    let bindSource = "\(containerRootfs)\(guestVolumeMount)/data"
+                    // 2. Create bind mount from the VirtioFS data/ subdirectory to the container path.
+                    // Source from /run/virtiofs/{tag}, which LinuxContainer.create() mounts in the VM
+                    // before any container mount is applied, rather than from the share's own
+                    // in-container destination. Upstream sorts spec.mounts by destination depth
+                    // (sortMountsByDestinationDepth), so a container path shallower than
+                    // /mnt/arca-volumes/{hash} would otherwise be mounted before the share it reads
+                    // from and fail with ENOENT. Sourcing from /run/virtiofs removes the ordering
+                    // dependency instead of trying to satisfy it.
+                    let bindSource = "\(Self.guestVirtiofsRoot)/\(volumeRootHash)/data"
 
                     var bindOptions = ["bind"]
                     if isReadOnly {
@@ -3873,9 +3886,9 @@ public actor ContainerManager {
                     let filename = (expandedHostPath as NSString).lastPathComponent
 
                     // Create unique mount point for parent directory using deterministic hash
-                    // Must use hashMountSource() which is the same hash used for VirtioFS tags
+                    // Must use the same hash used for VirtioFS tags
                     // This ensures consistency between the VirtioFS mount and bind mount paths
-                    let parentDirHash = try hashMountSource(source: parentDir)
+                    let parentDirHash = try Self.virtiofsTag(forSource: parentDir)
                     let guestParentMount = "/mnt/arca-file-mounts/\(parentDirHash)"
 
                     // 1. Track VirtioFS mount for parent directory (deduplicated)
@@ -3894,12 +3907,9 @@ public actor ContainerManager {
                         ])
                     }
 
-                    // 2. Create bind mount from VirtioFS location to container path
-                    // vmexec prefixes mount DESTINATIONS with rootfs path, but NOT sources
-                    // So VirtioFS gets mounted at: /run/container/{id}/rootfs/mnt/arca-file-mounts/{hash}/
-                    // We need the bind mount source to point there (with rootfs prefix)
-                    let containerRootfs = "/run/container/\(dockerID)/rootfs"
-                    let bindSource = "\(containerRootfs)\(guestParentMount)/\(filename)"
+                    // 2. Create bind mount from the VirtioFS location to the container path.
+                    // Sourced from /run/virtiofs/{tag} for the same reason as the volume case above.
+                    let bindSource = "\(Self.guestVirtiofsRoot)/\(parentDirHash)/\(filename)"
 
                     // For file bind mounts, we need to signal to vminitd that the target
                     // should be created as an empty file, not a directory

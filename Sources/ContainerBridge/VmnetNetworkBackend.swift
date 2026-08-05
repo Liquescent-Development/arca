@@ -146,7 +146,7 @@ public actor VmnetNetworkBackend {
         logger.info("Allocated vmnet interface for container", metadata: [
             "container_id": "\(containerID)",
             "network_id": "\(networkID)",
-            "ip": "\(interface.address)"
+            "ip": "\(interface.ipv4Address)"
         ])
 
         // Update metadata
