@@ -394,6 +394,23 @@ public actor WireGuardNetworkBackend {
                 rangeEnd = Int64(ipRange.range.upperBound.value)
             } else {
                 rangeStart = Int64(startIP.value)
+                // DEFECT (Vas-Solutus/arca#50), deliberately unfixed. This is
+                // the LIVE allocation path. `range.upperBound` is the subnet's
+                // broadcast address, not broadcast-1, and allocateAndReserveIP
+                // treats the bound as inclusive, so a container can be
+                // allocated its subnet's broadcast address.
+                //
+                // Worse on /31 and /32: rangeStart exceeds rangeEnd, so the
+                // first attach silently allocates an address outside the
+                // network and the second reaches `for ip in rangeStart...
+                // rangeEnd` in StateStore.allocateAndReserveIP — a closed range
+                // with lowerBound > upperBound — which traps and kills the
+                // daemon. Subnets are accepted verbatim with no prefix-length
+                // check (effectiveSubnet, ~line 178), so this is reachable from
+                // `docker network create --subnet 10.0.0.0/31`.
+                //
+                // Fix HERE, not in allocateIP() below: that function has no
+                // callers, though it carries a similar note.
                 rangeEnd = Int64(block.range.upperBound.value)
             }
 

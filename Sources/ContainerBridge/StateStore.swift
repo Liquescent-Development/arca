@@ -955,7 +955,13 @@ public actor StateStore {
     ///   - containerID: The container to allocate IP for
     ///   - networkID: The network to allocate IP on
     ///   - rangeStart: First IP in allocation range as integer
-    ///   - rangeEnd: Last IP in allocation range as integer
+    ///   - rangeEnd: Last IP in allocation range as integer. **Callers currently
+    ///     pass the subnet's broadcast address, and this method treats the bound
+    ///     as inclusive** — see `Vas-Solutus/arca#50`. This method does not
+    ///     validate `rangeStart <= rangeEnd`, and the fallback scan below is
+    ///     `for ip in rangeStart...rangeEnd`, a closed range: an inverted pair
+    ///     traps and kills the daemon. That is reachable today via a `/31` or
+    ///     `/32` subnet from `WireGuardNetworkBackend.attachContainer`.
     ///   - gatewayInt: Gateway IP as integer (to skip)
     ///   - macAddress: MAC address for the attachment
     ///   - aliases: DNS aliases for the attachment
