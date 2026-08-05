@@ -75,6 +75,17 @@ let package = Package(
             ]
         ),
 
+        // Internal IPv4/CIDR types. Zero dependencies by design: this target
+        // replaced swift-ip, whose transitive graph pinned commits that no
+        // longer exist upstream and made the tree impossible to build cold.
+        // Adding a dependency here would forfeit that property.
+        .target(name: "ArcaIP"),
+
+        .testTarget(
+            name: "ArcaIPTests",
+            dependencies: ["ArcaIP"]
+        ),
+
         // Tests
         .testTarget(
             name: "ArcaTests",
