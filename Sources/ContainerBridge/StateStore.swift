@@ -2,7 +2,7 @@ import Foundation
 import SQLite
 import Logging
 import Containerization
-import IP
+import ArcaIP
 
 /// StateStore manages persistent container and network state in SQLite
 /// All operations are atomic and thread-safe via actor isolation

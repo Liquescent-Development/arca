@@ -16,7 +16,6 @@ let package = Package(
         .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.23.0"),
         .package(url: "https://github.com/stephencelis/SQLite.swift.git", from: "0.15.4"),
         .package(url: "https://github.com/tsolomko/SWCompression.git", from: "4.8.0"),
-        .package(url: "https://github.com/tayloraswift/swift-ip.git", exact: "0.3.3"),
     ],
     targets: [
         // Main executable target
@@ -71,8 +70,19 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "GRPC", package: "grpc-swift"),
                 .product(name: "SQLite", package: "SQLite.swift"),
-                .product(name: "IP", package: "swift-ip"),
+                "ArcaIP",
             ]
+        ),
+
+        // Internal IPv4/CIDR types. Zero dependencies by design: this target
+        // replaced swift-ip, whose transitive graph pinned commits that no
+        // longer exist upstream and made the tree impossible to build cold.
+        // Adding a dependency here would forfeit that property.
+        .target(name: "ArcaIP"),
+
+        .testTarget(
+            name: "ArcaIPTests",
+            dependencies: ["ArcaIP"]
         ),
 
         // Tests
