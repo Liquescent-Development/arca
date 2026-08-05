@@ -29,6 +29,33 @@
       }
     },
     {
+      "identity" : "grpc-swift-2",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/grpc/grpc-swift-2.git",
+      "state" : {
+        "revision" : "28cdd63ef88583ddc67d7bb179eab46fab465ce9",
+        "version" : "2.4.2"
+      }
+    },
+    {
+      "identity" : "grpc-swift-nio-transport",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/grpc/grpc-swift-nio-transport.git",
+      "state" : {
+        "revision" : "c46f77c07c3ae4fce4734e7af03fcb35ab544428",
+        "version" : "2.9.1"
+      }
+    },
+    {
+      "identity" : "grpc-swift-protobuf",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/grpc/grpc-swift-protobuf.git",
+      "state" : {
+        "revision" : "8723cf856dc23d9c2fad4d874e7b9ed3254acf03",
+        "version" : "2.3.0"
+      }
+    },
+    {
       "identity" : "sqlite.swift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/stephencelis/SQLite.swift.git",
@@ -60,8 +87,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-argument-parser.git",
       "state" : {
-        "revision" : "cdd0ef3755280949551dc26dee5de9ddeda89f54",
-        "version" : "1.6.2"
+        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "version" : "1.8.2"
       }
     },
     {
@@ -195,8 +222,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-log.git",
       "state" : {
-        "revision" : "ce592ae52f982c847a4efc0dd881cc9eb32d29f2",
-        "version" : "1.6.4"
+        "revision" : "a878e7f8f46cfc0e1125e565b5c08e7d5272dc9a",
+        "version" : "1.14.0"
       }
     },
     {
@@ -204,8 +231,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio.git",
       "state" : {
-        "revision" : "4e8f4b1c9adaa59315c523540c1ff2b38adc20a9",
-        "version" : "2.87.0"
+        "revision" : "0b18836bd8b0162e7e17a995a3fbee20ed8f3b2b",
+        "version" : "2.101.3"
       }
     },
     {
@@ -222,8 +249,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio-http2.git",
       "state" : {
-        "revision" : "5e9e99ec96c53bc2c18ddd10c1e25a3cd97c55e5",
-        "version" : "1.38.0"
+        "revision" : "45bdf670248be5f16ec0340e125dca285536f0fb",
+        "version" : "1.45.0"
       }
     },
     {
@@ -231,8 +258,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio-ssl.git",
       "state" : {
-        "revision" : "d3bad3847c53015fe8ec1e6c3ab54e53a5b6f15f",
-        "version" : "2.35.0"
+        "revision" : "d930168b86f46ca51a4bc09c5ca45c1833db8067",
+        "version" : "2.37.2"
       }
     },
     {
@@ -285,8 +312,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-system.git",
       "state" : {
-        "revision" : "395a77f0aa927f0ff73941d7ac35f2b46d47c9db",
-        "version" : "1.6.3"
+        "revision" : "704705c5c51156ede21172a38654d522ce487074",
+        "version" : "1.8.0"
       }
     },
     {
@@ -305,6 +332,15 @@
       "state" : {
         "revision" : "0a939dd2b955bf5a0aa5ea2073ee21200e1575a3",
         "version" : "0.2.0"
+      }
+    },
+    {
+      "identity" : "zstd",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/facebook/zstd.git",
+      "state" : {
+        "revision" : "f8745da6ff1ad1e7bab384bd1f9d742439278e99",
+        "version" : "1.5.7"
       }
     }
   ],
