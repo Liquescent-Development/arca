@@ -570,7 +570,7 @@ public struct ContainerHandlers: Sendable {
 
             // Transform to Docker format
             let now = ISO8601DateFormatter().string(from: Date())
-            let dockerStats = transformToDockerStats(
+            let dockerStats = try transformToDockerStats(
                 stats: stats,
                 containerID: containerInfo.id,
                 containerName: containerInfo.name,
@@ -605,60 +605,49 @@ public struct ContainerHandlers: Sendable {
     }
 
     /// Transform Apple ContainerStatistics to Docker stats format
+    ///
+    /// Every `ContainerStatistics` category became optional upstream: a category is nil
+    /// when the guest did not report it. Docker's `/stats` payload has no representation
+    /// for "unknown" in the cpu/memory/pids objects, so a missing one is surfaced as an
+    /// error rather than reported as zero. The blkio and network collections already model
+    /// absence (they are omitted when empty), so nil there is just the empty case.
     private func transformToDockerStats(
         stats: Containerization.ContainerStatistics,
         containerID: String,
         containerName: String,
         timestamp: String
-    ) -> ContainerStatsResponse {
-        // Convert microseconds to nanoseconds for Docker compatibility
-        let cpuUsageNano = stats.cpu.usageUsec * 1000
-        let userUsageNano = stats.cpu.userUsec * 1000
-        let systemUsageNano = stats.cpu.systemUsec * 1000
-        let throttledTimeNano = stats.cpu.throttledTimeUsec * 1000
+    ) throws -> ContainerStatsResponse {
+        let cpuStats = try buildCPUStats(from: stats)
 
-        // Build CPU stats
-        let cpuUsage = CPUUsage(
-            totalUsage: cpuUsageNano,
-            usageInKernelmode: systemUsageNano,
-            usageInUsermode: userUsageNano
-        )
-
-        let throttlingData = ThrottlingData(
-            periods: stats.cpu.throttlingPeriods,
-            throttledPeriods: stats.cpu.throttledPeriods,
-            throttledTime: throttledTimeNano
-        )
-
-        let cpuStats = CPUStats(
-            cpuUsage: cpuUsage,
-            systemCpuUsage: cpuUsageNano,  // Approximate
-            onlineCpus: ProcessInfo.processInfo.processorCount,
-            throttlingData: throttlingData
-        )
+        guard let memory = stats.memory else {
+            throw ContainerError.statsFailed("container \(containerID) reported no memory statistics")
+        }
+        guard let process = stats.process else {
+            throw ContainerError.statsFailed("container \(containerID) reported no process statistics")
+        }
 
         // Build memory stats
         let memoryStatsDetails = MemoryStatsDetails(
-            cache: stats.memory.cacheBytes,
-            pgfault: stats.memory.pageFaults,
-            pgmajfault: stats.memory.majorPageFaults
+            cache: memory.cacheBytes,
+            pgfault: memory.pageFaults,
+            pgmajfault: memory.majorPageFaults
         )
 
         let memoryStats = MemoryStats(
-            usage: stats.memory.usageBytes,
-            limit: stats.memory.limitBytes,
+            usage: memory.usageBytes,
+            limit: memory.limitBytes,
             stats: memoryStatsDetails
         )
 
         // Build PID stats
         let pidsStats = PidsStats(
-            current: stats.process.current,
-            limit: stats.process.limit
+            current: process.current,
+            limit: process.limit
         )
 
         // Build block I/O stats
         var blkioEntries: [BlkioStatEntry] = []
-        for device in stats.blockIO.devices {
+        for device in stats.blockIO?.devices ?? [] {
             blkioEntries.append(BlkioStatEntry(
                 major: device.major,
                 minor: device.minor,
@@ -679,7 +668,7 @@ public struct ContainerHandlers: Sendable {
 
         // Build network stats
         var networks: [String: NetworkStats] = [:]
-        for netStat in stats.networks {
+        for netStat in stats.networks ?? [] {
             networks[netStat.interface] = NetworkStats(
                 rxBytes: netStat.receivedBytes,
                 rxPackets: netStat.receivedPackets,
@@ -766,7 +755,7 @@ public struct ContainerHandlers: Sendable {
                         let currentTimestamp = ISO8601DateFormatter().string(from: Date())
 
                         // Build stats response with previous values for deltas
-                        var statsResponse = self.transformToDockerStats(
+                        var statsResponse = try self.transformToDockerStats(
                             stats: currentStats,
                             containerID: containerInfo.id,
                             containerName: containerInfo.name,
@@ -775,6 +764,9 @@ public struct ContainerHandlers: Sendable {
 
                         // Update preread and precpu stats if we have previous values
                         if let prevTimestamp = previousTimestamp {
+                            let precpuStats = try previousStats.map { prevStats in
+                                try self.buildCPUStats(from: prevStats)
+                            }
                             statsResponse = ContainerStatsResponse(
                                 id: statsResponse.id,
                                 name: statsResponse.name,
@@ -782,9 +774,7 @@ public struct ContainerHandlers: Sendable {
                                 preread: prevTimestamp,
                                 pidsStats: statsResponse.pidsStats,
                                 cpuStats: statsResponse.cpuStats,
-                                precpuStats: previousStats.map { prevStats in
-                                    self.buildCPUStats(from: prevStats)
-                                } ?? statsResponse.cpuStats,
+                                precpuStats: precpuStats ?? statsResponse.cpuStats,
                                 memoryStats: statsResponse.memoryStats,
                                 blkioStats: statsResponse.blkioStats,
                                 networks: statsResponse.networks
@@ -835,12 +825,17 @@ public struct ContainerHandlers: Sendable {
         }
     }
 
-    /// Helper to build CPUStats from ContainerStatistics (for precpu stats)
-    private func buildCPUStats(from stats: Containerization.ContainerStatistics) -> CPUStats {
-        let cpuUsageNano = stats.cpu.usageUsec * 1000
-        let userUsageNano = stats.cpu.userUsec * 1000
-        let systemUsageNano = stats.cpu.systemUsec * 1000
-        let throttledTimeNano = stats.cpu.throttledTimeUsec * 1000
+    /// Helper to build CPUStats from ContainerStatistics (used for both cpu and precpu stats)
+    private func buildCPUStats(from stats: Containerization.ContainerStatistics) throws -> CPUStats {
+        guard let cpu = stats.cpu else {
+            throw ContainerError.statsFailed("container \(stats.id) reported no CPU statistics")
+        }
+
+        // Convert microseconds to nanoseconds for Docker compatibility
+        let cpuUsageNano = cpu.usageUsec * 1000
+        let userUsageNano = cpu.userUsec * 1000
+        let systemUsageNano = cpu.systemUsec * 1000
+        let throttledTimeNano = cpu.throttledTimeUsec * 1000
 
         let cpuUsage = CPUUsage(
             totalUsage: cpuUsageNano,
@@ -849,14 +844,14 @@ public struct ContainerHandlers: Sendable {
         )
 
         let throttlingData = ThrottlingData(
-            periods: stats.cpu.throttlingPeriods,
-            throttledPeriods: stats.cpu.throttledPeriods,
+            periods: cpu.throttlingPeriods,
+            throttledPeriods: cpu.throttledPeriods,
             throttledTime: throttledTimeNano
         )
 
         return CPUStats(
             cpuUsage: cpuUsage,
-            systemCpuUsage: cpuUsageNano,
+            systemCpuUsage: cpuUsageNano,  // Approximate
             onlineCpus: ProcessInfo.processInfo.processorCount,
             throttlingData: throttlingData
         )
