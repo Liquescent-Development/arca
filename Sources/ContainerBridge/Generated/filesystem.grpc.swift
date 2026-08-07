@@ -48,6 +48,26 @@ public protocol Arca_Filesystem_V1_FilesystemServiceClientProtocol: GRPCClient {
     _ request: Arca_Filesystem_V1_CreateBindMountRequest,
     callOptions: CallOptions?
   ) -> UnaryCall<Arca_Filesystem_V1_CreateBindMountRequest, Arca_Filesystem_V1_CreateBindMountResponse>
+
+  func statPath(
+    _ request: Arca_Filesystem_V1_StatPathRequest,
+    callOptions: CallOptions?
+  ) -> UnaryCall<Arca_Filesystem_V1_StatPathRequest, Arca_Filesystem_V1_StatPathResponse>
+
+  func createVolumeOverlay(
+    _ request: Arca_Filesystem_V1_CreateVolumeOverlayRequest,
+    callOptions: CallOptions?
+  ) -> UnaryCall<Arca_Filesystem_V1_CreateVolumeOverlayRequest, Arca_Filesystem_V1_CreateVolumeOverlayResponse>
+
+  func createDirectMount(
+    _ request: Arca_Filesystem_V1_CreateDirectMountRequest,
+    callOptions: CallOptions?
+  ) -> UnaryCall<Arca_Filesystem_V1_CreateDirectMountRequest, Arca_Filesystem_V1_CreateDirectMountResponse>
+
+  func generateHostsFile(
+    _ request: Arca_Filesystem_V1_GenerateHostsFileRequest,
+    callOptions: CallOptions?
+  ) -> UnaryCall<Arca_Filesystem_V1_GenerateHostsFileRequest, Arca_Filesystem_V1_GenerateHostsFileResponse>
 }
 
 extension Arca_Filesystem_V1_FilesystemServiceClientProtocol {
@@ -173,6 +193,88 @@ extension Arca_Filesystem_V1_FilesystemServiceClientProtocol {
       interceptors: self.interceptors?.makeCreateBindMountInterceptors() ?? []
     )
   }
+
+  /// Stat path - check if a path exists and get metadata
+  /// Used for HEAD requests on archive endpoint
+  ///
+  /// - Parameters:
+  ///   - request: Request to send to StatPath.
+  ///   - callOptions: Call options.
+  /// - Returns: A `UnaryCall` with futures for the metadata, status and response.
+  public func statPath(
+    _ request: Arca_Filesystem_V1_StatPathRequest,
+    callOptions: CallOptions? = nil
+  ) -> UnaryCall<Arca_Filesystem_V1_StatPathRequest, Arca_Filesystem_V1_StatPathResponse> {
+    return self.makeUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.statPath.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeStatPathInterceptors() ?? []
+    )
+  }
+
+  /// Create volume overlay - create OverlayFS mount for a volume
+  /// Overlays an EXT4 upper layer on top of VirtioFS lower layer
+  /// This provides full POSIX compliance (Unix sockets, chmod) while maintaining
+  /// read access to host files via VirtioFS
+  /// Used for bind mounts that need both host file access AND POSIX compliance
+  ///
+  /// - Parameters:
+  ///   - request: Request to send to CreateVolumeOverlay.
+  ///   - callOptions: Call options.
+  /// - Returns: A `UnaryCall` with futures for the metadata, status and response.
+  public func createVolumeOverlay(
+    _ request: Arca_Filesystem_V1_CreateVolumeOverlayRequest,
+    callOptions: CallOptions? = nil
+  ) -> UnaryCall<Arca_Filesystem_V1_CreateVolumeOverlayRequest, Arca_Filesystem_V1_CreateVolumeOverlayResponse> {
+    return self.makeUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createVolumeOverlay.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeCreateVolumeOverlayInterceptors() ?? []
+    )
+  }
+
+  /// Create direct volume mount - bind mount EXT4 directory to container path
+  /// Creates a directory on the writable EXT4 filesystem and bind mounts it
+  /// Provides full POSIX compliance without OverlayFS (allows nested overlays)
+  /// Used for named volumes (local driver) that don't need host file access
+  ///
+  /// - Parameters:
+  ///   - request: Request to send to CreateDirectMount.
+  ///   - callOptions: Call options.
+  /// - Returns: A `UnaryCall` with futures for the metadata, status and response.
+  public func createDirectMount(
+    _ request: Arca_Filesystem_V1_CreateDirectMountRequest,
+    callOptions: CallOptions? = nil
+  ) -> UnaryCall<Arca_Filesystem_V1_CreateDirectMountRequest, Arca_Filesystem_V1_CreateDirectMountResponse> {
+    return self.makeUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createDirectMount.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeCreateDirectMountInterceptors() ?? []
+    )
+  }
+
+  /// Generate /etc/hosts file for container
+  /// Creates the standard Docker hosts file with localhost entries and container hostname
+  /// Docker generates this file; we need to do the same for compatibility
+  ///
+  /// - Parameters:
+  ///   - request: Request to send to GenerateHostsFile.
+  ///   - callOptions: Call options.
+  /// - Returns: A `UnaryCall` with futures for the metadata, status and response.
+  public func generateHostsFile(
+    _ request: Arca_Filesystem_V1_GenerateHostsFileRequest,
+    callOptions: CallOptions? = nil
+  ) -> UnaryCall<Arca_Filesystem_V1_GenerateHostsFileRequest, Arca_Filesystem_V1_GenerateHostsFileResponse> {
+    return self.makeUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.generateHostsFile.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeGenerateHostsFileInterceptors() ?? []
+    )
+  }
 }
 
 @available(*, deprecated)
@@ -268,6 +370,26 @@ public protocol Arca_Filesystem_V1_FilesystemServiceAsyncClientProtocol: GRPCCli
     _ request: Arca_Filesystem_V1_CreateBindMountRequest,
     callOptions: CallOptions?
   ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_CreateBindMountRequest, Arca_Filesystem_V1_CreateBindMountResponse>
+
+  func makeStatPathCall(
+    _ request: Arca_Filesystem_V1_StatPathRequest,
+    callOptions: CallOptions?
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_StatPathRequest, Arca_Filesystem_V1_StatPathResponse>
+
+  func makeCreateVolumeOverlayCall(
+    _ request: Arca_Filesystem_V1_CreateVolumeOverlayRequest,
+    callOptions: CallOptions?
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_CreateVolumeOverlayRequest, Arca_Filesystem_V1_CreateVolumeOverlayResponse>
+
+  func makeCreateDirectMountCall(
+    _ request: Arca_Filesystem_V1_CreateDirectMountRequest,
+    callOptions: CallOptions?
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_CreateDirectMountRequest, Arca_Filesystem_V1_CreateDirectMountResponse>
+
+  func makeGenerateHostsFileCall(
+    _ request: Arca_Filesystem_V1_GenerateHostsFileRequest,
+    callOptions: CallOptions?
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_GenerateHostsFileRequest, Arca_Filesystem_V1_GenerateHostsFileResponse>
 }
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
@@ -351,6 +473,54 @@ extension Arca_Filesystem_V1_FilesystemServiceAsyncClientProtocol {
       interceptors: self.interceptors?.makeCreateBindMountInterceptors() ?? []
     )
   }
+
+  public func makeStatPathCall(
+    _ request: Arca_Filesystem_V1_StatPathRequest,
+    callOptions: CallOptions? = nil
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_StatPathRequest, Arca_Filesystem_V1_StatPathResponse> {
+    return self.makeAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.statPath.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeStatPathInterceptors() ?? []
+    )
+  }
+
+  public func makeCreateVolumeOverlayCall(
+    _ request: Arca_Filesystem_V1_CreateVolumeOverlayRequest,
+    callOptions: CallOptions? = nil
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_CreateVolumeOverlayRequest, Arca_Filesystem_V1_CreateVolumeOverlayResponse> {
+    return self.makeAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createVolumeOverlay.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeCreateVolumeOverlayInterceptors() ?? []
+    )
+  }
+
+  public func makeCreateDirectMountCall(
+    _ request: Arca_Filesystem_V1_CreateDirectMountRequest,
+    callOptions: CallOptions? = nil
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_CreateDirectMountRequest, Arca_Filesystem_V1_CreateDirectMountResponse> {
+    return self.makeAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createDirectMount.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeCreateDirectMountInterceptors() ?? []
+    )
+  }
+
+  public func makeGenerateHostsFileCall(
+    _ request: Arca_Filesystem_V1_GenerateHostsFileRequest,
+    callOptions: CallOptions? = nil
+  ) -> GRPCAsyncUnaryCall<Arca_Filesystem_V1_GenerateHostsFileRequest, Arca_Filesystem_V1_GenerateHostsFileResponse> {
+    return self.makeAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.generateHostsFile.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeGenerateHostsFileInterceptors() ?? []
+    )
+  }
 }
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
@@ -426,6 +596,54 @@ extension Arca_Filesystem_V1_FilesystemServiceAsyncClientProtocol {
       interceptors: self.interceptors?.makeCreateBindMountInterceptors() ?? []
     )
   }
+
+  public func statPath(
+    _ request: Arca_Filesystem_V1_StatPathRequest,
+    callOptions: CallOptions? = nil
+  ) async throws -> Arca_Filesystem_V1_StatPathResponse {
+    return try await self.performAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.statPath.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeStatPathInterceptors() ?? []
+    )
+  }
+
+  public func createVolumeOverlay(
+    _ request: Arca_Filesystem_V1_CreateVolumeOverlayRequest,
+    callOptions: CallOptions? = nil
+  ) async throws -> Arca_Filesystem_V1_CreateVolumeOverlayResponse {
+    return try await self.performAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createVolumeOverlay.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeCreateVolumeOverlayInterceptors() ?? []
+    )
+  }
+
+  public func createDirectMount(
+    _ request: Arca_Filesystem_V1_CreateDirectMountRequest,
+    callOptions: CallOptions? = nil
+  ) async throws -> Arca_Filesystem_V1_CreateDirectMountResponse {
+    return try await self.performAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createDirectMount.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeCreateDirectMountInterceptors() ?? []
+    )
+  }
+
+  public func generateHostsFile(
+    _ request: Arca_Filesystem_V1_GenerateHostsFileRequest,
+    callOptions: CallOptions? = nil
+  ) async throws -> Arca_Filesystem_V1_GenerateHostsFileResponse {
+    return try await self.performAsyncUnaryCall(
+      path: Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.generateHostsFile.path,
+      request: request,
+      callOptions: callOptions ?? self.defaultCallOptions,
+      interceptors: self.interceptors?.makeGenerateHostsFileInterceptors() ?? []
+    )
+  }
 }
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
@@ -464,6 +682,18 @@ public protocol Arca_Filesystem_V1_FilesystemServiceClientInterceptorFactoryProt
 
   /// - Returns: Interceptors to use when invoking 'createBindMount'.
   func makeCreateBindMountInterceptors() -> [ClientInterceptor<Arca_Filesystem_V1_CreateBindMountRequest, Arca_Filesystem_V1_CreateBindMountResponse>]
+
+  /// - Returns: Interceptors to use when invoking 'statPath'.
+  func makeStatPathInterceptors() -> [ClientInterceptor<Arca_Filesystem_V1_StatPathRequest, Arca_Filesystem_V1_StatPathResponse>]
+
+  /// - Returns: Interceptors to use when invoking 'createVolumeOverlay'.
+  func makeCreateVolumeOverlayInterceptors() -> [ClientInterceptor<Arca_Filesystem_V1_CreateVolumeOverlayRequest, Arca_Filesystem_V1_CreateVolumeOverlayResponse>]
+
+  /// - Returns: Interceptors to use when invoking 'createDirectMount'.
+  func makeCreateDirectMountInterceptors() -> [ClientInterceptor<Arca_Filesystem_V1_CreateDirectMountRequest, Arca_Filesystem_V1_CreateDirectMountResponse>]
+
+  /// - Returns: Interceptors to use when invoking 'generateHostsFile'.
+  func makeGenerateHostsFileInterceptors() -> [ClientInterceptor<Arca_Filesystem_V1_GenerateHostsFileRequest, Arca_Filesystem_V1_GenerateHostsFileResponse>]
 }
 
 public enum Arca_Filesystem_V1_FilesystemServiceClientMetadata {
@@ -477,6 +707,10 @@ public enum Arca_Filesystem_V1_FilesystemServiceClientMetadata {
       Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.readArchive,
       Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.writeArchive,
       Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createBindMount,
+      Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.statPath,
+      Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createVolumeOverlay,
+      Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.createDirectMount,
+      Arca_Filesystem_V1_FilesystemServiceClientMetadata.Methods.generateHostsFile,
     ]
   )
 
@@ -514,6 +748,30 @@ public enum Arca_Filesystem_V1_FilesystemServiceClientMetadata {
     public static let createBindMount = GRPCMethodDescriptor(
       name: "CreateBindMount",
       path: "/arca.filesystem.v1.FilesystemService/CreateBindMount",
+      type: GRPCCallType.unary
+    )
+
+    public static let statPath = GRPCMethodDescriptor(
+      name: "StatPath",
+      path: "/arca.filesystem.v1.FilesystemService/StatPath",
+      type: GRPCCallType.unary
+    )
+
+    public static let createVolumeOverlay = GRPCMethodDescriptor(
+      name: "CreateVolumeOverlay",
+      path: "/arca.filesystem.v1.FilesystemService/CreateVolumeOverlay",
+      type: GRPCCallType.unary
+    )
+
+    public static let createDirectMount = GRPCMethodDescriptor(
+      name: "CreateDirectMount",
+      path: "/arca.filesystem.v1.FilesystemService/CreateDirectMount",
+      type: GRPCCallType.unary
+    )
+
+    public static let generateHostsFile = GRPCMethodDescriptor(
+      name: "GenerateHostsFile",
+      path: "/arca.filesystem.v1.FilesystemService/GenerateHostsFile",
       type: GRPCCallType.unary
     )
   }

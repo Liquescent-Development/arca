@@ -18,13 +18,13 @@ import SwiftProtobuf
 // incompatible with the version of SwiftProtobuf to which you are linking.
 // Please ensure that you are building against the same version of the API
 // that was used to generate this file.
-fileprivate struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
+fileprivate nonisolated struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
   struct _2: SwiftProtobuf.ProtobufAPIVersion_2 {}
   typealias Version = _2
 }
 
 /// Request to check service readiness
-public struct Arca_Wireguard_V1_ReadyRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_ReadyRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -35,7 +35,7 @@ public struct Arca_Wireguard_V1_ReadyRequest: Sendable {
 }
 
 /// Response indicating service readiness
-public struct Arca_Wireguard_V1_ReadyResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_ReadyResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -55,7 +55,7 @@ public struct Arca_Wireguard_V1_ReadyResponse: Sendable {
 }
 
 /// Request to add a network to the container
-public struct Arca_Wireguard_V1_AddNetworkRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_AddNetworkRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -104,7 +104,7 @@ public struct Arca_Wireguard_V1_AddNetworkRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_AddNetworkResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_AddNetworkResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -137,7 +137,7 @@ public struct Arca_Wireguard_V1_AddNetworkResponse: Sendable {
 }
 
 /// Request to remove a network from the container
-public struct Arca_Wireguard_V1_RemoveNetworkRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_RemoveNetworkRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -153,7 +153,7 @@ public struct Arca_Wireguard_V1_RemoveNetworkRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_RemoveNetworkResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_RemoveNetworkResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -173,7 +173,7 @@ public struct Arca_Wireguard_V1_RemoveNetworkResponse: Sendable {
 }
 
 /// Request WireGuard status
-public struct Arca_Wireguard_V1_GetStatusRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_GetStatusRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -183,7 +183,7 @@ public struct Arca_Wireguard_V1_GetStatusRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_GetStatusResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_GetStatusResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -205,7 +205,7 @@ public struct Arca_Wireguard_V1_GetStatusResponse: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_InterfaceStatus: Sendable {
+public nonisolated struct Arca_Wireguard_V1_InterfaceStatus: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -230,7 +230,7 @@ public struct Arca_Wireguard_V1_InterfaceStatus: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_PeerStatus: Sendable {
+public nonisolated struct Arca_Wireguard_V1_PeerStatus: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -255,11 +255,11 @@ public struct Arca_Wireguard_V1_PeerStatus: Sendable {
 
   /// Transfer statistics
   public var stats: Arca_Wireguard_V1_TransferStats {
-    get {return _stats ?? Arca_Wireguard_V1_TransferStats()}
+    get {_stats ?? Arca_Wireguard_V1_TransferStats()}
     set {_stats = newValue}
   }
   /// Returns true if `stats` has been explicitly set.
-  public var hasStats: Bool {return self._stats != nil}
+  public var hasStats: Bool {self._stats != nil}
   /// Clears the value of `stats`. Subsequent reads from it will return its default value.
   public mutating func clearStats() {self._stats = nil}
 
@@ -270,7 +270,7 @@ public struct Arca_Wireguard_V1_PeerStatus: Sendable {
   fileprivate var _stats: Arca_Wireguard_V1_TransferStats? = nil
 }
 
-public struct Arca_Wireguard_V1_TransferStats: Sendable {
+public nonisolated struct Arca_Wireguard_V1_TransferStats: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -290,7 +290,7 @@ public struct Arca_Wireguard_V1_TransferStats: Sendable {
 }
 
 /// Request for vmnet endpoint information
-public struct Arca_Wireguard_V1_GetVmnetEndpointRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_GetVmnetEndpointRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -300,7 +300,7 @@ public struct Arca_Wireguard_V1_GetVmnetEndpointRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_GetVmnetEndpointResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_GetVmnetEndpointResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -320,7 +320,7 @@ public struct Arca_Wireguard_V1_GetVmnetEndpointResponse: Sendable {
 }
 
 /// Request to add a peer to a WireGuard interface
-public struct Arca_Wireguard_V1_AddPeerRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_AddPeerRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -354,7 +354,7 @@ public struct Arca_Wireguard_V1_AddPeerRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_AddPeerResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_AddPeerResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -374,7 +374,7 @@ public struct Arca_Wireguard_V1_AddPeerResponse: Sendable {
 }
 
 /// Request to remove a peer from a WireGuard interface
-public struct Arca_Wireguard_V1_RemovePeerRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_RemovePeerRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -396,7 +396,7 @@ public struct Arca_Wireguard_V1_RemovePeerRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_RemovePeerResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_RemovePeerResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -416,7 +416,7 @@ public struct Arca_Wireguard_V1_RemovePeerResponse: Sendable {
 }
 
 /// Request to publish a port (expose container port on host)
-public struct Arca_Wireguard_V1_PublishPortRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_PublishPortRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -438,7 +438,7 @@ public struct Arca_Wireguard_V1_PublishPortRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_PublishPortResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_PublishPortResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -455,7 +455,7 @@ public struct Arca_Wireguard_V1_PublishPortResponse: Sendable {
 }
 
 /// Request to unpublish a port (remove port exposure)
-public struct Arca_Wireguard_V1_UnpublishPortRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_UnpublishPortRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -471,7 +471,7 @@ public struct Arca_Wireguard_V1_UnpublishPortRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_UnpublishPortResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_UnpublishPortResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -488,7 +488,7 @@ public struct Arca_Wireguard_V1_UnpublishPortResponse: Sendable {
 }
 
 /// Request to dump nftables state for debugging
-public struct Arca_Wireguard_V1_DumpNftablesRequest: Sendable {
+public nonisolated struct Arca_Wireguard_V1_DumpNftablesRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -498,7 +498,7 @@ public struct Arca_Wireguard_V1_DumpNftablesRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Wireguard_V1_DumpNftablesResponse: Sendable {
+public nonisolated struct Arca_Wireguard_V1_DumpNftablesResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -520,9 +520,9 @@ public struct Arca_Wireguard_V1_DumpNftablesResponse: Sendable {
 
 // MARK: - Code below here is support for the SwiftProtobuf runtime.
 
-fileprivate let _protobuf_package = "arca.wireguard.v1"
+fileprivate nonisolated let _protobuf_package = "arca.wireguard.v1"
 
-extension Arca_Wireguard_V1_ReadyRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_ReadyRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadyRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -541,7 +541,7 @@ extension Arca_Wireguard_V1_ReadyRequest: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Arca_Wireguard_V1_ReadyResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_ReadyResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadyResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}ready\0\u{1}version\0\u{3}uptime_ms\0")
 
@@ -581,7 +581,7 @@ extension Arca_Wireguard_V1_ReadyResponse: SwiftProtobuf.Message, SwiftProtobuf.
   }
 }
 
-extension Arca_Wireguard_V1_AddNetworkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_AddNetworkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AddNetworkRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}network_id\0\u{3}network_index\0\u{3}private_key\0\u{3}listen_port\0\u{3}peer_endpoint\0\u{3}peer_public_key\0\u{3}ip_address\0\u{3}network_cidr\0\u{1}gateway\0\u{3}host_ip\0\u{3}extra_hosts\0\u{3}container_id\0")
 
@@ -666,7 +666,7 @@ extension Arca_Wireguard_V1_AddNetworkRequest: SwiftProtobuf.Message, SwiftProto
   }
 }
 
-extension Arca_Wireguard_V1_AddNetworkResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_AddNetworkResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AddNetworkResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0\u{3}total_networks\0\u{3}wg_interface\0\u{3}eth_interface\0\u{3}public_key\0\u{3}namespace_path\0")
 
@@ -726,7 +726,7 @@ extension Arca_Wireguard_V1_AddNetworkResponse: SwiftProtobuf.Message, SwiftProt
   }
 }
 
-extension Arca_Wireguard_V1_RemoveNetworkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_RemoveNetworkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RemoveNetworkRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}network_id\0\u{3}network_index\0")
 
@@ -761,7 +761,7 @@ extension Arca_Wireguard_V1_RemoveNetworkRequest: SwiftProtobuf.Message, SwiftPr
   }
 }
 
-extension Arca_Wireguard_V1_RemoveNetworkResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_RemoveNetworkResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RemoveNetworkResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0\u{3}remaining_networks\0")
 
@@ -801,7 +801,7 @@ extension Arca_Wireguard_V1_RemoveNetworkResponse: SwiftProtobuf.Message, SwiftP
   }
 }
 
-extension Arca_Wireguard_V1_GetStatusRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_GetStatusRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetStatusRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -820,7 +820,7 @@ extension Arca_Wireguard_V1_GetStatusRequest: SwiftProtobuf.Message, SwiftProtob
   }
 }
 
-extension Arca_Wireguard_V1_GetStatusResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_GetStatusResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetStatusResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}network_count\0\u{1}interfaces\0\u{1}peers\0")
 
@@ -865,7 +865,7 @@ extension Arca_Wireguard_V1_GetStatusResponse: SwiftProtobuf.Message, SwiftProto
   }
 }
 
-extension Arca_Wireguard_V1_InterfaceStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_InterfaceStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".InterfaceStatus"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}network_id\0\u{1}name\0\u{3}public_key\0\u{3}listen_port\0\u{3}ip_addresses\0")
 
@@ -915,7 +915,7 @@ extension Arca_Wireguard_V1_InterfaceStatus: SwiftProtobuf.Message, SwiftProtobu
   }
 }
 
-extension Arca_Wireguard_V1_PeerStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_PeerStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".PeerStatus"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}network_id\0\u{3}interface_name\0\u{3}public_key\0\u{1}endpoint\0\u{3}allowed_ips\0\u{3}latest_handshake\0\u{1}stats\0")
 
@@ -979,7 +979,7 @@ extension Arca_Wireguard_V1_PeerStatus: SwiftProtobuf.Message, SwiftProtobuf._Me
   }
 }
 
-extension Arca_Wireguard_V1_TransferStats: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_TransferStats: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".TransferStats"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}bytes_received\0\u{3}bytes_sent\0\u{3}persistent_keepalive\0")
 
@@ -1019,7 +1019,7 @@ extension Arca_Wireguard_V1_TransferStats: SwiftProtobuf.Message, SwiftProtobuf.
   }
 }
 
-extension Arca_Wireguard_V1_GetVmnetEndpointRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_GetVmnetEndpointRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetVmnetEndpointRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -1038,7 +1038,7 @@ extension Arca_Wireguard_V1_GetVmnetEndpointRequest: SwiftProtobuf.Message, Swif
   }
 }
 
-extension Arca_Wireguard_V1_GetVmnetEndpointResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_GetVmnetEndpointResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetVmnetEndpointResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0\u{1}endpoint\0")
 
@@ -1078,7 +1078,7 @@ extension Arca_Wireguard_V1_GetVmnetEndpointResponse: SwiftProtobuf.Message, Swi
   }
 }
 
-extension Arca_Wireguard_V1_AddPeerRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_AddPeerRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AddPeerRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}network_id\0\u{3}network_index\0\u{3}peer_public_key\0\u{3}peer_endpoint\0\u{3}peer_ip_address\0\u{3}peer_name\0\u{3}peer_container_id\0\u{3}peer_aliases\0")
 
@@ -1143,7 +1143,7 @@ extension Arca_Wireguard_V1_AddPeerRequest: SwiftProtobuf.Message, SwiftProtobuf
   }
 }
 
-extension Arca_Wireguard_V1_AddPeerResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_AddPeerResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AddPeerResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0\u{3}total_peers\0")
 
@@ -1183,7 +1183,7 @@ extension Arca_Wireguard_V1_AddPeerResponse: SwiftProtobuf.Message, SwiftProtobu
   }
 }
 
-extension Arca_Wireguard_V1_RemovePeerRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_RemovePeerRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RemovePeerRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}network_id\0\u{3}network_index\0\u{3}peer_public_key\0\u{3}peer_name\0")
 
@@ -1228,7 +1228,7 @@ extension Arca_Wireguard_V1_RemovePeerRequest: SwiftProtobuf.Message, SwiftProto
   }
 }
 
-extension Arca_Wireguard_V1_RemovePeerResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_RemovePeerResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RemovePeerResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0\u{3}remaining_peers\0")
 
@@ -1268,7 +1268,7 @@ extension Arca_Wireguard_V1_RemovePeerResponse: SwiftProtobuf.Message, SwiftProt
   }
 }
 
-extension Arca_Wireguard_V1_PublishPortRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_PublishPortRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".PublishPortRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}protocol\0\u{3}host_port\0\u{3}container_ip\0\u{3}container_port\0")
 
@@ -1313,7 +1313,7 @@ extension Arca_Wireguard_V1_PublishPortRequest: SwiftProtobuf.Message, SwiftProt
   }
 }
 
-extension Arca_Wireguard_V1_PublishPortResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_PublishPortResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".PublishPortResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0")
 
@@ -1348,7 +1348,7 @@ extension Arca_Wireguard_V1_PublishPortResponse: SwiftProtobuf.Message, SwiftPro
   }
 }
 
-extension Arca_Wireguard_V1_UnpublishPortRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_UnpublishPortRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".UnpublishPortRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}protocol\0\u{3}host_port\0")
 
@@ -1383,7 +1383,7 @@ extension Arca_Wireguard_V1_UnpublishPortRequest: SwiftProtobuf.Message, SwiftPr
   }
 }
 
-extension Arca_Wireguard_V1_UnpublishPortResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_UnpublishPortResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".UnpublishPortResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0")
 
@@ -1418,7 +1418,7 @@ extension Arca_Wireguard_V1_UnpublishPortResponse: SwiftProtobuf.Message, SwiftP
   }
 }
 
-extension Arca_Wireguard_V1_DumpNftablesRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_DumpNftablesRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".DumpNftablesRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -1437,7 +1437,7 @@ extension Arca_Wireguard_V1_DumpNftablesRequest: SwiftProtobuf.Message, SwiftPro
   }
 }
 
-extension Arca_Wireguard_V1_DumpNftablesResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Wireguard_V1_DumpNftablesResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".DumpNftablesResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{1}error\0\u{1}ruleset\0")
 
