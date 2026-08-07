@@ -15,13 +15,13 @@ import SwiftProtobuf
 // incompatible with the version of SwiftProtobuf to which you are linking.
 // Please ensure that you are building against the same version of the API
 // that was used to generate this file.
-fileprivate struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
+fileprivate nonisolated struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
   struct _2: SwiftProtobuf.ProtobufAPIVersion_2 {}
   typealias Version = _2
 }
 
 /// Request to check service readiness
-public struct Arca_Process_V1_ReadyRequest: Sendable {
+public nonisolated struct Arca_Process_V1_ReadyRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -32,7 +32,7 @@ public struct Arca_Process_V1_ReadyRequest: Sendable {
 }
 
 /// Response indicating service readiness
-public struct Arca_Process_V1_ReadyResponse: Sendable {
+public nonisolated struct Arca_Process_V1_ReadyResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -51,7 +51,7 @@ public struct Arca_Process_V1_ReadyResponse: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_StartProcessRequest: Sendable {
+public nonisolated struct Arca_Process_V1_StartProcessRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -61,7 +61,7 @@ public struct Arca_Process_V1_StartProcessRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_StartProcessResponse: Sendable {
+public nonisolated struct Arca_Process_V1_StartProcessResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -80,7 +80,7 @@ public struct Arca_Process_V1_StartProcessResponse: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_GetProcessStatusRequest: Sendable {
+public nonisolated struct Arca_Process_V1_GetProcessStatusRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -90,7 +90,7 @@ public struct Arca_Process_V1_GetProcessStatusRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_GetProcessStatusResponse: Sendable {
+public nonisolated struct Arca_Process_V1_GetProcessStatusResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -109,7 +109,7 @@ public struct Arca_Process_V1_GetProcessStatusResponse: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_ListProcessesRequest: Sendable {
+public nonisolated struct Arca_Process_V1_ListProcessesRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -123,7 +123,7 @@ public struct Arca_Process_V1_ListProcessesRequest: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_ListProcessesResponse: Sendable {
+public nonisolated struct Arca_Process_V1_ListProcessesResponse: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -140,7 +140,7 @@ public struct Arca_Process_V1_ListProcessesResponse: Sendable {
   public init() {}
 }
 
-public struct Arca_Process_V1_ProcessInfo: Sendable {
+public nonisolated struct Arca_Process_V1_ProcessInfo: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -155,9 +155,9 @@ public struct Arca_Process_V1_ProcessInfo: Sendable {
 
 // MARK: - Code below here is support for the SwiftProtobuf runtime.
 
-fileprivate let _protobuf_package = "arca.process.v1"
+fileprivate nonisolated let _protobuf_package = "arca.process.v1"
 
-extension Arca_Process_V1_ReadyRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_ReadyRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadyRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -176,7 +176,7 @@ extension Arca_Process_V1_ReadyRequest: SwiftProtobuf.Message, SwiftProtobuf._Me
   }
 }
 
-extension Arca_Process_V1_ReadyResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_ReadyResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadyResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}ready\0\u{1}version\0\u{3}uptime_ms\0")
 
@@ -216,7 +216,7 @@ extension Arca_Process_V1_ReadyResponse: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 }
 
-extension Arca_Process_V1_StartProcessRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_StartProcessRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StartProcessRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -235,7 +235,7 @@ extension Arca_Process_V1_StartProcessRequest: SwiftProtobuf.Message, SwiftProto
   }
 }
 
-extension Arca_Process_V1_StartProcessResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_StartProcessResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StartProcessResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}success\0\u{3}error_message\0\u{1}pid\0")
 
@@ -275,7 +275,7 @@ extension Arca_Process_V1_StartProcessResponse: SwiftProtobuf.Message, SwiftProt
   }
 }
 
-extension Arca_Process_V1_GetProcessStatusRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_GetProcessStatusRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetProcessStatusRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -294,7 +294,7 @@ extension Arca_Process_V1_GetProcessStatusRequest: SwiftProtobuf.Message, SwiftP
   }
 }
 
-extension Arca_Process_V1_GetProcessStatusResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_GetProcessStatusResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetProcessStatusResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}state\0\u{1}pid\0\u{3}exit_code\0")
 
@@ -334,7 +334,7 @@ extension Arca_Process_V1_GetProcessStatusResponse: SwiftProtobuf.Message, Swift
   }
 }
 
-extension Arca_Process_V1_ListProcessesRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_ListProcessesRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ListProcessesRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}ps_args\0")
 
@@ -364,7 +364,7 @@ extension Arca_Process_V1_ListProcessesRequest: SwiftProtobuf.Message, SwiftProt
   }
 }
 
-extension Arca_Process_V1_ListProcessesResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_ListProcessesResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ListProcessesResponse"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}titles\0\u{1}processes\0")
 
@@ -399,7 +399,7 @@ extension Arca_Process_V1_ListProcessesResponse: SwiftProtobuf.Message, SwiftPro
   }
 }
 
-extension Arca_Process_V1_ProcessInfo: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Arca_Process_V1_ProcessInfo: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ProcessInfo"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}values\0")
 
