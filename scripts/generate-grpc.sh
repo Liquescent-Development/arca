@@ -46,7 +46,6 @@ fi
 # WireGuard Service
 # ============================================================================
 WG_PROTO="$ARCA_SERVICES_DIR/proto/wireguard/wireguard.proto"
-WG_GO_DIR="$ARCA_SERVICES_DIR/proto/wireguard"
 
 echo ""
 echo "→ Generating Swift code for WireGuard Service..."
@@ -60,25 +59,11 @@ else
     echo "  ⚠ Skipping - proto file not found: $WG_PROTO"
 fi
 
-echo ""
-echo "→ Generating Go code for WireGuard Service..."
-if [ -f "$WG_PROTO" ] && command -v protoc-gen-go &> /dev/null && command -v protoc-gen-go-grpc &> /dev/null; then
-    protoc "$WG_PROTO" \
-        --proto_path="$(dirname "$WG_PROTO")" \
-        --go_out="$WG_GO_DIR" \
-        --go_opt=paths=source_relative \
-        --go-grpc_out="$WG_GO_DIR" \
-        --go-grpc_opt=paths=source_relative
-    echo "  ✓ Generated Go code in $WG_GO_DIR"
-else
-    echo "  ⚠ Skipping - proto file or Go plugins not found"
-fi
 
 # ============================================================================
 # Filesystem Service
 # ============================================================================
 FS_PROTO="$ARCA_SERVICES_DIR/proto/filesystem/filesystem.proto"
-FS_GO_DIR="$ARCA_SERVICES_DIR/proto/filesystem"
 
 echo ""
 echo "→ Generating Swift code for Filesystem Service..."
@@ -92,25 +77,11 @@ else
     echo "  ⚠ Skipping - proto file not found: $FS_PROTO"
 fi
 
-echo ""
-echo "→ Generating Go code for Filesystem Service..."
-if [ -f "$FS_PROTO" ] && command -v protoc-gen-go &> /dev/null && command -v protoc-gen-go-grpc &> /dev/null; then
-    protoc "$FS_PROTO" \
-        --proto_path="$(dirname "$FS_PROTO")" \
-        --go_out="$FS_GO_DIR" \
-        --go_opt=paths=source_relative \
-        --go-grpc_out="$FS_GO_DIR" \
-        --go-grpc_opt=paths=source_relative
-    echo "  ✓ Generated Go code in $FS_GO_DIR"
-else
-    echo "  ⚠ Skipping - proto file or Go plugins not found"
-fi
 
 # ============================================================================
 # Process Service
 # ============================================================================
 PROC_PROTO="$ARCA_SERVICES_DIR/proto/process/process.proto"
-PROC_GO_DIR="$ARCA_SERVICES_DIR/proto/process"
 
 echo ""
 echo "→ Generating Swift code for Process Service..."
@@ -124,19 +95,6 @@ else
     echo "  ⚠ Skipping - proto file not found: $PROC_PROTO"
 fi
 
-echo ""
-echo "→ Generating Go code for Process Service..."
-if [ -f "$PROC_PROTO" ] && command -v protoc-gen-go &> /dev/null && command -v protoc-gen-go-grpc &> /dev/null; then
-    protoc "$PROC_PROTO" \
-        --proto_path="$(dirname "$PROC_PROTO")" \
-        --go_out="$PROC_GO_DIR" \
-        --go_opt=paths=source_relative \
-        --go-grpc_out="$PROC_GO_DIR" \
-        --go-grpc_opt=paths=source_relative
-    echo "  ✓ Generated Go code in $PROC_GO_DIR"
-else
-    echo "  ⚠ Skipping - proto file or Go plugins not found"
-fi
 
 # ============================================================================
 # Sandbox Engine Service — the published contract to Arca's consumers
