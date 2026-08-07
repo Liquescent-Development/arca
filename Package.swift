@@ -74,6 +74,24 @@ let package = Package(
             ]
         ),
 
+        // Generated server code for the published sandbox-engine contract,
+        // proto/arca/engine/v1/engine.proto. Its own target, not part of
+        // ContainerBridge, for the same reason the proto sits at the repository
+        // root rather than beside the guest-facing ones: a contract published to
+        // consumers is not a ContainerBridge internal. Regenerate with
+        // scripts/generate-grpc.sh; do not hand-edit the generated files.
+        //
+        // Nothing depends on this target yet. That is deliberate — P3's exit is
+        // "proto exists, both sides generate, nothing implements it yet" — but
+        // `swift build` still compiles it, so the generated code is proven to
+        // build rather than merely proven to have been emitted.
+        .target(
+            name: "SandboxEngineProto",
+            dependencies: [
+                .product(name: "GRPC", package: "grpc-swift"),
+            ]
+        ),
+
         // Internal IPv4/CIDR types. Zero dependencies by design: this target
         // replaced swift-ip, whose transitive graph pinned commits that no
         // longer exist upstream and made the tree impossible to build cold.

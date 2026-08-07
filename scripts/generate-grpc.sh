@@ -138,6 +138,40 @@ else
     echo "  ⚠ Skipping - proto file or Go plugins not found"
 fi
 
+# ============================================================================
+# Sandbox Engine Service — the published contract to Arca's consumers
+# ============================================================================
+# Unlike the three services above, this arm does NOT skip when its input is
+# missing. Those are guest-facing protos that live in a submodule which may not
+# be checked out; a skip there is a real condition. This proto is tracked at
+# this repository's root, so an absent file means the tree is broken, and a
+# generator that prints a warning and exits 0 would let a consumer pin a
+# revision whose server code was never regenerated.
+#
+# --proto_path is the repository's proto root, not the file's own directory, so
+# the generated files nest under arca/engine/v1/ and the import root stays
+# correct if this contract ever imports a sibling. The three arms above use the
+# file's directory because each of their protos is alone in one.
+ENGINE_PROTO="$PROJECT_ROOT/proto/arca/engine/v1/engine.proto"
+ENGINE_PROTO_ROOT="$PROJECT_ROOT/proto"
+ENGINE_SWIFT_DIR="$PROJECT_ROOT/Sources/SandboxEngineProto/Generated"
+
+echo ""
+echo "→ Generating Swift server code for Sandbox Engine Service..."
+if [ ! -f "$ENGINE_PROTO" ]; then
+    echo "ERROR: engine proto is missing: $ENGINE_PROTO"
+    exit 66
+fi
+
+mkdir -p "$ENGINE_SWIFT_DIR"
+# Server only. Arca serves this contract; the client is Gas Can's, generated
+# from the same file by crates/gascan-engine-proto across the signed pin.
+protoc "$ENGINE_PROTO" \
+    --proto_path="$ENGINE_PROTO_ROOT" \
+    --swift_out=Visibility=Public:"$ENGINE_SWIFT_DIR" \
+    --grpc-swift_out=Client=false,Server=true,Visibility=Public:"$ENGINE_SWIFT_DIR"
+echo "  ✓ Generated Swift code: arca/engine/v1/engine.{pb,grpc}.swift"
+
 echo ""
 echo "========================================"
 echo "✓ gRPC code generation complete"
