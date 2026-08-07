@@ -1,0 +1,483 @@
+// Arca Sandbox Engine Protocol
+//
+// Arca's published contract to its consumers. Arca is the server and versions
+// independently, so this file is owned here and not in a consumer's repository.
+// The consumer owns the behavioural specification: its conformance suite decides
+// what a correct answer is, and a contract violation fails a build rather than a
+// document review.
+//
+// GOVERNING RULE: THE PROTOCOL IS THE POLICY. Anything this file cannot express
+// cannot be requested, and therefore never needs validating, logging, or
+// defending. Before adding a field, read "What must stay inexpressible" below.
+//
+// What must stay inexpressible:
+//   - An arbitrary host path to mount. A project root, and nothing else.
+//   - An arbitrary image reference to pull. A content digest the engine already
+//     holds; absent it, the request fails.
+//   - A bind address for a published port. Loopback is implied.
+//   - A network topology, or any mutation of one.
+//   - A change to a running sandbox's topology. No such RPC exists, and its
+//     absence is a security property: a compromised sandbox must have no path to
+//     request reach toward a neighbour.
+//
+// Design and rationale: gascan docs/superpowers/specs/2026-08-07-arca-engine-proto-design.md
+// Contract:            gascan docs/superpowers/specs/2026-08-04-sandbox-engine-contract.md
+
+syntax = "proto3";
+
+package arca.engine.v1;
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// One method per method of the consumer's runtime-backend abstraction. Eleven,
+// and a superset of it is how Docker shapes return: a method here that no
+// backend method needs is a method the consumer's policy compiler cannot gate.
+service SandboxEngine {
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc Inspect(InspectRequest) returns (InspectResponse);
+  rpc Create(CreateRequest) returns (CreateResponse);
+  rpc PrepareImage(PrepareImageRequest) returns (PrepareImageResponse);
+  rpc CreateContainer(CreateContainerRequest) returns (CreateResponse);
+  rpc Start(StartRequest) returns (AckResponse);
+  rpc Stop(StopRequest) returns (AckResponse);
+  rpc Remove(RemoveRequest) returns (AckResponse);
+  rpc Exec(stream ExecClientFrame) returns (stream ExecServerFrame);
+  rpc Logs(LogsRequest) returns (stream LogsChunk);
+  rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Outcomes
+//
+// Every response carries its outcome in a oneof. gRPC status codes are reserved
+// for transport faults -- an unreachable engine, a broken stream -- and carry no
+// engine semantics. The reason is Create: a create that fails after making two
+// of three volumes must report those two, or they leak, and a status code cannot
+// carry them. Uniformity makes that a rule rather than an exception.
+// ---------------------------------------------------------------------------
+
+message EngineError {
+  // Stable identifier, never reworded once shipped. A consumer maps this with a
+  // table, not a judgment, so a new engine failure mode cannot quietly become an
+  // existing one.
+  string code = 1;
+  // The resource the failure is about; empty when it is not about one.
+  string resource = 2;
+  // Human-readable detail. Never parsed.
+  string message = 3;
+  reserved 4;
+}
+
+// Success with nothing to say.
+message Ack { reserved 1; }
+
+message AckResponse {
+  oneof outcome {
+    Ack ok = 1;
+    EngineError error = 2;
+  }
+  reserved 3;
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+  reserved 4;
+}
+
+// Whether the engine can prove a property rather than merely assert it. PROVEN
+// must mean proven: established by observation -- for a guest-enforced network,
+// by dumping the live packet-filter ruleset -- and not by having passed a flag.
+enum Isolation {
+  ISOLATION_UNSPECIFIED = 0;
+  ISOLATION_PROVEN = 1;
+  ISOLATION_UNSUPPORTED = 2;
+  ISOLATION_UNVERIFIED = 3;
+}
+
+message CapabilitiesRequest { reserved 1; }
+
+message Capabilities {
+  // The engine's own version. A consumer refuses to drive an engine version it
+  // does not recognise.
+  Version engine_version = 1;
+  // The contract's minor version. The major version is the package path, so a
+  // consumer speaking arca.engine.v1 that reads contract_minor = N knows exactly
+  // which additive fields it may find populated. Distinct from engine_version on
+  // purpose: an engine bugfix release must not imply a contract revision.
+  uint32 contract_minor = 2;
+  // The engine can mount a project root.
+  bool project_mount = 3;
+  bool named_volumes = 4;
+  bool tty = 5;
+  bool signals = 6;
+  bool loopback_publish = 7;
+  bool resource_limits = 8;
+  // Whether an offline sandbox can be proven to have no egress.
+  Isolation offline = 9;
+  // Reserved for the network-model phase. 10 = egress_policy (Isolation),
+  // 11 = peer_channels (bool). Reserved rather than present: a capability
+  // nothing enforces is a surface that exists and is undefended.
+  reserved 10 to 19;
+}
+
+message CapabilitiesResponse {
+  oneof outcome {
+    Capabilities capabilities = 1;
+    EngineError error = 2;
+  }
+  reserved 3;
+}
+
+// ---------------------------------------------------------------------------
+// Identity and ownership
+// ---------------------------------------------------------------------------
+
+// Labels the consumer attaches to everything it creates. The engine stores them
+// verbatim, echoes them back, and NEVER INTERPRETS THEM. Deciding whether a
+// labelled resource is yours, foreign, or mismatched is the consumer's judgment
+// and it stays there: an engine that decided "this one is yours" would be
+// deciding a policy question inside the component the policy boundary exists to
+// constrain.
+message OwnerLabels {
+  string managed_by = 1;
+  string sandbox_id = 2;
+  reserved 3;
+}
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_CONTAINER = 1;
+  RESOURCE_KIND_VOLUME = 2;
+  RESOURCE_KIND_NETWORK = 3;
+}
+
+message ResourceIdentity {
+  ResourceKind kind = 1;
+  string name = 2;
+  reserved 3;
+}
+
+message Resource {
+  ResourceIdentity identity = 1;
+  // Absent when the engine holds no labels for this resource, which is how a
+  // consumer sees one it does not own.
+  OwnerLabels owner = 2;
+  reserved 3;
+}
+
+// A content digest the engine already holds. A tag is not a field, so "whatever
+// :latest means today" cannot be said, and the engine needs no registry client,
+// no registry credentials, and no keychain access to honour a request.
+message ImageDigest {
+  // Repository name, without tag or digest.
+  string repository = 1;
+  // Lowercase hex SHA-256, exactly 64 characters, with no "sha256:" prefix.
+  string sha256_hex = 2;
+  reserved 3;
+}
+
+// ---------------------------------------------------------------------------
+// Create
+// ---------------------------------------------------------------------------
+
+// The one mount. SINGULAR, NOT REPEATED: a project root is permitted and nothing
+// else, so there is no second mount to name. Always writable -- a read-only
+// project root is not a case that exists, so it is not a field.
+message ProjectMount {
+  // Absolute host path.
+  string host_path = 1;
+  // Absolute guest path.
+  string guest_path = 2;
+  reserved 3;
+}
+
+// An engine-owned volume, referenced by name. The consumer never names a host
+// path for one. Always writable.
+message Volume {
+  string name = 1;
+  string guest_path = 2;
+  uint64 capacity_bytes = 3;
+  reserved 4;
+}
+
+// No bind address: loopback is implied, and it is the only case the capability
+// declaration names.
+message PortMapping {
+  uint32 host_port = 1;
+  uint32 guest_port = 2;
+  reserved 3;
+}
+
+message ResourceLimits {
+  optional uint32 cpus = 1;
+  optional uint64 memory_bytes = 2;
+  optional uint64 disk_bytes = 3;
+  optional uint32 process_count = 4;
+  reserved 5;
+}
+
+message EnvironmentVariable {
+  string name = 1;
+  string value = 2;
+  reserved 3;
+}
+
+message Offline { reserved 1; }
+
+// Declared at create and never afterwards. No RPC changes it: immutability is
+// enforced by the absence of a method, not by a check that a later change could
+// relax.
+message Network {
+  oneof mode {
+    // No egress. The engine must be able to report ISOLATION_PROVEN for this.
+    Offline offline = 1;
+    // Name of an engine-managed network resource, created with the sandbox.
+    string networked_name = 2;
+  }
+  reserved 3;
+}
+
+enum User {
+  USER_UNSPECIFIED = 0;
+  USER_WORKSPACE = 1;
+  USER_ROOT = 2;
+}
+
+message CreateRequest {
+  string sandbox_id = 1;
+  ImageDigest image = 2;
+  ProjectMount project = 3;
+  repeated Volume volumes = 4;
+  repeated PortMapping ports = 5;
+  repeated EnvironmentVariable environment = 6;
+  ResourceLimits resources = 7;
+  Network network = 8;
+  User user = 9;
+  // Run the workspace process under an init.
+  bool init = 10;
+  OwnerLabels owner = 11;
+  // Reserved for the network-model phase. 12 = peer channels. A channel is
+  // declared here or not at all; granting one to a running sandbox is a
+  // privilege-escalation path rather than a convenience, so it gets no RPC.
+  reserved 12 to 19;
+}
+
+message Created {
+  // Every resource the engine created, including the container.
+  repeated Resource created = 1;
+  reserved 2;
+}
+
+// A create that failed partway. The resources already created are reported so
+// the consumer can remove exactly them; losing this evidence leaks resources
+// that nothing afterwards knows to look for.
+message CreateFailed {
+  repeated Resource created = 1;
+  EngineError error = 2;
+  reserved 3;
+}
+
+message CreateResponse {
+  oneof outcome {
+    Created created = 1;
+    CreateFailed failed = 2;
+  }
+  reserved 3;
+}
+
+// Recreate the container of an existing sandbox. The engine creates the
+// container only; everything named in retained already exists and is reused.
+message CreateContainerRequest {
+  CreateRequest create = 1;
+  repeated Resource retained = 2;
+  reserved 3;
+}
+
+// ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+// Materialise a rootfs for content THE ENGINE ALREADY HOLDS. This is the one
+// method that would grow a registry client if nobody were watching it. Absent
+// content is a failure; it is never a fetch.
+//
+// How the engine comes to hold the content is deliberately unanswered by this
+// contract. Do not resolve it by adding a field here.
+message PrepareImageRequest {
+  ImageDigest image = 1;
+  reserved 2;
+}
+
+message PrepareImageResponse {
+  oneof outcome {
+    Ack ok = 1;
+    EngineError error = 2;
+  }
+  reserved 3;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_CREATING = 1;
+  SANDBOX_STATE_RUNNING = 2;
+  SANDBOX_STATE_STOPPED = 3;
+}
+
+message Sandbox {
+  string sandbox_id = 1;
+  ImageDigest image = 2;
+  SandboxState state = 3;
+  OwnerLabels owner = 4;
+  repeated PortMapping ports = 5;
+  reserved 6;
+}
+
+message InspectRequest {
+  string sandbox_id = 1;
+  reserved 2;
+}
+
+message Absent { reserved 1; }
+
+// Three arms, not two. A sandbox that does not exist is an ANSWER, not a
+// failure. Collapsing it into an error would make "it is not there"
+// indistinguishable from "I could not tell", and those demand opposite
+// behaviour from a reconciler.
+message InspectResponse {
+  oneof outcome {
+    Sandbox sandbox = 1;
+    Absent absent = 2;
+    EngineError error = 3;
+  }
+  reserved 4;
+}
+
+message StartRequest {
+  string sandbox_id = 1;
+  reserved 2;
+}
+
+message StopRequest {
+  string sandbox_id = 1;
+  reserved 2;
+}
+
+// Exact resources, named. There is no predicate, prefix, or prune form: the
+// consumer decides what to delete and says so precisely.
+message RemoveRequest {
+  repeated ResourceIdentity resources = 1;
+  // The caller's labels. The engine refuses any resource whose stored labels
+  // differ, so one consumer cannot be induced to delete another's resource.
+  OwnerLabels owner = 2;
+  reserved 3;
+}
+
+message ListResourcesRequest { reserved 1; }
+
+// Every resource the engine holds, labelled or not. Unlabelled ones are not
+// filtered out: a consumer's drift detection depends on seeing them, and hiding
+// them engine-side would break it silently.
+message ResourceList {
+  repeated Resource resources = 1;
+  reserved 2;
+}
+
+message ListResourcesResponse {
+  oneof outcome {
+    ResourceList resources = 1;
+    EngineError error = 2;
+  }
+  reserved 3;
+}
+
+// ---------------------------------------------------------------------------
+// Exec
+// ---------------------------------------------------------------------------
+
+// Opens the session. MUST be the first frame, and exactly one may appear per
+// stream; any other first frame is a protocol error. The stream that starts the
+// exec is the stream that carries it, so no session token binds them.
+message ExecStart {
+  string sandbox_id = 1;
+  // argv as bytes: execve takes bytes, and a consumer holding a non-UTF-8
+  // argument must be able to send it. Environment stays string/string, where
+  // that pressure does not exist.
+  repeated bytes argv = 2;
+  repeated EnvironmentVariable environment = 3;
+  bool tty = 4;
+  reserved 5;
+}
+
+message Resize {
+  uint32 columns = 1;
+  uint32 rows = 2;
+  reserved 3;
+}
+
+message Close { reserved 1; }
+
+message ExecClientFrame {
+  oneof frame {
+    ExecStart start = 1;
+    bytes stdin = 2;
+    Resize resize = 3;
+    // Signal number to forward to the guest process.
+    int32 signal = 4;
+    Close close = 5;
+  }
+  reserved 6;
+}
+
+message Exit {
+  int32 code = 1;
+  int32 signal = 2;
+  reserved 3;
+}
+
+message ExecServerFrame {
+  oneof frame {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    Exit exit = 3;
+    EngineError error = 4;
+  }
+  reserved 5;
+}
+
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
+
+message LogsRequest {
+  string sandbox_id = 1;
+  // Unix milliseconds. Absent means from the beginning.
+  optional int64 since_unix_millis = 2;
+  reserved 3;
+}
+
+// One logical buffer, chunked; the consumer concatenates data frames in order.
+// Streamed rather than unary because a log larger than the default message limit
+// would otherwise fail as a size error rather than as a log.
+//
+// There is deliberately NO follow field. A follow mode is the first step back
+// toward a general container API, and this contract has a size budget for
+// exactly that reason.
+message LogsChunk {
+  oneof outcome {
+    bytes data = 1;
+    EngineError error = 2;
+  }
+  reserved 3;
+}
