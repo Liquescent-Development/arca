@@ -47,11 +47,42 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         )
     }
 
+    /// See the note on the `create(request:)` overload above.
+    ///
+    /// Every capability flag reports what this build implements. Milestone 1
+    /// implements no create and no exec, so every feature flag is false and
+    /// offline is unverified; later milestones flip each flag as they earn
+    /// it. A flag that is true before its code exists induces a consumer to
+    /// send a request the engine cannot honour.
+    func capabilities(request: Arca_Engine_V1_CapabilitiesRequest) async -> Arca_Engine_V1_CapabilitiesResponse {
+        guard let version = engineVersion(from: ArcaVersion.version) else {
+            return Arca_Engine_V1_CapabilitiesResponse.with {
+                $0.error = engineError(
+                    .invalidOutput,
+                    message: "engine version \(ArcaVersion.version) is not a readable semantic version"
+                )
+            }
+        }
+        return Arca_Engine_V1_CapabilitiesResponse.with { response in
+            response.capabilities = Arca_Engine_V1_Capabilities.with { capabilities in
+                capabilities.engineVersion = version
+                capabilities.contractMinor = 0
+                capabilities.projectMount = false
+                capabilities.namedVolumes = false
+                capabilities.tty = false
+                capabilities.signals = false
+                capabilities.loopbackPublish = false
+                capabilities.resourceLimits = false
+                capabilities.offline = .unverified
+            }
+        }
+    }
+
     public func capabilities(
         request: Arca_Engine_V1_CapabilitiesRequest,
         context: GRPCAsyncServerCallContext
     ) async throws -> Arca_Engine_V1_CapabilitiesResponse {
-        Arca_Engine_V1_CapabilitiesResponse.with { $0.error = Self.notImplemented("Capabilities") }
+        await capabilities(request: request)
     }
 
     public func inspect(
