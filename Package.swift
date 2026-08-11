@@ -110,6 +110,18 @@ let package = Package(
             dependencies: ["ArcaEngine"]
         ),
 
+        // The `arca-engine` executable: binds SandboxEngineService to a Unix
+        // socket. Deliberately does NOT depend on DockerAPI or ArcaDaemon, for
+        // the same reason ArcaEngine itself does not.
+        .executableTarget(
+            name: "arca-engine",
+            dependencies: [
+                "ArcaEngine",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+
         // Internal IPv4/CIDR types. Zero dependencies by design: this target
         // replaced swift-ip, whose transitive graph pinned commits that no
         // longer exist upstream and made the tree impossible to build cold.
