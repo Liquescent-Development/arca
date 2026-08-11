@@ -85,11 +85,46 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         await capabilities(request: request)
     }
 
+    /// See the note on the `create(request:)` overload above.
+    func inspect(request: Arca_Engine_V1_InspectRequest) async -> Arca_Engine_V1_InspectResponse {
+        let name = SandboxIdentity.containerName(forSandboxId: request.sandboxID)
+        let found = await engineErrorCatching(.commandIo, resource: name) {
+            try await self.containerManager.getContainer(id: name)
+        }
+        switch found {
+        case .failure(let error):
+            return Arca_Engine_V1_InspectResponse.with { $0.error = error }
+        case .success(nil):
+            return Arca_Engine_V1_InspectResponse.with { $0.absent = Arca_Engine_V1_Absent() }
+        case .success(.some(let container)):
+            guard let digest = imageDigest(fromReference: container.image) else {
+                return Arca_Engine_V1_InspectResponse.with {
+                    $0.error = engineError(
+                        .invalidOutput,
+                        resource: name,
+                        message: "container image \(container.image) is not an exact digest reference"
+                    )
+                }
+            }
+            return Arca_Engine_V1_InspectResponse.with { response in
+                response.sandbox = Arca_Engine_V1_Sandbox.with { sandbox in
+                    sandbox.sandboxID = request.sandboxID
+                    sandbox.image = digest
+                    sandbox.state = sandboxState(fromStatus: container.state.status)
+                    if let owner = SandboxIdentity.owner(from: container.config.labels) {
+                        sandbox.owner = owner
+                    }
+                    sandbox.ports = []
+                }
+            }
+        }
+    }
+
     public func inspect(
         request: Arca_Engine_V1_InspectRequest,
         context: GRPCAsyncServerCallContext
     ) async throws -> Arca_Engine_V1_InspectResponse {
-        Arca_Engine_V1_InspectResponse.with { $0.error = Self.notImplemented("Inspect") }
+        await inspect(request: request)
     }
 
     /// Test seam: grpc-swift's `GRPCAsyncServerCallContext` has no public
