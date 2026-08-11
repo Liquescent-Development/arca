@@ -92,6 +92,24 @@ let package = Package(
             ]
         ),
 
+        // Gas Can's sandbox engine. Deliberately does NOT depend on DockerAPI or
+        // ArcaDaemon: Gas Can builds only the targets it ships, and that absent
+        // edge is asserted by gascan's tests/release/engine-targets-contract.sh.
+        .target(
+            name: "ArcaEngine",
+            dependencies: [
+                "SandboxEngineProto",
+                "ContainerBridge",
+                .product(name: "GRPC", package: "grpc-swift"),
+                .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+
+        .testTarget(
+            name: "ArcaEngineTests",
+            dependencies: ["ArcaEngine"]
+        ),
+
         // Internal IPv4/CIDR types. Zero dependencies by design: this target
         // replaced swift-ip, whose transitive graph pinned commits that no
         // longer exist upstream and made the tree impossible to build cold.
