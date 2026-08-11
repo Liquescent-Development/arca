@@ -231,10 +231,50 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         )
     }
 
+    /// See the note on the `create(request:)` overload above.
+    ///
+    /// Unlabelled resources are reported, never filtered: a resource the
+    /// engine holds no labels for is exactly what a consumer needs to see to
+    /// notice drift, and hiding it here would defeat that silently
+    /// (engine.proto:389-391).
+    func listResources(request: Arca_Engine_V1_ListResourcesRequest) async -> Arca_Engine_V1_ListResourcesResponse {
+        let collected = await engineErrorCatching(.commandIo) {
+            var resources: [Arca_Engine_V1_Resource] = []
+            for container in try await self.containerManager.listContainers(all: true) {
+                resources.append(
+                    resourceMessage(
+                        kind: .container,
+                        name: containerResourceName(names: container.names, id: container.id),
+                        labels: container.labels
+                    )
+                )
+            }
+            for volume in try await self.volumeManager.listVolumes() {
+                resources.append(
+                    resourceMessage(kind: .volume, name: volume.name, labels: volume.labels)
+                )
+            }
+            for network in await self.networkManager.listNetworks() {
+                resources.append(
+                    resourceMessage(kind: .network, name: network.name, labels: network.labels)
+                )
+            }
+            return resources
+        }
+        switch collected {
+        case .failure(let error):
+            return Arca_Engine_V1_ListResourcesResponse.with { $0.error = error }
+        case .success(let resources):
+            return Arca_Engine_V1_ListResourcesResponse.with { response in
+                response.resources = Arca_Engine_V1_ResourceList.with { $0.resources = resources }
+            }
+        }
+    }
+
     public func listResources(
         request: Arca_Engine_V1_ListResourcesRequest,
         context: GRPCAsyncServerCallContext
     ) async throws -> Arca_Engine_V1_ListResourcesResponse {
-        Arca_Engine_V1_ListResourcesResponse.with { $0.error = Self.notImplemented("ListResources") }
+        await listResources(request: request)
     }
 }

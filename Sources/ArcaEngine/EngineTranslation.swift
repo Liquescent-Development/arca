@@ -54,3 +54,41 @@ public func sandboxState(fromStatus status: String) -> Arca_Engine_V1_SandboxSta
     default: return .unspecified
     }
 }
+
+/// The container's resource name, as the contract requires it.
+///
+/// ContainerBridge reports Docker-style names with a leading slash
+/// (Sources/ContainerBridge/ContainerManager.swift:725), but the consumer
+/// compares a container resource's name against the bare sandbox id
+/// (crates/gascan-core/src/runtime.rs:829-832). Reporting the slashed form
+/// would make every owned container look unrelated to the sandbox that owns
+/// it, and drift detection would silently see nothing.
+///
+/// Falls back to the id when there is no name to strip, because an empty
+/// resource name fails the consumer's identity validation and would take the
+/// whole ListResources call down with it.
+public func containerResourceName(names: [String], id: String) -> String {
+    guard let first = names.first else { return id }
+    let stripped = first.hasPrefix("/") ? String(first.dropFirst()) : first
+    return stripped.isEmpty ? id : stripped
+}
+
+/// One resource on the way out.
+///
+/// `owner` stays unset when the engine holds no labels for the resource, which
+/// is how a consumer sees one it does not own (engine.proto:169-173).
+public func resourceMessage(
+    kind: Arca_Engine_V1_ResourceKind,
+    name: String,
+    labels: [String: String]
+) -> Arca_Engine_V1_Resource {
+    Arca_Engine_V1_Resource.with { resource in
+        resource.identity = Arca_Engine_V1_ResourceIdentity.with {
+            $0.kind = kind
+            $0.name = name
+        }
+        if let owner = SandboxIdentity.owner(from: labels) {
+            resource.owner = owner
+        }
+    }
+}
