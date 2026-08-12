@@ -108,7 +108,10 @@ let package = Package(
 
         // Gas Can's sandbox engine. Deliberately does NOT depend on DockerAPI or
         // ArcaDaemon: Gas Can builds only the targets it ships, and that absent
-        // edge is asserted by gascan's tests/release/engine-targets-contract.sh.
+        // edge is asserted by gascan's tests/release/engine-targets-check.sh,
+        // which walks the closure of both this target and the arca-engine
+        // executable below -- the executable is what Gas Can actually ships, so
+        // checking only this one would leave the shipped binary uncovered.
         .target(
             name: "ArcaEngine",
             dependencies: [
