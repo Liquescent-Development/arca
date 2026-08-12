@@ -4,21 +4,32 @@ import XCTest
 @testable import ArcaEngine
 
 final class ListResourcesTests: XCTestCase {
-    /// On an empty engine this is an empty list, not an error. A reconciler
-    /// reads "nothing exists" from this and must not see a failure instead.
+    /// An empty `ResourceList` is not an error arm -- it is a confident report
+    /// of a clean host, and this build cannot earn it.
+    ///
+    /// The assertion that matters is the negative one, for the same reason as
+    /// `InspectTests.testInspectRefusesToReportAbsenceItCannotObserve`. The
+    /// version this replaces asserted `list.resources.isEmpty` against a
+    /// service whose three managers are empty under every input; it would have
+    /// passed against a hardcoded empty list with ContainerBridge deleted.
+    /// gascan's drift and leak detection reads this method, and a clean report
+    /// from a host holding resources is the failure it cannot see.
     ///
     /// Calls the context-free `listResources(request:)` overload rather than
     /// the protocol-conforming `listResources(request:context:)`:
     /// grpc-swift's `GRPCAsyncServerCallContext` has no public initialiser,
     /// so a test target cannot construct one. See SandboxEngineService.swift.
-    func testAnEmptyEngineListsNoResourcesRatherThanFailing() async throws {
+    func testListResourcesRefusesToReportAnEmptinessItCannotObserve() async throws {
         let response = await SandboxEngineService.forTesting()
             .listResources(request: .init())
 
-        guard case .resources(let list) = response.outcome else {
-            return XCTFail("ListResources must answer with a list: \(String(describing: response.outcome))")
+        if case .resources = response.outcome {
+            return XCTFail("a build that loads no state must not report a resource list")
         }
-        XCTAssertTrue(list.resources.isEmpty)
+        guard case .error(let error) = response.outcome else {
+            return XCTFail("ListResources must answer: \(String(describing: response.outcome))")
+        }
+        XCTAssertEqual(error.code, "unsupported_capability")
     }
 
     /// Unlabelled resources are NOT filtered out. gascan's drift detection

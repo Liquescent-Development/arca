@@ -25,20 +25,86 @@ final class SandboxEngineServiceTests: XCTestCase {
         XCTAssertTrue(error.message.contains("Start"), "must name the RPC: \(error.message)")
     }
 
-    /// Every response type sets its oneof. An unset outcome is representable in
-    /// proto3 and reaches the consumer as invalid_output
-    /// (crates/gascan-arca/src/translate.rs:291-293).
-    func testEveryUnimplementedResponseSetsItsOutcome() async throws {
+    /// Every unimplemented response carries an `unsupported_capability` error
+    /// naming its RPC.
+    ///
+    /// This replaces a version that asserted only `XCTAssertNotNil(outcome)`.
+    /// An outcome is non-nil whenever *any* arm is set, so that test passed if
+    /// every one of these methods had answered `ok` -- the precise inversion of
+    /// what its name claimed. The code and the RPC name are what a consumer
+    /// reads, so they are what this asserts.
+    ///
+    /// The eight unary methods only. `Exec` and `Logs` send their error inside
+    /// a stream frame, and `GRPCAsyncResponseStreamWriter` has no initialiser a
+    /// test target can reach; gascan's live tier drives both against a real
+    /// engine over a real socket.
+    func testEveryUnimplementedUnaryMethodAnswersUnsupportedCapability() async throws {
         let service = SandboxEngineService.forTesting()
-        let stopOutcome = await service.stop(request: .init()).outcome
-        let removeOutcome = await service.remove(request: .init()).outcome
-        let createOutcome = await service.create(request: .init()).outcome
-        let createContainerOutcome = await service.createContainer(request: .init()).outcome
-        let prepareImageOutcome = await service.prepareImage(request: .init()).outcome
-        XCTAssertNotNil(stopOutcome)
-        XCTAssertNotNil(removeOutcome)
-        XCTAssertNotNil(createOutcome)
-        XCTAssertNotNil(createContainerOutcome)
-        XCTAssertNotNil(prepareImageOutcome)
+
+        let answers: [(rpc: String, error: Arca_Engine_V1_EngineError?)] = [
+            ("Inspect", engineError(await service.inspect(request: .init()).outcome)),
+            ("ListResources", engineError(await service.listResources(request: .init()).outcome)),
+            ("Create", engineError(await service.create(request: .init()).outcome)),
+            ("CreateContainer", engineError(await service.createContainer(request: .init()).outcome)),
+            ("PrepareImage", engineError(await service.prepareImage(request: .init()).outcome)),
+            ("Start", engineError(await service.start(request: .init()).outcome)),
+            ("Stop", engineError(await service.stop(request: .init()).outcome)),
+            ("Remove", engineError(await service.remove(request: .init()).outcome)),
+        ]
+
+        XCTAssertEqual(answers.count, 8, "the ten-method contract has eight unary methods left")
+        for (rpc, error) in answers {
+            guard let error else {
+                XCTFail("\(rpc) must answer with an error outcome, and did not")
+                continue
+            }
+            XCTAssertEqual(error.code, "unsupported_capability", "\(rpc) answered \(error.code)")
+            XCTAssertTrue(
+                error.message.contains(rpc),
+                "\(rpc)'s message must name the RPC: \(error.message)"
+            )
+        }
     }
+}
+
+// Reads the `EngineError` out of whichever arm a response type puts it in, so
+// the table above can be one list rather than eight near-copies. `nil` means
+// the response did not answer with an error, which for an unimplemented method
+// is itself the failure -- hence optional rather than a trap.
+
+private func engineError(
+    _ outcome: Arca_Engine_V1_InspectResponse.OneOf_Outcome?
+) -> Arca_Engine_V1_EngineError? {
+    if case .error(let error) = outcome { return error }
+    return nil
+}
+
+private func engineError(
+    _ outcome: Arca_Engine_V1_ListResourcesResponse.OneOf_Outcome?
+) -> Arca_Engine_V1_EngineError? {
+    if case .error(let error) = outcome { return error }
+    return nil
+}
+
+private func engineError(
+    _ outcome: Arca_Engine_V1_AckResponse.OneOf_Outcome?
+) -> Arca_Engine_V1_EngineError? {
+    if case .error(let error) = outcome { return error }
+    return nil
+}
+
+private func engineError(
+    _ outcome: Arca_Engine_V1_PrepareImageResponse.OneOf_Outcome?
+) -> Arca_Engine_V1_EngineError? {
+    if case .error(let error) = outcome { return error }
+    return nil
+}
+
+/// Create is the one shape that nests: its failure arm is a `CreateFailed`,
+/// which carries the error alongside the resources a partial create made.
+private func engineError(
+    _ outcome: Arca_Engine_V1_CreateResponse.OneOf_Outcome?
+) -> Arca_Engine_V1_EngineError? {
+    if case .failed(let failed) = outcome { return failed.error }
+    return nil
 }

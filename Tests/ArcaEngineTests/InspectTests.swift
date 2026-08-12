@@ -34,19 +34,34 @@ final class InspectTests: XCTestCase {
         XCTAssertEqual(sandboxState(fromStatus: "restarting"), .unspecified)
     }
 
-    /// Three arms, not two. "It is not there" and "I could not tell" demand
-    /// opposite behaviour from a reconciler (engine.proto:354-357).
+    /// Three arms, not two: "it is not there" and "I could not tell" demand
+    /// opposite behaviour from a reconciler (engine.proto:354-357). This build
+    /// is in the second position and must say so.
+    ///
+    /// The assertion that matters is the negative one. An earlier version of
+    /// this test asserted `.absent` and passed -- against a service whose
+    /// backing state is empty under every input, so `.absent` was the only
+    /// answer it could produce. It would have passed identically against
+    /// `{ .with { $0.absent = .init() } }` with ContainerBridge deleted, which
+    /// is to say it distinguished nothing. `absent` is the arm a reconciler
+    /// reads as "create it", so answering it without having looked is how a
+    /// running sandbox acquires a duplicate.
     ///
     /// Calls the context-free `inspect(request:)` overload rather than the
     /// protocol-conforming `inspect(request:context:)`: grpc-swift's
     /// `GRPCAsyncServerCallContext` has no public initialiser, so a test
     /// target cannot construct one. See SandboxEngineService.swift.
-    func testAnAbsentSandboxIsAnAnswerRatherThanAnError() async throws {
+    func testInspectRefusesToReportAbsenceItCannotObserve() async throws {
         let response = await SandboxEngineService.forTesting().inspect(
             request: Arca_Engine_V1_InspectRequest.with { $0.sandboxID = "absent-a1b2c3d4e5f6" }
         )
-        guard case .absent = response.outcome else {
-            return XCTFail("an unknown sandbox must be Absent, not an error: \(String(describing: response.outcome))")
+
+        if case .absent = response.outcome {
+            return XCTFail("a build that loads no state must not answer Absent")
         }
+        guard case .error(let error) = response.outcome else {
+            return XCTFail("Inspect must answer: \(String(describing: response.outcome))")
+        }
+        XCTAssertEqual(error.code, "unsupported_capability")
     }
 }

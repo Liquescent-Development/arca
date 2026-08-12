@@ -5,13 +5,30 @@ import SandboxEngineProto
 
 /// Arca's implementation of the published sandbox-engine contract.
 ///
-/// Each method is a thin seam: translate in, call ContainerBridge, translate
-/// out. Business logic belongs in ContainerBridge and mapping belongs in
-/// EngineTranslation, so that this file stays readable as a list of the
+/// Each method is intended as a thin seam: translate in, call ContainerBridge,
+/// translate out. Business logic belongs in ContainerBridge and mapping belongs
+/// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
+///
+/// **In this build, one of the eleven is implemented: `Capabilities`.** The
+/// other ten answer `unsupported_capability` inside their response `oneof`.
+/// `Inspect` and `ListResources` joined that list deliberately rather than by
+/// omission -- see the note on each -- because this process does not call
+/// `initialize()` on any manager, and an uninitialised manager does not report
+/// "I cannot tell", it reports "nothing exists".
 public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvider {
     public let interceptors: Arca_Engine_V1_SandboxEngineServerInterceptorFactoryProtocol? = nil
 
+    // Held and, in this build, unread. Deliberate on both counts.
+    //
+    // Unread because the only two methods that consulted them could not report
+    // anything true without loaded state. Held because the dependency edge is
+    // itself a shipped property: gascan's tests/release/engine-targets-check.sh
+    // asserts that `arca-engine` and `ArcaEngine` reach neither `DockerAPI` nor
+    // `ArcaDaemon`, and that assertion measures something only while this
+    // target genuinely depends on ContainerBridge. Dropping these five to
+    // silence an unused-property reading would make the release gate pass for a
+    // reason that has nothing to do with what it exists to prove.
     let containerManager: ContainerManager
     let volumeManager: VolumeManager
     let networkManager: NetworkManager
@@ -86,38 +103,28 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     }
 
     /// See the note on the `create(request:)` overload above.
+    ///
+    /// Unimplemented in this build, and that is a deliberate reversal.
+    ///
+    /// An earlier revision answered from `ContainerManager`. Because this
+    /// process never calls `ContainerManager.initialize()` -- see the reasoning
+    /// in `arca-engine`'s `ArcaEngineCommand.run()` -- the only two writers of
+    /// `ContainerManager.containers` never run, so that implementation could
+    /// return exactly one answer: `absent`. `engine.proto`'s `InspectResponse`
+    /// has three arms specifically so that "it is not there" stays
+    /// distinguishable from "I could not tell", and those "demand opposite
+    /// behaviour from a reconciler": on `absent` a consumer creates the
+    /// sandbox. An engine that answers `absent` for a sandbox that is running
+    /// induces a duplicate.
+    ///
+    /// `unsupported_capability` is the honest answer for a build that holds no
+    /// loaded state. It costs the consumer nothing it was getting -- the
+    /// previous answer carried no information -- and it cannot be mistaken for
+    /// an observation. The milestone that loads persisted state restores this
+    /// method along with the `Sandbox` translation in `EngineTranslation`,
+    /// which stays in the target, tested, for that purpose.
     func inspect(request: Arca_Engine_V1_InspectRequest) async -> Arca_Engine_V1_InspectResponse {
-        let name = SandboxIdentity.containerName(forSandboxId: request.sandboxID)
-        let found = await engineErrorCatching(.commandIo, resource: name) {
-            try await self.containerManager.getContainer(id: name)
-        }
-        switch found {
-        case .failure(let error):
-            return Arca_Engine_V1_InspectResponse.with { $0.error = error }
-        case .success(nil):
-            return Arca_Engine_V1_InspectResponse.with { $0.absent = Arca_Engine_V1_Absent() }
-        case .success(.some(let container)):
-            guard let digest = imageDigest(fromReference: container.image) else {
-                return Arca_Engine_V1_InspectResponse.with {
-                    $0.error = engineError(
-                        .invalidOutput,
-                        resource: name,
-                        message: "container image \(container.image) is not an exact digest reference"
-                    )
-                }
-            }
-            return Arca_Engine_V1_InspectResponse.with { response in
-                response.sandbox = Arca_Engine_V1_Sandbox.with { sandbox in
-                    sandbox.sandboxID = request.sandboxID
-                    sandbox.image = digest
-                    sandbox.state = sandboxState(fromStatus: container.state.status)
-                    if let owner = SandboxIdentity.owner(from: container.config.labels) {
-                        sandbox.owner = owner
-                    }
-                    sandbox.ports = []
-                }
-            }
-        }
+        Arca_Engine_V1_InspectResponse.with { $0.error = Self.notImplemented("Inspect") }
     }
 
     public func inspect(
@@ -233,42 +240,28 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
 
     /// See the note on the `create(request:)` overload above.
     ///
-    /// Unlabelled resources are reported, never filtered: a resource the
-    /// engine holds no labels for is exactly what a consumer needs to see to
-    /// notice drift, and hiding it here would defeat that silently
-    /// (engine.proto:389-391).
+    /// Unimplemented in this build, for the same reason as `inspect` and with a
+    /// sharper edge.
+    ///
+    /// `engine.proto`'s contract for this method is "Every resource the engine
+    /// holds, labelled or not", because a consumer's drift and leak detection
+    /// depends on seeing the unlabelled ones. An earlier revision walked
+    /// `ContainerManager`, `VolumeManager` and `NetworkManager`; without
+    /// `initialize()` all three are permanently empty -- containers and volumes
+    /// have no loaded rows, and `NetworkManager.listNetworks()` reads two
+    /// backends that are both nil -- so it returned `[]` under every input. An
+    /// empty `ResourceList` is not an error arm: it is a confident report of a
+    /// clean host, which is precisely the report that hides a leak.
+    ///
+    /// Two further defects sat behind that emptiness and would have surfaced
+    /// the moment state was loaded: `listContainers(all: true)` with no filters
+    /// drops every container labelled `com.arca.internal=true`, and
+    /// `NetworkManager.listNetworks()` swallows a WireGuard-backend failure
+    /// with `try?`, turning a real failure into a clean answer. Both must be
+    /// fixed in `ContainerBridge` before this method reports anything; a
+    /// silently incomplete list is worse than no list.
     func listResources(request: Arca_Engine_V1_ListResourcesRequest) async -> Arca_Engine_V1_ListResourcesResponse {
-        let collected = await engineErrorCatching(.commandIo) {
-            var resources: [Arca_Engine_V1_Resource] = []
-            for container in try await self.containerManager.listContainers(all: true) {
-                resources.append(
-                    resourceMessage(
-                        kind: .container,
-                        name: containerResourceName(names: container.names, id: container.id),
-                        labels: container.labels
-                    )
-                )
-            }
-            for volume in try await self.volumeManager.listVolumes() {
-                resources.append(
-                    resourceMessage(kind: .volume, name: volume.name, labels: volume.labels)
-                )
-            }
-            for network in await self.networkManager.listNetworks() {
-                resources.append(
-                    resourceMessage(kind: .network, name: network.name, labels: network.labels)
-                )
-            }
-            return resources
-        }
-        switch collected {
-        case .failure(let error):
-            return Arca_Engine_V1_ListResourcesResponse.with { $0.error = error }
-        case .success(let resources):
-            return Arca_Engine_V1_ListResourcesResponse.with { response in
-                response.resources = Arca_Engine_V1_ResourceList.with { $0.resources = resources }
-            }
-        }
+        Arca_Engine_V1_ListResourcesResponse.with { $0.error = Self.notImplemented("ListResources") }
     }
 
     public func listResources(
