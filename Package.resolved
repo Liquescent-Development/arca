@@ -1,5 +1,5 @@
 {
-  "originHash" : "4fecaade70bdb045659873fae138e820064d1349413fa6031d6c5aaa9884f022",
+  "originHash" : "3ff3ee24a0701550eafc9731c9b8fe4129a241ed0489e53031d2738e9f690a8a",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/grpc/grpc-swift-2.git",
       "state" : {
-        "revision" : "28cdd63ef88583ddc67d7bb179eab46fab465ce9",
-        "version" : "2.4.2"
+        "revision" : "f28854bc760a116e053fdfc4a48a9428c34625c0",
+        "version" : "2.3.0"
       }
     },
     {

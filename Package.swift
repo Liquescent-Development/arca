@@ -14,6 +14,20 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.23.0"),
+        // grpc-swift-2 is reached only transitively, through the containerization
+        // submodule (containerization/Package.swift declares it `from: "2.3.0"`).
+        // It is constrained here, at the root, because 2.4.x declares `traits: []`
+        // on swift-protobuf, and swift-protobuf 1.32.0 declares no traits at all --
+        // a combination Swift 6.3.3 rejects outright:
+        //
+        //   error: Disabled default traits by package 'grpc-swift-2' on package
+        //   'swift-protobuf' that declares no traits.
+        //
+        // The failure only appears when building an EXECUTABLE PRODUCT from a clean
+        // checkout; building library targets resolves without it, which is why this
+        // stayed hidden until Gas Can's pinned build began producing a binary.
+        // Remove this constraint once swift-protobuf declares traits.
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", "2.3.0" ..< "2.4.0"),
         .package(url: "https://github.com/stephencelis/SQLite.swift.git", from: "0.15.4"),
         .package(url: "https://github.com/tsolomko/SWCompression.git", from: "4.8.0"),
     ],
@@ -89,6 +103,39 @@ let package = Package(
             name: "SandboxEngineProto",
             dependencies: [
                 .product(name: "GRPC", package: "grpc-swift"),
+            ]
+        ),
+
+        // Gas Can's sandbox engine. Deliberately does NOT depend on DockerAPI or
+        // ArcaDaemon: Gas Can builds only the targets it ships, and that absent
+        // edge is asserted by gascan's tests/release/engine-targets-check.sh,
+        // which walks the closure of both this target and the arca-engine
+        // executable below -- the executable is what Gas Can actually ships, so
+        // checking only this one would leave the shipped binary uncovered.
+        .target(
+            name: "ArcaEngine",
+            dependencies: [
+                "SandboxEngineProto",
+                "ContainerBridge",
+                .product(name: "GRPC", package: "grpc-swift"),
+                .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+
+        .testTarget(
+            name: "ArcaEngineTests",
+            dependencies: ["ArcaEngine"]
+        ),
+
+        // The `arca-engine` executable: binds SandboxEngineService to a Unix
+        // socket. Deliberately does NOT depend on DockerAPI or ArcaDaemon, for
+        // the same reason ArcaEngine itself does not.
+        .executableTarget(
+            name: "arca-engine",
+            dependencies: [
+                "ArcaEngine",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Logging", package: "swift-log"),
             ]
         ),
 
