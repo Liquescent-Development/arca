@@ -22,7 +22,13 @@ final class EngineServerTests: XCTestCase {
     /// callback chained on the same future has run. The blocking `.wait()`
     /// forms don't return until that chain is fully drained.
     private var group: MultiThreadedEventLoopGroup!
-    private var server: Server?
+    private var engine: EngineServer?
+
+    /// Every path any test in this class handed to `EngineServer` or bound
+    /// itself. `/tmp` is not swept outside a reboot, so a test that leaves its
+    /// socket and lockfile behind grows the directory on every run of the suite
+    /// -- on a developer's machine and on CI alike.
+    private var createdPaths: [String] = []
 
     override func setUp() {
         super.setUp()
@@ -30,8 +36,13 @@ final class EngineServerTests: XCTestCase {
     }
 
     override func tearDown() {
-        XCTAssertNoThrow(try server?.close().wait())
+        XCTAssertNoThrow(try engine?.server.close().wait())
         XCTAssertNoThrow(try group.syncShutdownGracefully())
+        for path in createdPaths {
+            unlink(path)
+            unlink(path + ".lock")
+        }
+        createdPaths = []
         super.tearDown()
     }
 
@@ -41,16 +52,18 @@ final class EngineServerTests: XCTestCase {
     /// `/var/folders/...` long enough that a descriptive prefix plus a UUID
     /// overflows it. `/tmp` is short enough to leave headroom and is the
     /// conventional location for Unix domain sockets for exactly this reason.
-    private static func testSocketPath() -> String {
-        "/tmp/arca-engine-test-\(UUID().uuidString).sock"
+    private func testSocketPath() -> String {
+        let path = "/tmp/arca-engine-test-\(UUID().uuidString).sock"
+        createdPaths.append(path)
+        return path
     }
 
     /// The socket carries the engine's whole authority, so it must not be
     /// reachable by another user on a shared machine.
     func testTheSocketIsCreatedOwnerOnly() async throws {
-        let path = Self.testSocketPath()
+        let path = testSocketPath()
 
-        server = try await EngineServer.start(
+        engine = try await EngineServer.start(
             socketPath: path,
             service: .forTesting(),
             group: group
@@ -61,7 +74,7 @@ final class EngineServerTests: XCTestCase {
     }
 
     /// A stale socket file from a killed engine must not make the next start
-    /// fail. Removing it is safe only because the caller owns the path.
+    /// fail. Removing it is safe only because nothing is listening on it.
     ///
     /// The fixture must be an actual socket-typed file, not a plain file: a
     /// killed process leaves behind the socket special file it bound to,
@@ -70,25 +83,129 @@ final class EngineServerTests: XCTestCase {
     /// plain-file fixture here would be testing the opposite of "stale
     /// socket."
     func testAStaleSocketFileDoesNotBlockStartup() async throws {
-        let path = Self.testSocketPath()
-        try Self.createStaleSocketFile(at: path)
+        let path = testSocketPath()
+        try Self.bindSocket(at: path, listening: false)
 
-        server = try await EngineServer.start(
+        engine = try await EngineServer.start(
             socketPath: path,
             service: .forTesting(),
             group: group
         )
     }
 
-    /// Binds a raw AF_UNIX socket to `path` and closes it without unlinking,
-    /// leaving exactly the artifact a killed engine would: a socket-typed
-    /// file with nothing listening behind it.
-    private static func createStaleSocketFile(at path: String) throws {
+    /// A socket with something still listening on it is NOT stale, and taking
+    /// it would leave the incumbent alive on an inode nothing can dial again.
+    ///
+    /// This is the case the type check alone could not see: an `lstat` cannot
+    /// tell a dead engine's leftover from a live one's socket, and the earlier
+    /// implementation unlinked both.
+    func testALiveListenerOnThePathIsRefusedRatherThanUnlinked() async throws {
+        let path = testSocketPath()
+        let incumbent = try Self.bindSocket(at: path, listening: true)
+        defer { close(incumbent) }
+
+        do {
+            engine = try await EngineServer.start(
+                socketPath: path,
+                service: .forTesting(),
+                group: group
+            )
+            XCTFail("starting on a path with a live listener must fail")
+        } catch let error as EngineServerError {
+            guard case .pathHasALiveListener = error else {
+                return XCTFail("wrong refusal: \(error)")
+            }
+        }
+
+        // The incumbent's socket is still the one at the path.
+        var status = stat()
+        XCTAssertEqual(lstat(path, &status), 0, "the live socket must not have been unlinked")
+    }
+
+    /// Two engines cannot serve the same path. The lock, not the socket file,
+    /// is what decides -- it is held by a live process and released by a dead
+    /// one, with no inference in between.
+    func testASecondEngineIsRefusedWhileTheFirstIsAlive() async throws {
+        let path = testSocketPath()
+        engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+        let firstInode = try Self.inode(of: path)
+
+        let second = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { XCTAssertNoThrow(try second.syncShutdownGracefully()) }
+
+        do {
+            _ = try await EngineServer.start(
+                socketPath: path,
+                service: .forTesting(),
+                group: second
+            )
+            XCTFail("a second engine must not take a live engine's path")
+        } catch let error as EngineServerError {
+            guard case .pathIsHeldByALiveEngine(_, let holder) = error else {
+                return XCTFail("wrong refusal: \(error)")
+            }
+            XCTAssertEqual(holder, "\(getpid())", "the refusal must name the holder")
+        }
+
+        XCTAssertEqual(
+            try Self.inode(of: path),
+            firstInode,
+            "the first engine's socket must still be the one at the path"
+        )
+    }
+
+    /// After a shutdown the path is free for the next engine: no socket file,
+    /// and the lock released.
+    ///
+    /// The second assertion is the one with teeth. The socket's disappearance
+    /// is not this code's doing -- MEASURED: closing the server unlinks it, so
+    /// this half passes with `shutDown`'s own removal step deleted, and it is
+    /// asserted as a property of the shutdown rather than as proof of a line.
+    /// Releasing the lock has no other owner: with `lock.release()` removed the
+    /// successor below cannot start, which is what makes this test capable of
+    /// failing.
+    ///
+    /// What both halves together stand for is the artifact the old
+    /// implementation left on every single exit, because it had no shutdown
+    /// path at all.
+    func testAfterShuttingDownTheNextEngineCanTakeThePath() async throws {
+        let path = testSocketPath()
+        let first = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+
+        try await first.shutDown()
+
+        var status = stat()
+        XCTAssertNotEqual(lstat(path, &status), 0, "no socket may be left at the path")
+
+        let second = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let successor = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: second
+        )
+        try await successor.shutDown()
+        try await second.shutdownGracefully()
+    }
+
+    /// Binds a raw AF_UNIX socket to `path`.
+    ///
+    /// Closed without unlinking and without listening, this leaves exactly the
+    /// artifact a killed engine would: a socket-typed file with nothing behind
+    /// it. Left open and listening, it is an incumbent engine.
+    @discardableResult
+    private static func bindSocket(at path: String, listening: Bool) throws -> Int32 {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        defer { close(descriptor) }
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -108,7 +225,28 @@ final class EngineServerTests: XCTestCase {
             }
         }
         guard bindResult == 0 else {
+            let code = errno
+            close(descriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+
+        guard listening else {
+            close(descriptor)
+            return -1
+        }
+        guard Darwin.listen(descriptor, 1) == 0 else {
+            let code = errno
+            close(descriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return descriptor
+    }
+
+    private static func inode(of path: String) throws -> UInt64 {
+        var status = stat()
+        guard lstat(path, &status) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        return status.st_ino
     }
 }
