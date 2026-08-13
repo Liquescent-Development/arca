@@ -20,22 +20,86 @@ public func engineVersion(from string: String) -> Arca_Engine_V1_Version? {
     return version
 }
 
+/// The hex half of a digest, as the contract spells it: bare, lowercase, and
+/// exactly 64 characters, with no "sha256:" prefix (engine.proto:179-185).
+///
+/// One predicate rather than one per direction. Both directions below decide
+/// the same question, and two copies of it are two chances for the engine to
+/// accept on the way in what it refuses on the way out.
+private func isSHA256Hex(_ hex: String) -> Bool {
+    hex.count == 64 && hex.allSatisfy { $0.isNumber || ("a"..."f").contains($0) }
+}
+
 /// Splits an exact digest reference into the two fields the contract carries.
 ///
 /// A tag is not representable on the wire, so a reference that is not an exact
-/// digest has nothing to map to and is refused. The hex is bare and lowercase,
-/// exactly 64 characters, with no "sha256:" prefix (engine.proto:179-185).
+/// digest has nothing to map to and is refused.
 public func imageDigest(fromReference reference: String) -> Arca_Engine_V1_ImageDigest? {
     guard let separator = reference.range(of: "@sha256:", options: .backwards) else { return nil }
     let repository = String(reference[reference.startIndex..<separator.lowerBound])
     let hex = String(reference[separator.upperBound...])
-    guard !repository.isEmpty, hex.count == 64,
-          hex.allSatisfy({ $0.isNumber || ("a"..."f").contains($0) })
-    else { return nil }
+    guard !repository.isEmpty, isSHA256Hex(hex) else { return nil }
     var digest = Arca_Engine_V1_ImageDigest()
     digest.repository = repository
     digest.sha256Hex = hex
     return digest
+}
+
+/// A wire digest as the reference an operator would go looking for.
+///
+/// The exact inverse of `imageDigest(fromReference:)` above, and here rather
+/// than spelt out at its call sites so the two cannot drift into disagreeing
+/// about what the canonical form is. Used for the `resource` field of a
+/// failure, which names "the resource the failure is about"
+/// (engine.proto:66-67) -- and for a request that names content, the thing the
+/// failure is about is the content, not the RPC.
+///
+/// Total, deliberately: this is what a refusal *echoes*, so it has to be able
+/// to echo a request that is itself malformed. Validity is
+/// `imageStoreDigest(_:)`'s question, one function down.
+public func imageReference(forDigest digest: Arca_Engine_V1_ImageDigest) -> String {
+    "\(digest.repository)@sha256:\(digest.sha256Hex)"
+}
+
+/// The image store's lookup key for a wire digest, or nil when the wire digest
+/// is not one.
+///
+/// Refusing rather than passing a malformed digest through to a lookup that
+/// would simply match nothing: the two answers are "you sent nonsense" and "the
+/// engine does not hold that", and a consumer acts differently on each --
+/// `not_found` is a final answer about content whose fix is to send the
+/// content. `ImageDigest` is a message, so an *unset* one arrives here with
+/// both fields empty and is refused by the same guard.
+///
+/// The `sha256:` prefix belongs to the store and not to the wire: the contract
+/// carries bare hex "with no sha256: prefix" (engine.proto:182-183), while
+/// Containerization records a descriptor digest prefixed. This is the one place
+/// that conversion happens.
+public func imageStoreDigest(_ digest: Arca_Engine_V1_ImageDigest) -> String? {
+    guard !digest.repository.isEmpty, isSHA256Hex(digest.sha256Hex) else { return nil }
+    return "sha256:\(digest.sha256Hex)"
+}
+
+/// The repository half of a stored image reference, split the way the consumer
+/// splits its own.
+///
+/// The rule is Gas Can's, mirrored: `immutable_image_identity`
+/// (crates/gascan-core/src/runtime.rs:704-715) drops anything from `@sha256:`
+/// onward, then drops a tag -- the last `:` that comes after the last `/`, so
+/// that the port in `registry.example:5000/repo` is not mistaken for one. The
+/// two sides have to split identically, or the comparison they meet in is
+/// decided by punctuation rather than by identity.
+///
+/// This is NOT the split `imageDigest(fromReference:)` performs one direction
+/// up, which keeps a tag inside the repository it reports. That asymmetry is
+/// real; it belongs to the Inspect path and is recorded rather than changed
+/// here.
+public func imageRepository(ofReference reference: String) -> String {
+    let name = reference.range(of: "@sha256:", options: .backwards)
+        .map { String(reference[reference.startIndex..<$0.lowerBound]) } ?? reference
+    guard let tagSeparator = name.lastIndex(of: ":") else { return name }
+    if let slash = name.lastIndex(of: "/"), tagSeparator < slash { return name }
+    return String(name[name.startIndex..<tagSeparator])
 }
 
 /// Maps ContainerBridge's status string onto the contract's three states.

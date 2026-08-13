@@ -638,6 +638,101 @@ public actor ImageManager {
         return image
     }
 
+    /// Whether this store holds, in full, the content named by an exact digest.
+    ///
+    /// **The lookup is exact string equality against the digest each stored
+    /// image carries, and deliberately not `resolveImage(nameOrId:)`.** That
+    /// resolver has three arms, and two of them are wrong for a caller asking
+    /// "do you hold this content": the reference arm matches a *tag*
+    /// (`matchesReference` above, which also normalizes registries and falls
+    /// back to suffix matching), so it answers about a name that can be
+    /// remapped to different bytes at any time; and the short-ID arm matches a
+    /// 12-character prefix. A caller building a promise on the answer needs
+    /// neither. Passing `sha256:<hex>` to `resolveImage` would take its long-ID
+    /// arm, which is exact -- but only by coincidence of the input, and a later
+    /// caller passing something else would silently get the forgiving arms.
+    ///
+    /// The digest compared against is the store's own root descriptor digest,
+    /// which for an image imported from a single-manifest OCI layout is an
+    /// index Containerization *synthesizes* during the import
+    /// (`ImageStore+Import.swift:216-224`), not the manifest digest the layout
+    /// named. A caller holding the manifest digest for such an image gets
+    /// `.noImageForDigest` here. That is the safe direction -- a false "not
+    /// held" is recoverable and visible, a false "held" is neither -- but it is
+    /// a real limitation and not an accident.
+    ///
+    /// Three cases and not a `Bool`, for the reason `imageExists(nameOrId:)`
+    /// above is too cheap an answer to build a promise on: it collapses "no
+    /// such image", "the store has a row and cannot produce its bytes", and
+    /// "the read itself failed" into `false`. Those demand different reports.
+    ///
+    /// - Parameter digest: The content digest, in the `sha256:<hex>` form the
+    ///   store records. Anything else matches nothing.
+    /// - Throws: Whatever listing the store throws. A store that cannot be read
+    ///   is not a store that holds nothing.
+    public func heldImageContent(digest: String) async throws -> HeldImageContent {
+        let images = try await imageStore.list()
+        guard let image = images.first(where: { $0.digest == digest }) else {
+            logger.debug("No image holds this content digest", metadata: ["digest": "\(digest)"])
+            return .noImageForDigest
+        }
+
+        // `referencedDigests()` reads the image's own index blob before it can
+        // name anything else, so a throw here is that blob being absent or
+        // undecodable -- which is this image's content missing, reported as
+        // such rather than as a read failure.
+        let referenced: [String]
+        do {
+            referenced = try await image.referencedDigests()
+        } catch {
+            logger.warning("Image index unreadable", metadata: [
+                "reference": "\(image.reference)",
+                "digest": "\(digest)",
+                "error": "\(error)"
+            ])
+            return .blobsMissing(reference: image.reference, digests: [image.digest])
+        }
+
+        // Every blob the image names, fetched from the content store. This is
+        // what separates a store that has a row from a store a container can
+        // actually be created from: `OverlayFSUnpacker.unpack` reads each layer
+        // by digest, and a layer that is not here fails there instead.
+        //
+        // A throw from `getContent` is the blob being absent: its other failure
+        // mode is a digest the image does not reference, and every digest here
+        // came from the image's own reference walk.
+        //
+        // Not exhaustive in one case, deliberately unrepaired: `referencedDigests`
+        // skips the children of a manifest it cannot decode. The manifest's own
+        // digest is still in the list, so such an image is still reported
+        // incomplete -- just without its layers enumerated beneath it.
+        var missing: [String] = []
+        for candidate in referenced {
+            do {
+                _ = try await image.getContent(digest: candidate)
+            } catch {
+                missing.append(generateDockerID(from: candidate))
+            }
+        }
+        guard missing.isEmpty else {
+            logger.warning("Image is missing content it references", metadata: [
+                "reference": "\(image.reference)",
+                "digest": "\(digest)",
+                "missing": "\(missing.joined(separator: ", "))"
+            ])
+            // Sorted because the walk's order follows the index, and a caller
+            // that puts these in a message would otherwise report the same
+            // damaged image two different ways.
+            return .blobsMissing(reference: image.reference, digests: missing.sorted())
+        }
+
+        logger.debug("Image content held in full", metadata: [
+            "reference": "\(image.reference)",
+            "digest": "\(digest)"
+        ])
+        return .held(reference: image.reference)
+    }
+
     /// Normalize image reference to Docker Hub format
     /// Docker convention:
     /// - "alpine" → "docker.io/library/alpine:latest"
@@ -715,6 +810,31 @@ public actor ImageManager {
             labels: config.labels ?? [:]
         )
     }
+}
+
+// MARK: - Held content
+
+/// What an image store can say about content named by an exact digest.
+///
+/// The answer to `heldImageContent(digest:)`. Three cases rather than a `Bool`
+/// because they demand different reports from a caller: content that never
+/// arrived has to be sent, content whose blobs are gone has to be sent again,
+/// and content that is here in full needs nothing. `Equatable` so a test can
+/// state the whole answer rather than one field of it.
+public enum HeldImageContent: Sendable, Equatable {
+    /// The store holds an image under this digest and every blob that image
+    /// names is present. `reference` is the reference it is stored under, so a
+    /// caller that also cares which repository the content arrived as can check
+    /// it without a second lookup.
+    case held(reference: String)
+
+    /// No image in this store carries this digest.
+    case noImageForDigest
+
+    /// An image carries the digest, but the content store cannot produce these
+    /// blobs, in `sha256:<hex>` form. Nothing can be created from the image
+    /// until they arrive.
+    case blobsMissing(reference: String, digests: [String])
 }
 
 // MARK: - Errors

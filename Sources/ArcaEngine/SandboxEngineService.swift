@@ -10,8 +10,8 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, three of the eleven are implemented: `Capabilities`,
-/// `Inspect` and `ListResources`.** The other eight answer
+/// **In this build, four of the eleven are implemented: `Capabilities`,
+/// `Inspect`, `ListResources` and `PrepareImage`.** The other seven answer
 /// `unsupported_capability` inside their response `oneof`.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
@@ -25,11 +25,11 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
 
     // `containerManager` is read by `inspect(request:)` and, with
     // `volumeManager` and `networkManager`, by `listResources(request:)` below.
-    // `imageManager` and `execManager` are held and, in this build, unread.
-    // Deliberate on both counts.
+    // `imageManager` is read by `prepareImage(request:)`. `execManager` is held
+    // and, in this build, unread. Deliberate on both counts.
     //
-    // Unread because the methods that would consult them -- `PrepareImage`,
-    // `Exec` -- are among the eight this build does not implement. Held because
+    // Unread because the method that would consult it -- `Exec` -- is among the
+    // seven this build does not implement. Held because
     // the dependency edge is itself a shipped property: gascan's
     // tests/release/engine-targets-check.sh asserts that `arca-engine` and
     // `ArcaEngine` reach neither `DockerAPI` nor `ArcaDaemon`, and that
@@ -253,8 +253,123 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     }
 
     /// See the note on the `create(request:)` overload above.
+    ///
+    /// **Absent content is `not_found`, and that is a correct, final answer.**
+    /// It is not `unsupported_capability`, which means "this build cannot do
+    /// that", and it is not an invitation to fetch. `engine.proto:308-313` says
+    /// the same thing above the request message: "Materialise a rootfs for
+    /// content THE ENGINE ALREADY HOLDS ... Absent content is a failure; it is
+    /// never a fetch", and "How the engine comes to hold the content is
+    /// deliberately unanswered by this contract." Content arrives by
+    /// `arca-engine image load --oci-layout <dir>`, out of band, before any of
+    /// this.
+    ///
+    /// **There is no fallback to `ImageManager.pullImage`, and adding one would
+    /// undo the milestone.** It is the obvious-looking improvement here -- the
+    /// manager is right there, it has the method, and the failing request names
+    /// exactly what it would fetch. The design rejected it because it "would put
+    /// registry credentials and Keychain access back inside the component the
+    /// policy boundary exists to constrain"
+    /// (docs/superpowers/specs/2026-08-10-p5-1-engine-service-and-wiring-design.md
+    /// §2.2). A compromised guest must have no frame it can send that reaches a
+    /// registry, and this is the method the proto itself calls "the one method
+    /// that would grow a registry client if nobody were watching it".
+    ///
+    /// **What this verifies, and what it does not.** It asks the image store
+    /// whether it holds the content in full: an image under exactly this digest,
+    /// and every blob that image names present in the content store. That last
+    /// part is the substance -- an image row can outlive its layer blobs, and
+    /// the cheap answer, `imageExists(nameOrId:)`
+    /// (`ContainerBridge/ImageManager.swift:616-624`), says `true` for one that
+    /// has: it is built on `inspectImage`, which reads the index, the manifest
+    /// and the config and never a layer. `Ack` carries no payload, so an `Ack`
+    /// granted on that answer is a report the consumer has no way to check.
+    ///
+    /// It does **not** unpack the layers into the OverlayFS layer cache, which
+    /// is the only thing in this codebase that materialises a rootfs. That is
+    /// not a shortcut taken for convenience; the unpacker is not reachable here
+    /// in a way that would be correct. `ContainerManager` builds its
+    /// `OverlayFSUnpacker` inside `initialize()`
+    /// (`ContainerBridge/ContainerManager.swift:280-285`) and keeps it private,
+    /// and `Containerization.OverlayFSUnpacker.unpack` is per-*container*, not
+    /// per-image: it creates `upper` and `work` directories at a container path
+    /// and increments a reference count for each layer
+    /// (`containerization/Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift:123-144`).
+    /// Running it for an image with no container would leak reference counts
+    /// nothing will ever release, and its per-image half, `unpackLayerToCache`,
+    /// is private upstream. `Create` unpacks, scoped to the container that owns
+    /// the result; the promise this method can keep is that `Create` will find
+    /// the content here and will not need to reach a registry for it.
+    ///
+    /// **The repository is checked as well as the digest.** Answering `Ack` for
+    /// content held under a different repository would be a success followed by
+    /// a `Create` failure, since `ContainerManager.createContainer` resolves the
+    /// image by the reference it is given
+    /// (`ContainerBridge/ContainerManager.swift:1696-1698`). The comparison
+    /// splits both sides by Gas Can's own rule -- see
+    /// `imageRepository(ofReference:)` -- and is exact. It normalizes no
+    /// registry prefix, so content stored as `docker.io/library/alpine:3.19` is
+    /// not found under a requested repository of `alpine`. That is the safe
+    /// direction and it is chosen deliberately: a false `not_found` is visible
+    /// and recoverable, a false `Ack` is neither.
     func prepareImage(request: Arca_Engine_V1_PrepareImageRequest) async -> Arca_Engine_V1_PrepareImageResponse {
-        Arca_Engine_V1_PrepareImageResponse.with { $0.error = Self.notImplemented("PrepareImage") }
+        let resource = imageReference(forDigest: request.image)
+        guard let key = imageStoreDigest(request.image) else {
+            return Self.prepareImageFailure(engineError(
+                .invalidResourceIdentity,
+                resource: resource,
+                message: "an image digest is a non-empty repository and a 64-character lowercase "
+                    + "hex sha256 carrying no prefix"
+            ))
+        }
+
+        let held = await engineErrorCatching(.commandIo, resource: resource) {
+            try await self.imageManager.heldImageContent(digest: key)
+        }
+        switch held {
+        case .failure(let error):
+            return Self.prepareImageFailure(error)
+        case .success(.noImageForDigest):
+            return Self.prepareImageFailure(engineError(
+                .notFound,
+                resource: resource,
+                message: "this engine holds no image with that content digest and will not fetch "
+                    + "one; load it with 'arca-engine image load --oci-layout <dir>'"
+            ))
+        case .success(.blobsMissing(let reference, let digests)):
+            return Self.prepareImageFailure(engineError(
+                .notFound,
+                resource: resource,
+                message: "the image stored as \(reference) carries that content digest, but this "
+                    + "engine does not hold \(digests.count) of the blobs it names: "
+                    + digests.joined(separator: ", ")
+            ))
+        case .success(.held(let reference)):
+            let stored = imageRepository(ofReference: reference)
+            guard stored == request.image.repository else {
+                return Self.prepareImageFailure(engineError(
+                    .notFound,
+                    resource: resource,
+                    message: "this engine holds that content digest under repository "
+                        + "\(stored), not \(request.image.repository)"
+                ))
+            }
+            logger.info("image content is held in full", metadata: [
+                "reference": "\(reference)",
+                "digest": "\(key)",
+            ])
+            return Arca_Engine_V1_PrepareImageResponse.with { $0.ok = Arca_Engine_V1_Ack() }
+        }
+    }
+
+    /// The failure arm, in one place.
+    ///
+    /// Five refusals reach it, and spelling the wrapper out five times is five
+    /// chances for a later edit to build one of them differently.
+    private static func prepareImageFailure(
+        _ error: Arca_Engine_V1_EngineError
+    ) -> Arca_Engine_V1_PrepareImageResponse {
+        Arca_Engine_V1_PrepareImageResponse.with { $0.error = error }
     }
 
     public func prepareImage(
