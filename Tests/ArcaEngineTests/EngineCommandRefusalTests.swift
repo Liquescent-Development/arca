@@ -49,6 +49,25 @@ final class EngineCommandRefusalTests: XCTestCase {
             "the refusal must name the option that was wrong, got: \(run.errorText)"
         )
 
+        // The assertion above is not enough on its own, and cannot be: ArgumentParser
+        // prints a usage line on *any* parse error, on stderr, before `run()` is
+        // entered -- and that usage line contains the literal `--kernel-path`.
+        // MEASURED: with one unrelated required option added to
+        // `ArcaEngineCommand` that this test does not pass, all four of the other
+        // assertions passed on a pure parse failure while `validateEngineInputs`
+        // was never reached.
+        //
+        // The absent kernel's path is a temp path this test invented microseconds
+        // earlier, so no usage line can contain it. Only `EngineStartupError`'s
+        // own `\(name) names nothing that exists: \(path)` puts it on stderr,
+        // which means reaching this assertion at all requires having reached the
+        // validation. Task 5 and Task 6 both edit this command's options.
+        XCTAssertTrue(
+            run.errorText.contains(absentKernel.path),
+            "stderr must carry the validation's own message, naming the path tried, "
+                + "and not merely ArgumentParser's usage line; got: \(run.errorText)"
+        )
+
         // The ordering assertion. `createSocketParentDirectory` runs early in
         // `run()`; if validation moved after it, everything above still passes
         // and only this fails.
