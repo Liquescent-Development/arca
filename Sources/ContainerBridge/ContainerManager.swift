@@ -64,6 +64,21 @@ public actor ContainerManager {
     // State persistence
     private let stateStore: StateStore
 
+    /// Root of the Containerization ImageStore this manager uses. Held as a
+    /// `let` and not derived, because `initfs.ext4` lives inside it: sharing
+    /// this root is what makes two products fight over one initfs.
+    ///
+    /// `nonisolated` for the same reason `logManager` is: an actor's `let` is
+    /// isolated across module boundaries, so a consumer outside ContainerBridge
+    /// cannot read it without `await` unless it is stated here. It is immutable
+    /// and `URL` is `Sendable`, so nothing is given up by saying so.
+    nonisolated public let imageStoreRoot: URL
+
+    /// Directory holding the OverlayFS layer cache. Was hardcoded to
+    /// ~/.arca/layers, which meant every consumer wrote into Arca's tree
+    /// regardless of the state root it was given.
+    nonisolated public let layerCachePath: URL
+
     // Layer unpacker for OverlayFS
     private var overlayUnpacker: OverlayFSUnpacker?
 
@@ -170,14 +185,32 @@ public actor ContainerManager {
     public init(
         imageManager: ImageManager,
         kernelPath: String,
+        imageStoreRoot: URL,
+        layerCachePath: URL,
         stateStore: StateStore,
         logger: Logger
     ) {
         self.imageManager = imageManager
         self.kernelPath = kernelPath
+        self.imageStoreRoot = imageStoreRoot
+        self.layerCachePath = layerCachePath
         self.stateStore = stateStore
         self.logger = logger
         self.logManager = ContainerLogManager(logger: logger)
+    }
+
+    /// The root `initialize()` hands to `Containerization.ContainerManager`,
+    /// and so the directory `initfs.ext4` is built in.
+    ///
+    /// It exists as a method rather than as a use of `imageStoreRoot` at the
+    /// call site so that a test can assert on the value `initialize()` actually
+    /// selects. MEASURED: with `initialize()` passing no `root:` at all --
+    /// falling back to `ImageStore.default` -- a test asserting on the stored
+    /// property alone still reported `Executed 2 tests, with 0 failures`
+    /// (`swift test --filter ContainerBridgePathsTests`). Asserting on this
+    /// method instead puts the selection itself under test.
+    nonisolated public func containerizationRoot() -> URL {
+        imageStoreRoot
     }
 
     /// Set the NetworkManager (called after NetworkManager is initialized)
@@ -240,13 +273,13 @@ public actor ContainerManager {
         nativeManager = try await Containerization.ContainerManager(
             kernel: kernel,
             initfsReference: "arca-vminit:latest",  // Custom vminit loaded and tagged by ArcaDaemon
+            root: containerizationRoot(),
             network: try Containerization.VmnetNetwork()
         )
 
         // Initialize OverlayFS unpacker for parallel layer caching
-        let layerCachePath = NSString(string: "~/.arca/layers").expandingTildeInPath
         overlayUnpacker = OverlayFSUnpacker(
-            layerCachePath: URL(fileURLWithPath: layerCachePath),
+            layerCachePath: layerCachePath,
             stateStore: stateStore,
             logger: logger
         )

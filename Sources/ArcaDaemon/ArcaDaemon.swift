@@ -3,6 +3,7 @@ import Logging
 import NIOHTTP1
 import DockerAPI
 import ContainerBridge
+import Containerization
 
 /// The main Arca daemon that implements the Docker Engine API server
 public final class ArcaDaemon: @unchecked Sendable {
@@ -163,6 +164,14 @@ public final class ArcaDaemon: @unchecked Sendable {
         let containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: config.kernelPath,
+            // ImageStore.default.path rather than a re-derivation of Apple's
+            // path: re-deriving it would silently diverge the day Apple changes
+            // it, and a hand-rolled `urls(for:in:)[0]` traps on an empty array
+            // where ImageStore.defaultRoot() throws.
+            imageStoreRoot: ImageStore.default.path,
+            layerCachePath: URL(
+                fileURLWithPath: NSString(string: "~/.arca/layers").expandingTildeInPath
+            ),
             stateStore: stateStore,
             logger: logger
         )

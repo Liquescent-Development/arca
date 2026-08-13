@@ -28,6 +28,8 @@ extension SandboxEngineService {
         let containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: root.appendingPathComponent("vmlinux").path,
+            imageStoreRoot: root.appendingPathComponent("images"),
+            layerCachePath: root.appendingPathComponent("layers"),
             stateStore: stateStore,
             logger: logger
         )
