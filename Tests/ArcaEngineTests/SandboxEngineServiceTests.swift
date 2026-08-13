@@ -76,7 +76,7 @@ final class SandboxEngineServiceTests: XCTestCase {
 }
 
 // Reads the `EngineError` out of whichever arm a response type puts it in, so
-// the table above can be one list rather than eight near-copies. `nil` means
+// the table above can be one list rather than six near-copies. `nil` means
 // the response did not answer with an error, which for an unimplemented method
 // is itself the failure -- hence optional rather than a trap.
 

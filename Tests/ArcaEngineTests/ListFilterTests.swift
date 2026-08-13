@@ -505,7 +505,18 @@ final class ListFilterTests: XCTestCase {
 /// reached from that `catch` (`ListFilterTests.swift:82:17` in the backtrace).
 /// Moving these two declarations out, with nothing else changed, made the same
 /// test pass.
-struct NetworkListerUnreachable: Error {}
+struct NetworkListerUnreachable: Error, CustomStringConvertible {
+    /// Stated rather than synthesised, because it is asserted verbatim.
+    /// `engineErrorCatching` interpolates the caught error into the
+    /// `EngineError`'s message (`EngineErrors.swift:62`), and
+    /// `ListResourcesTests.testANetworkBackendFailureIsTheErrorArmRatherThanAShortList`
+    /// pins that message by exact equality -- which is what distinguishes
+    /// "carried the source's own failure out" from "substituted engine prose",
+    /// and what `contains` would not. Left to the default `String(describing:)`
+    /// the asserted string was this type's *name*, so renaming the type would
+    /// have silently changed what that assertion meant.
+    var description: String { "the bridge network source could not be reached" }
+}
 
 /// A network source that either fails or answers. This is the seam the network
 /// tests need and the container tests did not: `NetworkManager` populates its

@@ -10,21 +10,33 @@ final class ListResourcesTests: XCTestCase {
     // MARK: - Every resource the engine holds
 
     /// The contract is "every resource the engine holds, labelled or not"
-    /// (engine.proto:387-391), asserted against the two kinds of container an
-    /// engine-side filter would drop: one labelled `com.arca.internal=true` and
-    /// one carrying no labels at all.
+    /// (engine.proto:387-391), asserted against **the whole response** -- all
+    /// three kinds in one list, not a projection of it.
     ///
-    /// **Three containers, and the assertion is the whole list.** This is the
+    /// **Unfiltered, and that is the point of this test.** Every other
+    /// assertion in this file narrows to one kind first, and a per-kind
+    /// assertion cannot see a walk that stops early. MEASURED: with
+    ///
+    ///     if resources.count >= 3 { return resources }
+    ///
+    /// after the container loop, an engine holding three or more containers
+    /// reports no volumes and no networks at all -- the silently incomplete list
+    /// `listResources`' own doc comment calls worse than no list -- and the
+    /// suite stayed green at `Executed 75 tests, with 0 failures`. Comparing
+    /// against a list holding every kind is what closes that: a walk that stops
+    /// after any source fails here, whichever source it was.
+    ///
+    /// **Five resources, three kinds, mixed ownership.** This is also the
     /// eighth-finding shape: a membership or non-emptiness assertion cannot tell
     /// "dropped the right one" from "dropped everything", which is the defect
     /// `XCTAssertTrue(hidden.isEmpty)` shipped in Task 2. Comparing the full
     /// sorted list against a list written out in full fails differently for the
-    /// two -- an `includeInternal: false` regression leaves the other two
+    /// two -- an `includeInternal: false` regression leaves the other four
     /// standing, and a walk that collected nothing leaves none.
     ///
-    /// The unlabelled container comes back with `owner` unset, which is how a
-    /// consumer sees a resource it does not own (engine.proto:169-173). That is
-    /// deliberately not `inspect`'s answer for the same row -- there an
+    /// The internal and unlabelled resources come back with `owner` unset, which
+    /// is how a consumer sees a resource it does not own (engine.proto:169-173).
+    /// That is deliberately not `inspect`'s answer for the same row -- there an
     /// unlabelled container is `foreign_resource_refused`
     /// (`InspectTests.testAnUnlabelledContainerIsRefusedAsForeignRatherThanReturnedWithoutAnOwner`).
     /// The two methods answer different questions and the difference is load-bearing.
@@ -34,7 +46,7 @@ final class ListResourcesTests: XCTestCase {
     /// `containerResourceName` is on the call path and not merely unit-tested
     /// below: an unstripped slash makes every owned container look unrelated to
     /// its sandbox and drift detection silently sees nothing.
-    func testEveryContainerIsReportedIncludingTheInternalAndTheUnlabelledOne() async throws {
+    func testTheWholeResponseHoldsEveryKindIncludingInternalAndUnlabelledResources() async throws {
         let managers = try Self.managers()
         try await Self.seedContainer(
             into: managers.stateStore,
@@ -54,12 +66,27 @@ final class ListResourcesTests: XCTestCase {
             name: Self.unlabelledContainerName,
             labels: [:]
         )
+        // One of each remaining kind, so the assertion below spans all three.
+        // Labelled volume, unlabelled network: the owner field is exercised in
+        // both directions across kinds rather than only across containers.
+        try await Self.seedVolume(
+            into: managers.stateStore,
+            name: Self.ownedVolumeName,
+            labels: SandboxIdentity.labels(from: Self.ownerLabels)
+        )
+        try await Self.seedNetwork(
+            into: managers.stateStore,
+            id: Self.foreignNetworkID,
+            name: Self.foreignNetworkName,
+            labels: [:]
+        )
         try await managers.containerManager.loadPersistedState()
+        try await managers.volumeManager.initialize()
 
         let resources = try await Self.listedResources(managers)
 
         XCTAssertEqual(
-            Self.sorted(resources.filter { $0.identity.kind == .container }),
+            Self.sorted(resources),
             Self.sorted([
                 Arca_Engine_V1_Resource.with {
                     $0.identity = Arca_Engine_V1_ResourceIdentity.with {
@@ -83,11 +110,25 @@ final class ListResourcesTests: XCTestCase {
                         $0.name = Self.unlabelledContainerName
                     }
                 },
+                Arca_Engine_V1_Resource.with {
+                    $0.identity = Arca_Engine_V1_ResourceIdentity.with {
+                        $0.kind = .volume
+                        $0.name = Self.ownedVolumeName
+                    }
+                    $0.owner = Self.ownerLabels
+                },
+                Arca_Engine_V1_Resource.with {
+                    $0.identity = Arca_Engine_V1_ResourceIdentity.with {
+                        $0.kind = .network
+                        $0.name = Self.foreignNetworkName
+                    }
+                },
             ]),
-            "all three seeded containers must be reported: the owned one, the "
-                + "internal one, and the unlabelled one. Dropping only the internal "
-                + "row is an includeInternal regression; dropping all three is a "
-                + "walk that reads no containers, and these are not the same defect"
+            "the response must hold all five seeded resources across all three "
+                + "kinds. Dropping only the internal container is an includeInternal "
+                + "regression; dropping every volume and network is a walk that "
+                + "stopped after the containers; dropping all five is a walk that "
+                + "read nothing, and these are three different defects"
         )
     }
 
@@ -232,7 +273,7 @@ final class ListResourcesTests: XCTestCase {
                 + "the consumer looking for a resource that is not the problem"
         )
         XCTAssertEqual(
-            error.message, "NetworkListerUnreachable()",
+            error.message, "the bridge network source could not be reached",
             "the backend's own failure is carried out verbatim rather than replaced "
                 + "with prose that hides which source could not answer"
         )
@@ -493,6 +534,14 @@ final class ListResourcesTests: XCTestCase {
     }
 
     /// The resources arm, or a failure naming the arm that came back instead.
+    ///
+    /// Calls the context-free `listResources(request:)` overload rather than the
+    /// protocol-conforming `listResources(request:context:)`, as every direct
+    /// call in this file does: grpc-swift's `GRPCAsyncServerCallContext` has no
+    /// public initialiser reachable from outside the GRPC module, so a test
+    /// target cannot construct one. See the note on the `create(request:)`
+    /// overload in `SandboxEngineService.swift`. The forwarding overload is
+    /// therefore driven only by gascan's live tier, over a real socket.
     private static func listedResources(
         _ managers: EngineManagers,
         file: StaticString = #filePath,
