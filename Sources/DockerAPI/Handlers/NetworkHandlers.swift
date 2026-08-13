@@ -25,8 +25,14 @@ public struct NetworkHandlers: Sendable {
     }
 
     /// Get error description from Swift errors
+    ///
+    /// `String(describing:)`, not `localizedDescription`: a Swift `enum … :
+    /// Error` carries no localized description, so Foundation renders it as
+    /// "The operation couldn't be completed. (… error N.)". That would reach
+    /// gascan and the CLI as `failed to list networks: <content-free string>`,
+    /// discarding the very signal `listNetworks()` now throws in order to carry.
     private func errorDescription(_ error: Error) -> String {
-        return error.localizedDescription
+        return String(describing: error)
     }
 
     /// Handle GET /networks

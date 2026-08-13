@@ -2,15 +2,66 @@ import Foundation
 import Logging
 import Containerization
 
-/// The source `NetworkManager.listNetworks()` reads bridge networks from.
+/// A source `NetworkManager.listNetworks()` reads networks from.
 ///
 /// `NetworkManager` owns this abstraction rather than the backend: it names the
 /// one capability the listing needs, so a caller can supply a source that fails
 /// without standing in for the rest of `WireGuardNetworkBackend`. `package`
 /// because the only such caller is `ArcaEngineTests`, which is in this package;
 /// nothing outside it has a reason to implement this.
-package protocol BridgeNetworkLister: Sendable {
+package protocol NetworkLister: Sendable {
     func listNetworks() async throws -> [NetworkMetadata]
+}
+
+/// The `null`-driver networks, read from the StateStore.
+///
+/// A `NetworkLister` rather than an inline branch of `listNetworks()`. As a
+/// branch it read each network back through `getNetwork(id:)`, whose `catch`
+/// logs and returns `nil`, so a StateStore failure -- `SQLITE_BUSY` under a
+/// concurrent write, say -- dropped every `--driver null` network from
+/// `docker network ls` and still reported success. Read as a source, through
+/// the same `try` as every other source, it has nowhere left to drop one.
+struct NullDriverNetworks: NetworkLister {
+    let stateStore: StateStore
+
+    func listNetworks() async throws -> [NetworkMetadata] {
+        try await stateStore.loadAllNetworks()
+            .filter { $0.driver == "null" }
+            .map(NetworkMetadata.init(persisted:))
+    }
+}
+
+extension NetworkMetadata {
+    /// One stored network as metadata. The single mapping from a persisted row,
+    /// so `NullDriverNetworks` and `NetworkManager.getNetwork(id:)` cannot come
+    /// to disagree about what a stored network means.
+    ///
+    /// Malformed `options`/`labels` JSON decodes to empty rather than throwing:
+    /// that was the behaviour before this was extracted, and a network is still
+    /// a network without its labels. A failure to *reach* the row is the one
+    /// this task is about, and that is the caller's `try`.
+    init(persisted network: StateStore.PersistedNetwork) {
+        self.init(
+            id: network.id,
+            name: network.name,
+            driver: network.driver,
+            subnet: network.subnet,
+            gateway: network.gateway,
+            ipRange: network.ipRange,
+            containers: [],  // Null networks don't track containers
+            created: network.createdAt,
+            options: Self.decodeStringMap(network.optionsJSON),
+            labels: Self.decodeStringMap(network.labelsJSON),
+            isDefault: network.isDefault
+        )
+    }
+
+    private static func decodeStringMap(_ json: String?) -> [String: String] {
+        guard let json, let data = json.data(using: .utf8) else {
+            return [:]
+        }
+        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+    }
 }
 
 /// Manages Docker networks with WireGuard as the default bridge backend:
@@ -30,25 +81,34 @@ public actor NetworkManager {
     private var vmnetBackend: VmnetNetworkBackend?
     private var wireGuardBackend: WireGuardNetworkBackend?
 
-    /// A bridge-network source standing in for the WireGuard backend. `nil` in
-    /// production and set only by `setBridgeNetworkLister(_:)`, which exists
-    /// because `listNetworks()` has no other reachable failure: a backend is
-    /// otherwise populated only by `initialize()`, which also creates the
-    /// default `host` network over vmnet and so cannot run in a unit test.
-    private var installedBridgeNetworkLister: (any BridgeNetworkLister)?
+    /// Sources standing in for the two `listNetworks()` derives. `nil` in
+    /// production and set only by the two `package` setters below, which exist
+    /// because `listNetworks()` has no other reachable failure: the WireGuard
+    /// backend is populated only by `initialize()`, which also creates the
+    /// default `host` network over vmnet and so cannot run in a unit test, and
+    /// `StateStore` is a concrete actor whose SQLite connection a test has no
+    /// way to break deterministically.
+    private var installedBridgeNetworkLister: (any NetworkLister)?
+    private var installedNullNetworkLister: (any NetworkLister)?
 
-    /// The source `listNetworks()` reads, and its only reader.
+    /// The sources `listNetworks()` reads, and its only reader.
     ///
-    /// Computed rather than stored: a stored second reference would have to be
-    /// assigned alongside `wireGuardBackend` in `initialize()`, and dropping
-    /// that one line would leave production listing no bridge networks with
-    /// every test still green. Derived, the backend cannot be installed without
-    /// this seeing it.
-    private var bridgeNetworkLister: (any BridgeNetworkLister)? {
-        if let installed = installedBridgeNetworkLister {
-            return installed
+    /// Computed rather than stored: a stored copy would have to be assigned
+    /// alongside `wireGuardBackend` in `initialize()`, and dropping that one
+    /// line would leave production listing no bridge networks with every test
+    /// still green. Derived, a source cannot be installed without this seeing
+    /// it.
+    private var networkListers: [any NetworkLister] {
+        var listers: [any NetworkLister] = []
+
+        if let bridge = installedBridgeNetworkLister ?? wireGuardBackend {
+            listers.append(bridge)
         }
-        return wireGuardBackend
+        listers.append(
+            installedNullNetworkLister ?? NullDriverNetworks(stateStore: stateStore)
+        )
+
+        return listers
     }
 
     // Central network routing: networkID -> driver
@@ -77,12 +137,21 @@ public actor NetworkManager {
     /// Install the bridge-network source `listNetworks()` reads, in place of
     /// the WireGuard backend, without the rest of `initialize()`.
     ///
-    /// `package` rather than `public` for the reason `BridgeNetworkLister` is:
-    /// this exists so `ArcaEngineTests` can drive `listNetworks()` against a
-    /// backend that fails. The daemon has no use for it -- it calls
-    /// `initialize()`, which installs the real backend itself.
-    package func setBridgeNetworkLister(_ lister: any BridgeNetworkLister) {
+    /// `package` rather than `public` for the reason `NetworkLister` is: this
+    /// exists so `ArcaEngineTests` can drive `listNetworks()` against a backend
+    /// that fails. The daemon has no use for it -- it calls `initialize()`,
+    /// which installs the real backend itself.
+    package func setBridgeNetworkLister(_ lister: any NetworkLister) {
         self.installedBridgeNetworkLister = lister
+    }
+
+    /// Install the `null`-driver source `listNetworks()` reads, in place of the
+    /// StateStore-backed one. `package` for the same reason, and separate from
+    /// the bridge setter so a test can fail one source while the other stands:
+    /// a single setter for both would prove only that *some* source's failure
+    /// surfaces, not that the null-driver read is one of the sources.
+    package func setNullNetworkLister(_ lister: any NetworkLister) {
+        self.installedNullNetworkLister = lister
     }
 
     /// Initialize the network manager and backends
@@ -511,42 +580,18 @@ public actor NetworkManager {
 
         case "null":
             // "null" driver - load from StateStore
+            //
+            // Still returns nil on a failure, unlike listNetworks(): this
+            // answers about one named network, and every caller already treats
+            // nil as "not found". listNetworks() answers about the whole host,
+            // where the same nil becomes a short list reported as success, so it
+            // reads NullDriverNetworks directly rather than looping through here.
             do {
-                let allNetworks = try await stateStore.loadAllNetworks()
-                guard let networkData = allNetworks.first(where: { $0.id == id }) else {
+                guard let network = try await stateStore.loadAllNetworks()
+                    .first(where: { $0.id == id }) else {
                     return nil
                 }
-
-                // Decode options and labels from JSON
-                let options: [String: String]
-                if let optionsJSON = networkData.optionsJSON,
-                   let data = optionsJSON.data(using: .utf8) {
-                    options = (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
-                } else {
-                    options = [:]
-                }
-
-                let labels: [String: String]
-                if let labelsJSON = networkData.labelsJSON,
-                   let data = labelsJSON.data(using: .utf8) {
-                    labels = (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
-                } else {
-                    labels = [:]
-                }
-
-                return NetworkMetadata(
-                    id: networkData.id,
-                    name: networkData.name,
-                    driver: networkData.driver,
-                    subnet: networkData.subnet,
-                    gateway: networkData.gateway,
-                    ipRange: networkData.ipRange,  // Load ipRange from database
-                    containers: [],  // Null networks don't track containers
-                    created: networkData.createdAt,
-                    options: options,
-                    labels: labels,
-                    isDefault: networkData.isDefault
-                )
+                return NetworkMetadata(persisted: network)
             } catch {
                 logger.error("Failed to load null network", metadata: ["id": "\(id)", "error": "\(error)"])
                 return nil
@@ -597,16 +642,8 @@ public actor NetworkManager {
             networks.append(contentsOf: await backend.listNetworks())
         }
 
-        if let lister = bridgeNetworkLister {
+        for lister in networkListers {
             networks.append(contentsOf: try await lister.listNetworks())
-        }
-
-        // Add null driver networks from StateStore
-        let nullNetworkIDs = networkDrivers.filter { $0.value == "null" }.keys
-        for networkID in nullNetworkIDs {
-            if let network = await getNetwork(id: networkID) {
-                networks.append(network)
-            }
         }
 
         return networks

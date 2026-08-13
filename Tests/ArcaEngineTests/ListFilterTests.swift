@@ -64,19 +64,19 @@ final class ListFilterTests: XCTestCase {
     /// that the signature says `throws` would pass against the unfixed body the
     /// moment someone wrote `throws` without deleting the `try?`, and asserting
     /// only that the failing lister throws would pass against a `listNetworks()`
-    /// that threw no matter what. Both mutations were run against this test, and
-    /// `swift test --filter ArcaEngineTests` reported `Executed 37 tests, with 1
-    /// failure` for each:
+    /// that threw no matter what. Both mutations were run against this test:
     ///
-    /// - the append put back to `if let wgNetworks = try? await
-    ///   lister.listNetworks()` -> `listNetworks() returned 0 networks instead
-    ///   of reporting the backend failure`
+    /// - the source loop swallowing again, `if let listed = try? await
+    ///   lister.listNetworks()` -> `Executed 39 tests, with 2 failures`, this
+    ///   one on `listNetworks() returned 0 networks instead of reporting the
+    ///   backend failure` (the null-driver test below is the other)
     /// - `throw NetworkManagerError.networkNotFound(...)` as the first statement
-    ///   of `listNetworks()` -> `caught error: "network guard-proving mutation
-    ///   not found"`
+    ///   of `listNetworks()` -> `Executed 37 tests, with 1 failure`, `caught
+    ///   error: "network guard-proving mutation not found"` (measured when the
+    ///   suite stood at 37, before the null-driver tests below existed)
     func testListNetworksReportsABackendFailureRatherThanAShortList() async throws {
         let failing = SandboxEngineService.forTesting().networkManager
-        await failing.setBridgeNetworkLister(StubBridgeLister.failing)
+        await failing.setBridgeNetworkLister(StubNetworkLister.failing)
 
         do {
             let swallowed = try await failing.listNetworks()
@@ -84,14 +84,14 @@ final class ListFilterTests: XCTestCase {
                 "listNetworks() returned \(swallowed.count) networks instead of "
                     + "reporting the backend failure"
             )
-        } catch is BridgeBackendUnreachable {
+        } catch is NetworkListerUnreachable {
             // The backend's own error reached the caller, which is the point.
         }
 
         // The other side: the same seam, a lister that answers. Without this,
         // a `listNetworks()` that threw no matter what would pass the half above.
         let working = SandboxEngineService.forTesting().networkManager
-        await working.setBridgeNetworkLister(StubBridgeLister.listing([Self.probeNetwork]))
+        await working.setBridgeNetworkLister(StubNetworkLister.listing([Self.probeNetwork]))
 
         let networks = try await working.listNetworks()
         XCTAssertEqual(
@@ -101,7 +101,84 @@ final class ListFilterTests: XCTestCase {
         )
     }
 
-    /// The one bridge network the succeeding half of the test above expects
+    /// The same rule for the other source `listNetworks()` reads. The
+    /// null-driver networks used to be read back one at a time through
+    /// `getNetwork(id:)`, whose `catch` logs and returns `nil`, so a StateStore
+    /// failure dropped every `--driver null` network from the answer and still
+    /// reported success -- the same short list one branch over.
+    ///
+    /// Failing the null source specifically, not "some source", is what makes
+    /// this test able to see that regression: it is why the two sources have
+    /// separate setters. MEASURED: with `NullDriverNetworks` dropped from
+    /// `networkListers` and the old branch restored to
+    ///
+    ///     let nullNetworkIDs = networkDrivers.filter { $0.value == "null" }.keys
+    ///     for networkID in nullNetworkIDs {
+    ///         if let network = await getNetwork(id: networkID) { ... }
+    ///     }
+    ///
+    /// `swift test --filter ArcaEngineTests` reported `Executed 39 tests, with 2
+    /// failures`, this test on `listNetworks() returned 0 networks instead of
+    /// reporting the null-driver store failure` and
+    /// `testNullDriverNetworksAreListedFromTheStore` on `("[]") is not equal to
+    /// ("["probe-none"]")`. Dropping only the source from `networkListers`, with
+    /// the old branch left out, reported the same two failures.
+    func testListNetworksReportsANullDriverStoreFailureRatherThanAShortList() async throws {
+        let failing = SandboxEngineService.forTesting().networkManager
+        await failing.setNullNetworkLister(StubNetworkLister.failing)
+
+        do {
+            let swallowed = try await failing.listNetworks()
+            XCTFail(
+                "listNetworks() returned \(swallowed.count) networks instead of "
+                    + "reporting the null-driver store failure"
+            )
+        } catch is NetworkListerUnreachable {
+            // The store's failure reached the caller rather than a short list.
+        }
+    }
+
+    /// The half the stub cannot prove: that the source `listNetworks()` derives
+    /// for null-driver networks really is the StateStore, and really is read.
+    ///
+    /// Nothing is installed here -- the manager runs its own
+    /// `NullDriverNetworks` over the real store the seed was written to, so
+    /// dropping that source from the derivation makes this go red while the
+    /// stub-driven test above stays green. The network is seeded through
+    /// `StateStore.saveNetwork`, the call `createNetwork` itself makes for
+    /// `driver: "null"`, rather than through a test-only setter.
+    func testNullDriverNetworksAreListedFromTheStore() async throws {
+        let stateRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("arca-null-network-tests-\(UUID().uuidString)")
+        let paths = EnginePaths(stateRoot: stateRoot)
+        let logger = Logger(label: "arca-engine-tests")
+
+        let seedStore = try StateStore(path: paths.stateDatabase.path, logger: logger)
+        try await seedStore.saveNetwork(
+            id: String(repeating: "d", count: 64),
+            name: "probe-none",
+            driver: "null",
+            scope: "local",
+            createdAt: Date(),
+            subnet: "",
+            gateway: "",
+            ipRange: nil,
+            optionsJSON: nil,
+            labelsJSON: nil,
+            isDefault: true
+        )
+
+        let manager = SandboxEngineService.forTesting(stateRoot: stateRoot).networkManager
+
+        let networks = try await manager.listNetworks()
+        XCTAssertEqual(
+            networks.map(\.name),
+            ["probe-none"],
+            "listNetworks() must read the null-driver networks out of the StateStore"
+        )
+    }
+
+    /// The one bridge network the succeeding half of the first test expects
     /// back, so the assertion is an equality rather than a non-emptiness check.
     private static let probeNetwork = NetworkMetadata(
         id: String(repeating: "c", count: 64),
@@ -200,10 +277,10 @@ final class ListFilterTests: XCTestCase {
     }
 }
 
-/// The error a failing bridge backend reports.
+/// The error a failing network source reports.
 ///
 /// At file scope, not nested inside `ListFilterTests`, and not nested inside
-/// `StubBridgeLister` either. MEASURED: nested, `catch is
+/// `StubNetworkLister` either. MEASURED: nested, `catch is
 /// StubBridgeLister.BackendUnreachable` crashed the test binary --
 /// `swift test --filter ArcaEngineTests` reported `exited with unexpected
 /// signal code 11`, and driving the one test straight through `xctest` exited
@@ -211,19 +288,20 @@ final class ListFilterTests: XCTestCase {
 /// reached from that `catch` (`ListFilterTests.swift:82:17` in the backtrace).
 /// Moving these two declarations out, with nothing else changed, made the same
 /// test pass.
-struct BridgeBackendUnreachable: Error {}
+struct NetworkListerUnreachable: Error {}
 
-/// A bridge-network source that either fails or answers. This is the seam the
-/// network test needs and the container tests did not: `NetworkManager`
-/// populates its real backend only inside `initialize()`, which also creates the
-/// default `host` network over vmnet and so cannot run in a unit test.
-struct StubBridgeLister: BridgeNetworkLister {
-    let result: Result<[NetworkMetadata], BridgeBackendUnreachable>
+/// A network source that either fails or answers. This is the seam the network
+/// tests need and the container tests did not: `NetworkManager` populates its
+/// WireGuard backend only inside `initialize()`, which also creates the default
+/// `host` network over vmnet and so cannot run in a unit test, and `StateStore`
+/// is a concrete actor whose SQLite connection a test cannot break on demand.
+struct StubNetworkLister: NetworkLister {
+    let result: Result<[NetworkMetadata], NetworkListerUnreachable>
 
-    static let failing = StubBridgeLister(result: .failure(BridgeBackendUnreachable()))
+    static let failing = StubNetworkLister(result: .failure(NetworkListerUnreachable()))
 
-    static func listing(_ networks: [NetworkMetadata]) -> StubBridgeLister {
-        StubBridgeLister(result: .success(networks))
+    static func listing(_ networks: [NetworkMetadata]) -> StubNetworkLister {
+        StubNetworkLister(result: .success(networks))
     }
 
     func listNetworks() async throws -> [NetworkMetadata] {
