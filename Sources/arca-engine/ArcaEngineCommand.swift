@@ -173,8 +173,11 @@ struct ServeCommand: AsyncParsableCommand {
 
         // After all three, as ArcaDaemon does. Without this the engine holds a
         // ContainerManager that cannot create a container with anonymous
-        // volumes, silently leaks them on Remove, and reports a networked
-        // container as attached to nothing. See EngineManagers.wireCollaborators.
+        // volumes, silently leaks them on Remove, reports a networked container
+        // as attached to nothing, and publishes none of a sandbox's ports while
+        // reporting the create as a success. See
+        // EngineManagers.wireCollaborators, which also records why the last of
+        // those four is the one no test in this repository can prove.
         await managers.wireCollaborators()
 
         let service = managers.makeService()

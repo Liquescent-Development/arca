@@ -504,15 +504,49 @@ public actor ImageManager {
     /// - Short reference: nginx:alpine, nginx
     /// - Short ID: 4986bf8c1536 (12 chars)
     /// - Long ID: sha256:4986bf8c15... (full digest)
+    /// - Exact digest reference: nginx@sha256:4986bf8c15... (repository AND digest)
+    ///
+    /// **The exact-digest arm was added because nothing here could resolve the
+    /// only form the sandbox engine is able to use.**
+    /// `ContainerManager.createContainer` resolves an image with the same string
+    /// it records as `ContainerInfo.image` (`:1698` and `:1901`),
+    /// `startContainer` resolves that recorded string again when it rebuilds a
+    /// container from persisted state (`:2218`), and the engine's `Inspect`
+    /// requires the recorded string to be an exact digest reference or it
+    /// answers `invalid_output`. One field, three constraints, and only
+    /// `repository@sha256:<hex>` satisfies all three -- which is also exactly
+    /// what Gas Can sends for every create
+    /// (`crates/gascan-core/src/runtime.rs:677-686`).
+    ///
+    /// Before this arm existed, such a string fell through to `matchesReference`
+    /// below, which compares names and cannot match a digest, so every create
+    /// following a successful `PrepareImage` failed to resolve its own image.
+    ///
+    /// **The change is additive, and the arms below are deliberately left
+    /// reachable for this input.** An exact digest reference is neither
+    /// `isShortID` -- the `@`, the `:` and the repository letters fail
+    /// `^[a-f0-9]{12,64}$` -- nor `isLongID`, whose `hasPrefix("sha256:")` fails
+    /// on the repository prefix. So `matchesReference` still runs for it, which
+    /// is what keeps a store row whose reference literally *is*
+    /// `repository@sha256:<hex>` resolving by exact string match exactly as it
+    /// did before. Nothing that resolved before resolves differently; a form
+    /// that threw can now succeed.
+    ///
+    /// This does change Arca's Docker surface: `docker run|rmi|inspect
+    /// repo@sha256:...` now works where it previously reported "No such image".
+    /// That is Docker's own semantics for the form, and the change is deliberate
+    /// rather than a side effect.
     private func resolveImage(nameOrId: String) async throws -> Containerization.Image {
         // Check if input is a Docker ID (short or long)
         let isShortID = nameOrId.range(of: "^[a-f0-9]{12,64}$", options: .regularExpression) != nil
         let isLongID = nameOrId.hasPrefix("sha256:")
+        let exactDigest = ImageIdentity.exactDigest(of: nameOrId)
 
         logger.debug("Resolving image", metadata: [
             "name_or_id": "\(nameOrId)",
             "is_short_id": "\(isShortID)",
-            "is_long_id": "\(isLongID)"
+            "is_long_id": "\(isLongID)",
+            "is_exact_digest": "\(exactDigest != nil)"
         ])
 
         // For both ID-based and tag-based lookups, we need to list all images
@@ -535,6 +569,31 @@ public actor ImageManager {
             // Match long ID (full digest)
             if isLongID && dockerID == nameOrId {
                 logger.debug("Matched image by long ID", metadata: [
+                    "input": "\(nameOrId)",
+                    "reference": "\(image.reference)",
+                    "digest": "\(image.digest)"
+                ])
+                return image
+            }
+
+            // Match an exact digest reference: both halves, never one.
+            //
+            // The repository is compared as well as the digest, and it is
+            // compared exactly -- no registry normalization -- which is the same
+            // direction the engine's PrepareImage chose. Matching on the digest
+            // alone would resolve `anything-at-all@sha256:<hex>` to this image,
+            // which is a container created from content under a name its caller
+            // never asked for. A false "not found" is visible and recoverable; a
+            // false match is neither.
+            //
+            // Both sides go through ImageIdentity.repository(of:), the one
+            // split, so that the stored `workspace:latest` and the requested
+            // `workspace@sha256:...` meet on `workspace` by the same rule the
+            // engine uses when it decides it holds the content at all.
+            if let exactDigest,
+               image.digest == exactDigest.digest,
+               ImageIdentity.repository(of: image.reference) == exactDigest.repository {
+                logger.debug("Matched image by exact digest reference", metadata: [
                     "input": "\(nameOrId)",
                     "reference": "\(image.reference)",
                     "digest": "\(image.digest)"

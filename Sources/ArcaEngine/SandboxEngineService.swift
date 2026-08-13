@@ -10,9 +10,9 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, four of the eleven are implemented: `Capabilities`,
-/// `Inspect`, `ListResources` and `PrepareImage`.** The other seven answer
-/// `unsupported_capability` inside their response `oneof`.
+/// **In this build, five of the eleven are implemented: `Capabilities`,
+/// `Inspect`, `ListResources`, `PrepareImage` and `Create`.** The other six
+/// answer `unsupported_capability` inside their response `oneof`.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -74,11 +74,18 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
 
     /// See the note on the `create(request:)` overload above.
     ///
-    /// Every capability flag reports what this build implements. Milestone 1
-    /// implements no create and no exec, so every feature flag is false and
-    /// offline is unverified; later milestones flip each flag as they earn
-    /// it. A flag that is true before its code exists induces a consumer to
-    /// send a request the engine cannot honour.
+    /// Every capability flag reports what this build implements, and a flag that
+    /// is true before its code exists induces a consumer to send a request the
+    /// engine cannot honour.
+    ///
+    /// **Every flag is still false, and `Create` landing does not change that.**
+    /// `Create` now honours a project mount, named volumes, loopback publishing
+    /// and resource limits, so three of these flags look ready to flip -- but
+    /// `loopback_publish` in particular is exactly the claim this build cannot
+    /// support: `setPortMapManager` is wired, and gates 2 and 3 between "a
+    /// container with bindings starts" and "a port is published" are provable
+    /// only from the live tier. Flipping the flags is its own task, done against
+    /// the evidence for each, and no flag moves here as a side effect.
     func capabilities(request: Arca_Engine_V1_CapabilitiesRequest) async -> Arca_Engine_V1_CapabilitiesResponse {
         guard let version = engineVersion(from: ArcaVersion.version) else {
             return Arca_Engine_V1_CapabilitiesResponse.with {
@@ -239,9 +246,186 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// This overload carries the actual logic; the protocol-conforming
     /// method below just forwards to it, which is safe because none of the
     /// not-implemented bodies read the context.
+    /// Volumes, then the network, then the container -- and whatever succeeded
+    /// before a failure is reported.
+    ///
+    /// **The order is the contract's, and the report is the reason it matters.**
+    /// `CreateFailed.created` exists because "losing this evidence leaks
+    /// resources that nothing afterwards knows to look for"
+    /// (engine.proto:279-283): the consumer removes exactly what it is told was
+    /// made, so a resource created and not reported is a resource on the host
+    /// that no `Remove` will ever name and only `ListResources` can find. Every
+    /// step below appends to `created` immediately after the call that made the
+    /// resource returns, never in a batch at the end, because a batch is one
+    /// early return away from being skipped.
+    ///
+    /// **Nothing is created before both refusal gates.** The image is checked
+    /// first and the request is translated second; both report an empty
+    /// `created`, so their order decides only which refusal a malformed request
+    /// hears first. The image goes first because it is the failure `PrepareImage`
+    /// exists to pre-empt, and hearing it here means the `Ack` that preceded it
+    /// was wrong -- which is worth surfacing ahead of a field-level complaint.
+    ///
+    /// **What this deliberately does NOT do**, both of which the daemon does and
+    /// both of which would arrive together if this method were written by
+    /// mirroring `ArcaDaemon`:
+    ///
+    /// - It runs no restart policy. `applyRestartPolicies()` calls
+    ///   `startContainer` and boots VMs, which would resurrect sandboxes the
+    ///   consumer believes stopped -- and the daemon does it before the socket
+    ///   binds, so the consumer could not even observe it happening. The
+    ///   container is created with the default `no` policy
+    ///   (`ContainerManager.swift:1916`) and nothing here changes that.
+    /// - It deletes no shared `initfs.ext4`. The private image-store root exists
+    ///   precisely so that this engine never touches the file Apple's tooling
+    ///   shares.
     func create(request: Arca_Engine_V1_CreateRequest) async -> Arca_Engine_V1_CreateResponse {
-        Arca_Engine_V1_CreateResponse.with {
-            $0.failed = Arca_Engine_V1_CreateFailed.with { $0.error = Self.notImplemented("Create") }
+        let image: String
+        switch await heldImageReferences(for: request.image) {
+        case .failure(let error):
+            return Self.createFailed([], error)
+        case .success:
+            // Problem 1's decision, in one expression. See
+            // `heldImageReferences(for:)` above for why the store is consulted
+            // at all, and `SandboxContainerSpec.image` for why the reference
+            // handed on is the digest form rather than a stored tag.
+            image = imageReference(forDigest: request.image)
+        }
+
+        let spec: SandboxContainerSpec
+        switch sandboxContainerSpec(for: request, image: image) {
+        case .failure(let error):
+            return Self.createFailed([], error)
+        case .success(let translated):
+            spec = translated
+        }
+
+        var created: [Arca_Engine_V1_Resource] = []
+
+        for volume in request.volumes {
+            let driver = volumeDriver(forCapacityBytes: volume.capacityBytes)
+            let made = await Self.createCatching(resource: volume.name) {
+                try await self.volumeManager.createVolume(
+                    name: volume.name,
+                    driver: driver.driver,
+                    driverOpts: driver.options,
+                    labels: spec.labels
+                )
+            }
+            if case .failure(let error) = made {
+                return Self.createFailed(created, error)
+            }
+            created.append(resourceMessage(kind: .volume, name: volume.name, labels: spec.labels))
+        }
+
+        if case .networkedName(let networkName) = request.network.mode {
+            // Asked before creating, because `NetworkManager.createNetwork` does
+            // not refuse a name it already holds: it generates a fresh id and
+            // overwrites `networkNames[name]` (`NetworkManager.swift:467`), so a
+            // repeated create would leave the first network on the host with
+            // nothing pointing at it. `createDefaultNetworks` guards itself the
+            // same way (`:297-330`); this is that guard at the one call site
+            // that takes a name from the wire. It is a check-then-act and there
+            // is no engine-side lock to make it otherwise -- the narrower race
+            // is still much better than the silent overwrite.
+            if await networkManager.getNetworkByName(name: networkName) != nil {
+                return Self.createFailed(created, engineError(
+                    .resourceConflict,
+                    resource: networkName,
+                    message: "this engine already holds a network named \(networkName)"
+                ))
+            }
+            let made = await Self.createCatching(resource: networkName) {
+                // `bridge` rather than `vmnet`, and it is the choice that decides
+                // whether ports can ever publish: bridge networks are
+                // WireGuard-backed (`NetworkManager.swift:393-395`), and
+                // `getWireGuardClient` returns nil -- silently publishing
+                // nothing -- for a container that is on no WireGuard network
+                // (`:819-833`).
+                try await self.networkManager.createNetwork(
+                    name: networkName,
+                    driver: "bridge",
+                    subnet: nil,
+                    gateway: nil,
+                    ipRange: nil,
+                    options: [:],
+                    labels: spec.labels
+                )
+            }
+            if case .failure(let error) = made {
+                return Self.createFailed(created, error)
+            }
+            created.append(
+                resourceMessage(kind: .network, name: networkName, labels: spec.labels)
+            )
+        }
+
+        let container = await Self.createCatching(resource: spec.name) {
+            try await self.containerManager.createContainer(
+                image: spec.image,
+                name: spec.name,
+                entrypoint: nil,
+                command: nil,
+                env: spec.env,
+                workingDir: nil,
+                labels: spec.labels,
+                networkMode: spec.networkMode,
+                binds: spec.binds,
+                portBindings: spec.portBindings,
+                memory: spec.memory,
+                nanoCpus: spec.nanoCpus,
+                user: spec.user
+            )
+        }
+        if case .failure(let error) = container {
+            return Self.createFailed(created, error)
+        }
+        created.append(resourceMessage(kind: .container, name: spec.name, labels: spec.labels))
+
+        return Arca_Engine_V1_CreateResponse.with { response in
+            response.created = Arca_Engine_V1_Created.with { $0.created = created }
+        }
+    }
+
+    /// A create failure with the evidence attached.
+    ///
+    /// Every early return in `create(request:)` goes through this, so that
+    /// "report what was made" cannot be forgotten at one of them.
+    private static func createFailed(
+        _ created: [Arca_Engine_V1_Resource],
+        _ error: Arca_Engine_V1_EngineError
+    ) -> Arca_Engine_V1_CreateResponse {
+        Arca_Engine_V1_CreateResponse.with { response in
+            response.failed = Arca_Engine_V1_CreateFailed.with {
+                $0.created = created
+                $0.error = error
+            }
+        }
+    }
+
+    /// `engineErrorCatching` with the one distinction `Create` has to preserve.
+    ///
+    /// A name that is already taken is `resource_conflict`, not
+    /// `command_failed`. The two are opposite instructions to a reconciler:
+    /// `command_failed` says the engine tried and something broke, so retrying
+    /// is reasonable, while `resource_conflict` says the name is occupied and
+    /// retrying will fail identically until something is removed. Collapsing
+    /// them puts a reconciler into a loop against a sandbox that already exists.
+    private static func createCatching<T>(
+        resource: String,
+        _ body: () async throws -> T
+    ) async -> Result<T, Arca_Engine_V1_EngineError> {
+        do {
+            return .success(try await body())
+        } catch {
+            let code: EngineErrorCode
+            switch error {
+            case ContainerManagerError.nameConflict, VolumeError.alreadyExists:
+                code = .resourceConflict
+            default:
+                code = .commandFailed
+            }
+            return .failure(engineError(code, resource: resource, message: "\(error)"))
         }
     }
 
@@ -322,9 +506,35 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// `not_found` for content the engine held, naming a repository the caller
     /// had not asked about.
     func prepareImage(request: Arca_Engine_V1_PrepareImageRequest) async -> Arca_Engine_V1_PrepareImageResponse {
-        let resource = imageReference(forDigest: request.image)
-        guard let key = imageStoreDigest(request.image) else {
-            return Self.prepareImageFailure(engineError(
+        switch await heldImageReferences(for: request.image) {
+        case .failure(let error):
+            return Self.prepareImageFailure(error)
+        case .success:
+            return Arca_Engine_V1_PrepareImageResponse.with { $0.ok = Arca_Engine_V1_Ack() }
+        }
+    }
+
+    /// The references this engine holds a wire digest's content under, or the
+    /// refusal that says why it holds none.
+    ///
+    /// **Shared by `PrepareImage` and `Create`, and sharing it is the point
+    /// rather than a tidiness.** The two methods are a promise and the act that
+    /// depends on it: an `Ack` means "`Create` will find this content and will
+    /// not need a registry for it", and a `Create` that then decided held-ness
+    /// by a second rule could refuse content its own engine had just promised.
+    /// One function decides, so the two cannot disagree about one digest.
+    ///
+    /// The five refusals above it are the same five in either caller, and their
+    /// prose is unchanged from when `prepareImage` spelt them out inline. See
+    /// that method's doc comment for why the store is asked in full rather than
+    /// through `imageExists`, why the repository is compared as well as the
+    /// digest, and why the comparison is exact and normalizes nothing.
+    func heldImageReferences(
+        for image: Arca_Engine_V1_ImageDigest
+    ) async -> Result<[String], Arca_Engine_V1_EngineError> {
+        let resource = imageReference(forDigest: image)
+        guard let key = imageStoreDigest(image) else {
+            return .failure(engineError(
                 .invalidResourceIdentity,
                 resource: resource,
                 message: "an image digest is a non-empty repository and a 64-character lowercase "
@@ -337,16 +547,16 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         }
         switch held {
         case .failure(let error):
-            return Self.prepareImageFailure(error)
+            return .failure(error)
         case .success(.noImageForDigest):
-            return Self.prepareImageFailure(engineError(
+            return .failure(engineError(
                 .notFound,
                 resource: resource,
                 message: "this engine holds no image with that content digest and will not fetch "
                     + "one; load it with 'arca-engine image load --oci-layout <dir>'"
             ))
         case .success(.blobsMissing(let references, let digests)):
-            return Self.prepareImageFailure(engineError(
+            return .failure(engineError(
                 .notFound,
                 resource: resource,
                 message: "this engine has that content digest in its store under "
@@ -359,12 +569,12 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
             // them. Testing a single row would refuse content the engine holds,
             // by whichever row the store listed first.
             let stored = Set(references.map(imageRepository(ofReference:))).sorted()
-            guard stored.contains(request.image.repository) else {
-                return Self.prepareImageFailure(engineError(
+            guard stored.contains(image.repository) else {
+                return .failure(engineError(
                     .notFound,
                     resource: resource,
                     message: "this engine does not hold that content digest under repository "
-                        + "\(request.image.repository); it holds it under "
+                        + "\(image.repository); it holds it under "
                         + stored.joined(separator: ", ")
                 ))
             }
@@ -372,7 +582,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
                 "references": "\(references.joined(separator: ", "))",
                 "digest": "\(key)",
             ])
-            return Arca_Engine_V1_PrepareImageResponse.with { $0.ok = Arca_Engine_V1_Ack() }
+            return .success(references)
         }
     }
 

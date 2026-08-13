@@ -39,6 +39,7 @@ public struct EngineManagers: Sendable {
     public let volumeManager: VolumeManager
     public let networkManager: NetworkManager
     public let execManager: ExecManager
+    public let portMapManager: PortMapManager
 
     private let logger: Logger
 
@@ -82,6 +83,14 @@ public struct EngineManagers: Sendable {
             logger: logger
         )
         self.execManager = ExecManager(containerManager: containerManager, logger: logger)
+        // `dumpNftablesOnPublish` follows the daemon's own rule
+        // (`ArcaDaemon.swift:276`): the dump is a debugging aid and is gated on
+        // the operator having asked for debug logging, not on a separate switch
+        // the engine would then have to grow a CLI option for.
+        self.portMapManager = PortMapManager(
+            logger: logger,
+            dumpNftablesOnPublish: logLevel.lowercased() == "debug"
+        )
     }
 
     /// The engine's own image store, rooted the one way.
@@ -101,7 +110,7 @@ public struct EngineManagers: Sendable {
         try ImageManager(logger: logger, imageStorePath: paths.imageStoreRoot)
     }
 
-    /// Hands `ContainerManager` the two collaborators it holds optionally.
+    /// Hands `ContainerManager` the three collaborators it holds optionally.
     ///
     /// `ContainerManager` takes these by setter rather than by initializer
     /// because `NetworkManager.init` already takes a `ContainerManager`: the two
@@ -120,6 +129,28 @@ public struct EngineManagers: Sendable {
     /// - `ContainerManager.swift:826` builds a container's `NetworkSettings`
     ///   only when `networkManager` is set, so `Inspect` would report a
     ///   container on a network as attached to nothing.
+    /// - `ContainerManager.swift:2494` publishes a container's ports only when
+    ///   `portMapManager` is set, and the gate has no `else`, so a `Create` that
+    ///   asked for ports would start a container that publishes none of them and
+    ///   report success. `Inspect` would then name the binding anyway, because
+    ///   Task 7 reports what the store holds -- see the note on
+    ///   `SandboxEngineService.inspect(request:)`. Every check green over a
+    ///   sandbox nothing can connect to.
+    ///
+    /// **The third line is not proved here the way the first two are, and that
+    /// is stated rather than papered over.** Both tests below assert on
+    /// behaviour a public method makes visible. `PortMapManager` exposes only
+    /// `publishPorts` and `unpublishPorts` (`PortMapManager.swift:61`, `:162`)
+    /// and no read at all, and `publishPorts` takes a non-optional
+    /// `WireGuardClient` whose `connect` needs a booted VM
+    /// (`NetworkManager.swift:836-838`). The one VM-free path that reaches the
+    /// gate -- `removeContainer`'s database-only branch, `:3052-3070` --
+    /// unpublishes a container that has no mappings, which is a no-op with no
+    /// observable result: a test written on it would pass with this line
+    /// deleted, which makes it worse than no test. Publication is provable only
+    /// from the live tier, and is routed to Task 13 with the shape that would
+    /// settle it: create with a `PortMapping`, `Start`, then connect to
+    /// `127.0.0.1:<host_port>` from the test process.
     ///
     /// Called after all three `initialize()` calls, which is what `ArcaDaemon`
     /// does and what the setters' own comments ask for. Nothing read during
@@ -130,22 +161,25 @@ public struct EngineManagers: Sendable {
     /// Separate from the `initialize()` sequence, and VM-free, because that is
     /// what lets it be proved at all. `ContainerManager.initialize()` constructs
     /// a real `VmnetNetwork`, so no test may call a method containing it; this
-    /// one a test can call, and `EngineManagerWiringTests` drives each line
-    /// through behaviour rather than through the call. MEASURED, one line
-    /// removed at a time, `swift test --filter ArcaEngineTests`:
+    /// one a test can call, and `EngineManagerWiringTests` drives the first two
+    /// lines through behaviour rather than through the call. MEASURED, one line
+    /// removed at a time, `swift test --filter ArcaEngineTests`, reported by
+    /// which tests fail rather than by how many:
     ///
-    /// - without `setVolumeManager`: `Executed 63 tests, with 1 failure` --
-    ///   `testRemovingAContainerDeletesItsAnonymousVolumeAndSparesTheNamedOne`,
-    ///   which found `["anon-vol", "named-vol"]` both still present after
-    ///   `Remove` had reported success.
-    /// - without `setNetworkManager`: `Executed 63 tests, with 3 failures`, all
-    ///   in `testAnAttachedContainerReportsTheNetworkItIsOn`, whose networks
-    ///   dictionary came back `[]`.
-    ///
-    /// Restored: `Executed 63 tests, with 0 failures`.
+    /// - without `setVolumeManager`, the only failure is
+    ///   `EngineManagerWiringTests.testRemovingAContainerDeletesItsAnonymousVolumeAndSparesTheNamedOne`,
+    ///   which finds `["anon-vol", "named-vol"]` both still present after
+    ///   `Remove` has reported success.
+    /// - without `setNetworkManager`, the only failing test is
+    ///   `EngineManagerWiringTests.testAnAttachedContainerReportsTheNetworkItIsOn`,
+    ///   on all three of its assertions, its networks dictionary having come
+    ///   back `[]`.
+    /// - without `setPortMapManager`, nothing fails, for the reason given above.
+    ///   That is the finding, not an omission.
     public func wireCollaborators() async {
         await containerManager.setVolumeManager(volumeManager)
         await containerManager.setNetworkManager(networkManager)
+        await containerManager.setPortMapManager(portMapManager)
     }
 
     /// The service over these managers.

@@ -103,12 +103,16 @@ public func imageStoreDigest(_ digest: Arca_Engine_V1_ImageDigest) -> String? {
 /// up, which keeps a tag inside the repository it reports. That asymmetry is
 /// real; it belongs to the Inspect path and is recorded rather than changed
 /// here.
+///
+/// **The rule moved into `ContainerBridge.ImageIdentity` and this forwards to
+/// it.** `ImageManager.resolveImage`'s exact-digest arm compares a requested
+/// repository against a stored one, and this compares the same two things for
+/// `PrepareImage`. Those answers have to agree -- an `Ack` here is a promise
+/// that the resolver there will find the content -- and two copies of a
+/// splitting rule agree only until one of them is edited. The name stays,
+/// because it is what the call sites already say; only the body moved.
 public func imageRepository(ofReference reference: String) -> String {
-    let name = reference.range(of: "@sha256:", options: .backwards)
-        .map { String(reference[reference.startIndex..<$0.lowerBound]) } ?? reference
-    guard let tagSeparator = name.lastIndex(of: ":") else { return name }
-    if let slash = name.lastIndex(of: "/"), tagSeparator < slash { return name }
-    return String(name[name.startIndex..<tagSeparator])
+    ImageIdentity.repository(of: reference)
 }
 
 /// Maps ContainerBridge's status string onto the contract's three states.
