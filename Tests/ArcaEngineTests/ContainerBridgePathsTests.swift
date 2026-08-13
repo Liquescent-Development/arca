@@ -2,6 +2,7 @@ import ContainerBridge
 import Foundation
 import Logging
 import XCTest
+@testable import ArcaEngine
 
 final class ContainerBridgePathsTests: XCTestCase {
     private func temporaryRoot() -> URL {
@@ -14,7 +15,74 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// builds `imageStore.path/initfs.ext4`. Sharing that store is what forces
     /// ArcaDaemon to delete the file on every start; a private root removes the
     /// need for any coordination.
-    func testTheImageStoreRootIsTheOneItWasGiven() throws {
+    ///
+    /// This drives `SandboxEngineService.forTesting(stateRoot:)`, which derives
+    /// its paths from `EnginePaths` exactly as `arca-engine` does, and reads
+    /// `containerizationRoot()`, the value `initialize()` hands to
+    /// Containerization. Both ends are the production ones: nothing here
+    /// restates the derivation, so a derivation that changed would be caught
+    /// rather than followed.
+    func testTheEngineImageStoreIsUnderItsStateRootAndNotApples() {
+        let root = temporaryRoot()
+        let service = SandboxEngineService.forTesting(stateRoot: root)
+
+        let selected = service.containerManager.containerizationRoot()
+        XCTAssertTrue(
+            selected.path.hasPrefix(root.path),
+            "the engine's image store must live under the state root it was given, got \(selected.path)"
+        )
+        XCTAssertFalse(
+            selected.path.contains("com.apple.containerization"),
+            "the engine's image store must not resolve into Apple's shared store"
+        )
+    }
+
+    /// `~/.arca/layers` was hardcoded, so a dev.gascan-rooted engine would still
+    /// write its layer cache into Arca's tree.
+    func testTheEngineLayerCacheIsUnderItsStateRootAndNotArcas() {
+        let root = temporaryRoot()
+        let service = SandboxEngineService.forTesting(stateRoot: root)
+
+        let cache = service.containerManager.layerCachePath
+        XCTAssertTrue(
+            cache.path.hasPrefix(root.path),
+            "the engine's layer cache must live under the state root it was given, got \(cache.path)"
+        )
+        XCTAssertFalse(
+            cache.path.hasSuffix(".arca/layers"),
+            "the engine's layer cache must not resolve into Arca's tree"
+        )
+    }
+
+    /// Nothing the engine derives escapes the state root. The two tests above
+    /// cover the image store and the layer cache through the wiring; this
+    /// covers the rest of `EnginePaths` -- the state database, the volumes
+    /// directory, the kernel and the configured socket -- which are handed to
+    /// managers this suite does not otherwise read back.
+    func testNoEnginePathEscapesTheStateRoot() {
+        let root = temporaryRoot()
+        let paths = EnginePaths(stateRoot: root)
+
+        for (name, path) in [
+            ("imageStoreRoot", paths.imageStoreRoot),
+            ("layerCache", paths.layerCache),
+            ("stateDatabase", paths.stateDatabase),
+            ("volumesRoot", paths.volumesRoot),
+            ("kernel", paths.kernel),
+            ("socket", paths.socket),
+        ] {
+            XCTAssertTrue(
+                path.path.hasPrefix(root.path + "/"),
+                "\(name) must live under the state root, got \(path.path)"
+            )
+        }
+    }
+
+    /// ContainerBridge's own contract, independent of the engine: a
+    /// `ContainerManager` uses the roots it was handed. ArcaDaemon depends on
+    /// this too, and it is constructed by neither `EnginePaths` nor
+    /// `forTesting`.
+    func testAContainerManagerUsesTheRootsItWasGiven() throws {
         let logger = Logger(label: "paths-tests")
         let root = temporaryRoot()
         let stateStore = try StateStore(
@@ -22,11 +90,12 @@ final class ContainerBridgePathsTests: XCTestCase {
             logger: logger
         )
         let imageStoreRoot = root.appendingPathComponent("images")
+        let layerCachePath = root.appendingPathComponent("layers")
         let manager = ContainerManager(
             imageManager: try ImageManager(logger: logger, imageStorePath: imageStoreRoot),
             kernelPath: root.appendingPathComponent("vmlinux").path,
             imageStoreRoot: imageStoreRoot,
-            layerCachePath: root.appendingPathComponent("layers"),
+            layerCachePath: layerCachePath,
             stateStore: stateStore,
             logger: logger
         )
@@ -34,43 +103,8 @@ final class ContainerBridgePathsTests: XCTestCase {
         // containerizationRoot() and not imageStoreRoot: the stored property is
         // beside the decision, not the decision. MEASURED: with initialize()
         // reverted to pass no `root:` at all, assertions on the property alone
-        // reported "Executed 2 tests, with 0 failures". containerizationRoot()
-        // is the value initialize() hands to Containerization, so reverting the
-        // selection is red.
+        // reported "Executed 2 tests, with 0 failures".
         XCTAssertEqual(manager.containerizationRoot(), imageStoreRoot)
-        XCTAssertEqual(manager.imageStoreRoot, imageStoreRoot)
-        XCTAssertFalse(
-            manager.containerizationRoot().path.contains("com.apple.containerization"),
-            "the engine's image store must not resolve into Apple's shared store"
-        )
-    }
-
-    /// `~/.arca/layers` was hardcoded, so a dev.gascan-rooted engine would still
-    /// write its layer cache into Arca's tree.
-    func testTheLayerCacheIsTheOneItWasGiven() throws {
-        let logger = Logger(label: "paths-tests")
-        let root = temporaryRoot()
-        let stateStore = try StateStore(
-            path: root.appendingPathComponent("state.db").path,
-            logger: logger
-        )
-        let layerCachePath = root.appendingPathComponent("layers")
-        let manager = ContainerManager(
-            imageManager: try ImageManager(
-                logger: logger,
-                imageStorePath: root.appendingPathComponent("images")
-            ),
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            imageStoreRoot: root.appendingPathComponent("images"),
-            layerCachePath: layerCachePath,
-            stateStore: stateStore,
-            logger: logger
-        )
-
         XCTAssertEqual(manager.layerCachePath, layerCachePath)
-        XCTAssertFalse(
-            manager.layerCachePath.path.hasSuffix(".arca/layers"),
-            "the engine's layer cache must not resolve into Arca's tree"
-        )
     }
 }

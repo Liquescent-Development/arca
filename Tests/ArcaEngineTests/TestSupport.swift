@@ -13,36 +13,54 @@ extension SandboxEngineService {
     /// be created, which should fail the test run loudly rather than surface
     /// as an ordinary assertion failure.
     static func forTesting() -> SandboxEngineService {
+        forTesting(
+            stateRoot: URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("arca-engine-tests-\(UUID().uuidString)")
+        )
+    }
+
+    /// The same service against a state root the caller names, so a test can
+    /// assert on where the managers were actually rooted.
+    ///
+    /// Paths come from `EnginePaths` -- the derivation `arca-engine` itself
+    /// calls -- and not from a copy of its `appendingPathComponent` lines. The
+    /// copy is what made this helper a replica of the wiring rather than the
+    /// wiring: while it stood, changing the engine's real image-store root left
+    /// the whole suite green.
+    ///
+    /// No default for `stateRoot`, in keeping with the rule the path parameters
+    /// on `ContainerManager` follow: the no-argument overload above states the
+    /// throwaway root it wants.
+    static func forTesting(stateRoot: URL) -> SandboxEngineService {
         let logger = Logger(label: "arca-engine-tests")
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("arca-engine-tests-\(UUID().uuidString)")
+        let paths = EnginePaths(stateRoot: stateRoot)
 
         let stateStore = try! StateStore(
-            path: root.appendingPathComponent("state.db").path,
+            path: paths.stateDatabase.path,
             logger: logger
         )
         let imageManager = try! ImageManager(
             logger: logger,
-            imageStorePath: root.appendingPathComponent("images")
+            imageStorePath: paths.imageStoreRoot
         )
         let containerManager = ContainerManager(
             imageManager: imageManager,
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            imageStoreRoot: root.appendingPathComponent("images"),
-            layerCachePath: root.appendingPathComponent("layers"),
+            kernelPath: paths.kernel.path,
+            imageStoreRoot: paths.imageStoreRoot,
+            layerCachePath: paths.layerCache,
             stateStore: stateStore,
             logger: logger
         )
         let config = ArcaConfig(
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            socketPath: root.appendingPathComponent("arca.sock").path,
+            kernelPath: paths.kernel.path,
+            socketPath: paths.socket.path,
             logLevel: "info"
         )
 
         return SandboxEngineService(
             containerManager: containerManager,
             volumeManager: VolumeManager(
-                volumesBasePath: root.appendingPathComponent("volumes").path,
+                volumesBasePath: paths.volumesRoot.path,
                 stateStore: stateStore,
                 logger: logger
             ),

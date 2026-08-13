@@ -33,7 +33,12 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // path to connect if the directory itself is 0700.
         try createSocketParentDirectory(for: socketPath)
 
-        let root = URL(fileURLWithPath: stateRoot)
+        // Every path below comes from this one derivation, which the tests call
+        // too. Spelling the components out here a second time is what let the
+        // suite stay green while the engine's real image-store root changed:
+        // TestSupport held a hand-copy of these lines, so the tests exercised a
+        // replica of the wiring rather than the wiring. See EnginePaths.
+        let paths = EnginePaths(stateRoot: URL(fileURLWithPath: stateRoot))
 
         // initialize() is deliberately never called on any manager here, and
         // the reason it cannot be is worth stating in full, because it decides
@@ -74,31 +79,31 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // dependency edge they create is a property gascan's release gate
         // measures. See the note on SandboxEngineService's stored properties.
         let stateStore = try StateStore(
-            path: root.appendingPathComponent("state.db").path,
+            path: paths.stateDatabase.path,
             logger: logger
         )
         let imageManager = try ImageManager(
             logger: logger,
-            imageStorePath: root.appendingPathComponent("images")
+            imageStorePath: paths.imageStoreRoot
         )
         let containerManager = ContainerManager(
             imageManager: imageManager,
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            imageStoreRoot: root.appendingPathComponent("images"),
-            layerCachePath: root.appendingPathComponent("layers"),
+            kernelPath: paths.kernel.path,
+            imageStoreRoot: paths.imageStoreRoot,
+            layerCachePath: paths.layerCache,
             stateStore: stateStore,
             logger: logger
         )
         let config = ArcaConfig(
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            socketPath: root.appendingPathComponent("arca.sock").path,
+            kernelPath: paths.kernel.path,
+            socketPath: paths.socket.path,
             logLevel: logLevel
         )
 
         let service = SandboxEngineService(
             containerManager: containerManager,
             volumeManager: VolumeManager(
-                volumesBasePath: root.appendingPathComponent("volumes").path,
+                volumesBasePath: paths.volumesRoot.path,
                 stateStore: stateStore,
                 logger: logger
             ),
