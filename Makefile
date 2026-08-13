@@ -269,6 +269,8 @@ test: codesign
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/Arca
 	@echo "Signing ArcaTestHelper binary..."
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/ArcaTestHelper
+	@echo "Signing $(ENGINE) binary..."
+	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(ENGINE)
 	@echo "Signing test binaries..."
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) .build/debug/ArcaPackageTests.xctest/Contents/MacOS/ArcaPackageTests 2>/dev/null || true
 	@echo "✓ All binaries signed"
