@@ -941,7 +941,19 @@ public actor ContainerManager {
 
     /// Convert Docker portBindings to PortMapping array for container list API
     /// Format: {"80/tcp": [PortBinding(hostIp: "0.0.0.0", hostPort: "8080")]} -> [PortMapping(...)]
-    private func convertPortBindingsToMappings(_ portBindings: [String: [PortBinding]]) -> [PortMapping] {
+    ///
+    /// `package` rather than `private` because `ArcaEngine`'s `Inspect` reports a
+    /// sandbox's ports and `Container` has no `ports` field to read them from
+    /// (`Types.swift:68-80`) -- only `hostConfig.portBindings` (`:218`), which is this
+    /// function's input. A second parser over the same `"80/tcp"` strings in
+    /// `ArcaEngine` would be a second place for the format to be read
+    /// differently, and this one is already the parser the restore path (`:420`)
+    /// and the create path (`:1911`) agree on.
+    ///
+    /// `package`, not `public`, following `loadPersistedState()` (`:316`): the
+    /// only caller outside this file is inside this SwiftPM package, so nothing
+    /// outside it needs the wider surface.
+    package func convertPortBindingsToMappings(_ portBindings: [String: [PortBinding]]) -> [PortMapping] {
         var mappings: [PortMapping] = []
 
         for (portProto, bindings) in portBindings {

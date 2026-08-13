@@ -7,8 +7,10 @@ final class ListResourcesTests: XCTestCase {
     /// An empty `ResourceList` is not an error arm -- it is a confident report
     /// of a clean host, and this build cannot earn it.
     ///
-    /// The assertion that matters is the negative one, for the same reason as
-    /// `InspectTests.testInspectRefusesToReportAbsenceItCannotObserve`. The
+    /// The assertion that matters is the negative one, for the reason
+    /// `InspectTests.testAbsentIsAnsweredOnlyForAnIdTheLoadedStateDoesNotHold`
+    /// now states from the other side: an emptiness is only an observation when
+    /// the thing reporting it can be shown to see a non-empty case too. The
     /// version this replaces asserted `list.resources.isEmpty` against a
     /// service whose three managers are empty under every input; it would have
     /// passed against a hardcoded empty list with ContainerBridge deleted.

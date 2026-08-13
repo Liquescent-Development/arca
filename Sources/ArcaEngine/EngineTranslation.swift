@@ -1,3 +1,4 @@
+import ContainerBridge
 import SandboxEngineProto
 
 /// Reads the leading `major.minor.patch` of a version string.
@@ -53,6 +54,102 @@ public func sandboxState(fromStatus status: String) -> Arca_Engine_V1_SandboxSta
     case "exited", "dead": return .stopped
     default: return .unspecified
     }
+}
+
+/// A stored port binding the contract has no field to carry.
+///
+/// Carried out rather than swallowed because there is no third answer available:
+/// `Sandbox.ports` is a plain `repeated PortMapping` (engine.proto:343) with no
+/// way to say "there is a binding here I cannot name", and `InspectResponse`'s
+/// three arms are sandbox, absent, and error (engine.proto:358-365). A sandbox
+/// arm carrying a port list that silently omits or invents a binding is the one
+/// outcome that cannot be detected downstream, so the refusal is the answer.
+///
+/// `reason` becomes the engine error's `message`: prose, never parsed
+/// (EngineErrors.swift:32-35), naming the binding so an operator knows which
+/// stored row to look at.
+public struct UnrepresentablePortBinding: Error, Equatable {
+    public let reason: String
+
+    public init(reason: String) {
+        self.reason = reason
+    }
+}
+
+/// A port number the wire can carry, or nil.
+///
+/// The field is `uint32` (engine.proto:214-215) but a TCP port is 1...65535, so
+/// three stored values have no representation: a negative, a number above
+/// 65535, and 0. The first two would wrap or trap on a bare `UInt32(_:)`
+/// conversion; 0 would convert cleanly and mean nothing -- the consumer reads it
+/// back as `port 0 is not a mapping`
+/// (crates/gascan-arca/src/translate.rs:370-375), blaming the engine's output
+/// for a number the store never held as a port.
+private func wirePort(_ value: Int) -> UInt32? {
+    guard (1...65535).contains(value) else { return nil }
+    return UInt32(value)
+}
+
+/// The binding as prose, for whichever refusal names it.
+private func describe(_ binding: PortMapping) -> String {
+    "\(binding.publicPort.map(String.init) ?? "<none>"):\(binding.privatePort)/\(binding.type)"
+}
+
+/// A sandbox's published ports, or the first binding that cannot be one.
+///
+/// The input is `ContainerManager.convertPortBindingsToMappings`' output, which
+/// is the parse of the stored `hostConfig.portBindings`. The output is the
+/// contract's `PortMapping`, and the two do not have the same shape: the stored
+/// side carries an optional host port, a protocol, and a bind address
+/// (`Types.swift:53-58`), and the wire side carries two numbers and nothing else
+/// (engine.proto:211-217). Every field the wire side lacks is a case where the
+/// only honest answers are "refuse" and "fabricate":
+///
+/// - **No host port.** An unset `publicPort` is a stored binding whose host side
+///   is not recorded. `hostPort = 0` fabricates the very class of value this
+///   mapping exists to stop, and dropping the entry asserts the sandbox
+///   publishes nothing on that guest port -- which is what drift detection then
+///   compares against.
+/// - **A protocol that is not tcp.** The wire has no protocol field, so a udp
+///   binding emitted here reads as a tcp publication that does not exist, and a
+///   tcp and a udp binding on the same two numbers collapse into a duplicate the
+///   consumer rejects outright (translate.rs:376-381).
+/// - **A number that is not a port.** See `wirePort` above.
+///
+/// Sorted, because `repeated` is ordered on the wire and the input comes from
+/// iterating a Dictionary (`ContainerManager.swift:959`), whose order is seeded
+/// per process. Unsorted, two Inspects of one unchanged sandbox can disagree
+/// about the order of its ports. Sorting reorders; it invents nothing.
+public func sandboxPorts(
+    fromBindings bindings: [PortMapping]
+) -> Result<[Arca_Engine_V1_PortMapping], UnrepresentablePortBinding> {
+    var ports: [Arca_Engine_V1_PortMapping] = []
+    for binding in bindings {
+        guard binding.type == "tcp" else {
+            return .failure(UnrepresentablePortBinding(
+                reason: "port binding \(describe(binding)) is not tcp, and the contract's "
+                    + "PortMapping carries no protocol field to say otherwise"
+            ))
+        }
+        guard let publicPort = binding.publicPort else {
+            return .failure(UnrepresentablePortBinding(
+                reason: "port binding \(describe(binding)) is stored with no host port, and "
+                    + "the contract has no way to report a binding that has none"
+            ))
+        }
+        guard let hostPort = wirePort(publicPort),
+              let guestPort = wirePort(binding.privatePort)
+        else {
+            return .failure(UnrepresentablePortBinding(
+                reason: "port binding \(describe(binding)) names a number that is not a port"
+            ))
+        }
+        ports.append(Arca_Engine_V1_PortMapping.with {
+            $0.hostPort = hostPort
+            $0.guestPort = guestPort
+        })
+    }
+    return .success(ports.sorted { ($0.guestPort, $0.hostPort) < ($1.guestPort, $1.hostPort) })
 }
 
 /// The container's resource name, as the contract requires it.
