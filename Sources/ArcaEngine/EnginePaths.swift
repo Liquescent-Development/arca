@@ -31,9 +31,28 @@ public struct EnginePaths: Sendable, Equatable {
     /// image one loads is not the one the other resolves the initfs from.
     public let imageStoreRoot: URL
 
+    /// The init filesystem Containerization unpacks the vminit image into.
+    ///
+    /// Derived from `imageStoreRoot` and not spelt out from the state root,
+    /// because that is where Containerization puts it -- `ContainerManager`
+    /// appends `initfs.ext4` to the image store's own path
+    /// (containerization/Sources/Containerization/ContainerManager.swift:146).
+    /// Restating it from the state root would be a second derivation of the
+    /// image store root, free to drift from the first.
+    ///
+    /// It is the engine's because the store is: ArcaDaemon deletes the copy in
+    /// Apple's shared store on every start, and this one is not that file.
+    public let initfs: URL
+
     /// OverlayFS layer cache. Under the state root rather than `~/.arca/layers`,
     /// which is Arca's tree.
     public let layerCache: URL
+
+    /// Digest of the vminit image `initfs` was built from, so that a start can
+    /// tell an unchanged vminit from a new one. Beside the state root's other
+    /// records and never beside Apple's shared `initfs.ext4`, which belongs to
+    /// whichever ArcaDaemon is running.
+    public let vminitDigest: URL
 
     /// SQLite database holding container, network and volume state.
     public let stateDatabase: URL
@@ -49,6 +68,8 @@ public struct EnginePaths: Sendable, Equatable {
     public init(stateRoot: URL) {
         self.stateRoot = stateRoot
         self.imageStoreRoot = stateRoot.appendingPathComponent("images")
+        self.initfs = self.imageStoreRoot.appendingPathComponent("initfs.ext4")
+        self.vminitDigest = stateRoot.appendingPathComponent("vminit-digest")
         self.layerCache = stateRoot.appendingPathComponent("layers")
         self.stateDatabase = stateRoot.appendingPathComponent("state.db")
         self.volumesRoot = stateRoot.appendingPathComponent("volumes")

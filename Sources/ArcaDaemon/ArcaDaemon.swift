@@ -94,8 +94,15 @@ public final class ArcaDaemon: @unchecked Sendable {
 
             // Delete the existing initfs.ext4 file to force regeneration from our custom vminit
             // Without this, the old initfs.ext4 (which may be from a different vminit) gets reused
-            let initfsPath = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/com.apple.containerization/initfs.ext4")
+            //
+            // Bound to the store this daemon actually loads into, rather than
+            // spelled out from the home directory a second time: Containerization
+            // builds initfs.ext4 at the image store's own path, so the two are the
+            // same file only for as long as the two spellings agree. Unchanged in
+            // effect -- the ImageManager above is constructed with no path, so its
+            // store is ImageStore.default, rooted at Application Support's
+            // com.apple.containerization (ImageStore.swift:55-64).
+            let initfsPath = imageManager.storeRoot.appendingPathComponent("initfs.ext4")
             if FileManager.default.fileExists(atPath: initfsPath.path) {
                 logger.debug("Deleting existing initfs.ext4 to force regeneration")
                 do {

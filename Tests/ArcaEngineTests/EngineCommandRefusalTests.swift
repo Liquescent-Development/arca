@@ -77,6 +77,52 @@ final class EngineCommandRefusalTests: XCTestCase {
         )
     }
 
+    /// The vminit load runs, and refuses, inside `run()`.
+    ///
+    /// `EngineStartupTests` calls `loadVminit` directly, which proves the
+    /// function and not the call -- the same hole this file exists for, and the
+    /// call is newer than the validation. A wrong reference is the only refusal
+    /// reachable from outside without a 178MB image: the layout below is real,
+    /// well-formed, and holds `vminit:latest`, so the engine can only learn that
+    /// by loading it.
+    ///
+    /// Both assertions carry the layout's own temp path, which no usage line
+    /// can contain, so neither can be satisfied by an ArgumentParser parse
+    /// error printed before `run()` was entered.
+    func testTheCommandRefusesALayoutHoldingAnotherImage() throws {
+        let root = try temporaryRoot()
+        let kernel = root.appendingPathComponent("vmlinux")
+        try Data("k".utf8).write(to: kernel)
+        let layout = root.appendingPathComponent("vminit")
+        try OCILayoutFixture.write(
+            at: layout, reference: "vminit:latest", payload: "not the engine's init"
+        )
+
+        let run = try runEngine(arguments: [
+            "--socket-path", root.appendingPathComponent("e.sock").path,
+            "--state-root", root.appendingPathComponent("state").path,
+            "--kernel-path", kernel.path,
+            "--vminit-layout", layout.path,
+        ])
+
+        XCTAssertTrue(
+            run.exitedOnItsOwn,
+            "the engine must refuse an unknown init image, not serve on it; stderr: \(run.errorText)"
+        )
+        XCTAssertNotEqual(
+            run.status, 0,
+            "a refusal must be a non-zero exit; stderr: \(run.errorText)"
+        )
+        XCTAssertTrue(
+            run.errorText.contains("--vminit-layout") && run.errorText.contains(layout.path),
+            "the refusal must name the option and the layout it read, got: \(run.errorText)"
+        )
+        XCTAssertTrue(
+            run.errorText.contains("arca-vminit:latest") && run.errorText.contains("vminit:latest"),
+            "the refusal must say which image was wanted and which was found, got: \(run.errorText)"
+        )
+    }
+
     // MARK: - Running the binary
 
     private struct EngineRun {

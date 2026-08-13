@@ -82,6 +82,8 @@ final class ContainerBridgePathsTests: XCTestCase {
 
         for (name, path) in [
             ("imageStoreRoot", paths.imageStoreRoot),
+            ("initfs", paths.initfs),
+            ("vminitDigest", paths.vminitDigest),
             ("layerCache", paths.layerCache),
             ("stateDatabase", paths.stateDatabase),
             ("volumesRoot", paths.volumesRoot),
@@ -122,5 +124,44 @@ final class ContainerBridgePathsTests: XCTestCase {
         // reported "Executed 2 tests, with 0 failures".
         XCTAssertEqual(manager.containerizationRoot(), imageStoreRoot)
         XCTAssertEqual(manager.layerCachePath, layerCachePath)
+    }
+
+    /// `initfs.ext4` is not a path the engine picks, it is a path
+    /// Containerization derives from whichever image store it is handed
+    /// (containerization/Sources/Containerization/ContainerManager.swift:146).
+    /// `EnginePaths.initfs` must therefore be that derivation and not a second
+    /// route to the same string -- the test above proves it stays under the
+    /// state root, this proves it stays inside the store.
+    func testTheInitfsIsInsideTheImageStoreTheEngineHandsContainerization() {
+        let root = temporaryRoot()
+        let paths = EnginePaths(stateRoot: root)
+        let service = SandboxEngineService.forTesting(
+            stateRoot: root, kernelPath: Self.externalKernel
+        )
+
+        XCTAssertEqual(
+            paths.initfs,
+            service.containerManager.containerizationRoot()
+                .appendingPathComponent("initfs.ext4"),
+            "the initfs the engine deletes must be the one Containerization builds"
+        )
+    }
+
+    /// An `ImageManager` reports the store it was actually given, which is what
+    /// lets ArcaDaemon name its initfs relative to its store instead of
+    /// re-deriving Application Support by hand -- the re-derivation that sat 70
+    /// lines from the comment saying the file avoids it.
+    ///
+    /// A store path is passed in rather than defaulted, because asserting on
+    /// the default would mean touching the real
+    /// `~/Library/Application Support/com.apple.containerization` from a test.
+    func testAnImageManagerReportsTheStoreRootItWasGiven() throws {
+        let root = temporaryRoot()
+        let storePath = root.appendingPathComponent("images")
+        let manager = try ImageManager(
+            logger: Logger(label: "paths-tests"), imageStorePath: storePath
+        )
+
+        XCTAssertEqual(manager.storeRoot, storePath)
     }
 }

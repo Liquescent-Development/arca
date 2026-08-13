@@ -63,45 +63,19 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // handed, not state the engine owns.
         let paths = EnginePaths(stateRoot: inputs.stateRoot)
 
-        // initialize() is deliberately never called on any manager here, and
-        // the reason it cannot be is worth stating in full, because it decides
-        // which RPCs this build may implement.
+        // Every manager below is rooted in the state root this engine owns, and
+        // that ownership is the design: a state root shared with a live
+        // ArcaDaemon is the hazard EngineInputs records, and an image store
+        // shared with it is the one EnginePaths records. Nothing here is
+        // derived a second way.
         //
-        // ContainerManager.initialize() requires the kernel file to exist on
-        // disk, an "arca-vminit:latest" image already loaded by ArcaDaemon, and
-        // a live Containerization.VmnetNetwork (ContainerManager.swift:219-244).
-        // Requiring all three would make this engine refuse to start anywhere a
-        // kernel or vminit image is absent, which defeats the point of this
-        // milestone -- a Rust client dialling a real, running engine.
-        //
-        // Its second half is not merely unavailable, it is unsafe here.
-        // loadPersistedState() marks every container whose persisted status is
-        // "running" as exited with code 137 and writes that back to the
-        // StateStore (ContainerManager.swift:316-338). Against a --state-root
-        // that a live ArcaDaemon is also using -- ~/.arca being the natural
-        // choice -- this engine would declare the daemon's running containers
-        // dead. NetworkManager.initialize() is likewise a mutation: it ends in
-        // createDefaultNetworks(), which creates "bridge", "host" (vmnet
-        // driver) and "none" (NetworkManager.swift:87-88).
-        //
-        // The consequence is total, not restart-scoped, and not confined to
-        // containers. The only two writers of ContainerManager.containers are
-        // initialize()'s restore loop and createContainer, which this build
-        // answers unsupported_capability; VolumeManager.volumes is loaded only
-        // from initialize(); NetworkManager.listNetworks() reads two backends
-        // that initialize() is the sole populator of. All three are empty for
-        // the life of the process, under every input.
-        //
-        // So Inspect and ListResources answer unsupported_capability rather
-        // than "absent" and "nothing here" -- see the notes on each in
-        // SandboxEngineService. --kernel-path and --vminit-layout now name the
-        // first two of those three preconditions, and a later task in this
-        // milestone calls initialize() once the third is in hand and restores
-        // both methods.
-        //
-        // The managers are still constructed and handed to the service: the
-        // dependency edge they create is a property gascan's release gate
-        // measures. See the note on SandboxEngineService's stored properties.
+        // initialize() is still not called on any manager. It needs a live
+        // Containerization.VmnetNetwork alongside the kernel and the vminit
+        // image (ContainerBridge/ContainerManager.swift:246-278), and until it
+        // is called, Inspect and ListResources answer unsupported_capability --
+        // see the notes on each in SandboxEngineService. The managers are
+        // constructed and handed to the service regardless: the dependency edge
+        // they create is a property gascan's release gate measures.
         let stateStore = try StateStore(
             path: paths.stateDatabase.path,
             logger: logger
@@ -110,6 +84,18 @@ struct ArcaEngineCommand: AsyncParsableCommand {
             logger: logger,
             imageStorePath: paths.imageStoreRoot
         )
+
+        // Before any manager that resolves an init image. This is the second of
+        // initialize()'s three preconditions, and the engine now satisfies it
+        // itself rather than inheriting an image ArcaDaemon happened to load
+        // into the shared store.
+        _ = try await loadVminit(
+            from: inputs.vminitLayout,
+            into: imageManager,
+            stateRoot: inputs.stateRoot,
+            logger: logger
+        )
+
         let containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: inputs.kernelPath.path,

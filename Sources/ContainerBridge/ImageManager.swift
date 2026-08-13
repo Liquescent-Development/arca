@@ -27,6 +27,17 @@ public actor ImageManager {
         self.defaultPlatform = Platform.current
     }
 
+    /// Root of the `ImageStore` this manager loads into.
+    ///
+    /// Exists so that a caller which has to reason about a file *inside* the
+    /// store -- `initfs.ext4`, which Containerization builds at the store's own
+    /// path -- can ask the manager instead of re-deriving that path from the
+    /// same defaults and trusting the two to stay equal.
+    ///
+    /// `nonisolated` because it is fixed at construction: making callers await
+    /// a constant would be the reason they went on hand-deriving it.
+    nonisolated public var storeRoot: URL { imageStore.path }
+
     /// Initialize the image manager
     public func initialize() async throws {
         logger.info("Initializing ImageManager", metadata: [
