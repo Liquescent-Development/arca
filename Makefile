@@ -15,6 +15,7 @@ endif
 # Binary names
 BINARY = Arca
 TEST_HELPER = ArcaTestHelper
+ENGINE = arca-engine
 
 # Installation directory
 INSTALL_DIR = /usr/local/bin
@@ -57,11 +58,22 @@ $(BUILD_DIR)/$(BINARY): gen-buildinfo $(SOURCES) Package.swift
 	@swift build $(SWIFT_BUILD_FLAGS)
 
 # Codesign the binaries with entitlements
-codesign: $(BUILD_DIR)/$(BINARY) $(BUILD_DIR)/$(TEST_HELPER)
+#
+# $(ENGINE) belongs here for the same reason $(BINARY) does, and was missing:
+# ContainerManager.initialize() constructs a Containerization.VmnetNetwork, and
+# vmnet refuses without com.apple.security.virtualization. MEASURED with the
+# signature as the only variable -- stripped of entitlements the engine exits 1
+# on "failed to create vmnet network with status vmnet_return_t(rawValue: 1002)"
+# and creates no socket. 1002 is VMNET_MEM_FAILURE in vmnet.h, which sends
+# whoever debugs it looking for a memory fault; re-signed with $(ENTITLEMENTS)
+# the same binary initialises all three managers and serves on its socket.
+codesign: $(BUILD_DIR)/$(BINARY) $(BUILD_DIR)/$(TEST_HELPER) $(BUILD_DIR)/$(ENGINE)
 	@echo "Code signing $(BINARY) with entitlements (identity: $(CODESIGN_IDENTITY))..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" --options runtime --timestamp --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(BINARY)
 	@echo "Code signing $(TEST_HELPER) with entitlements..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" --options runtime --timestamp --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(TEST_HELPER)
+	@echo "Code signing $(ENGINE) with entitlements..."
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" --options runtime --timestamp --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(ENGINE)
 	@echo "✓ Code signing complete"
 
 # Debug build (default)
