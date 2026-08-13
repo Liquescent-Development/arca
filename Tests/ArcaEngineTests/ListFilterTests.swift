@@ -178,6 +178,210 @@ final class ListFilterTests: XCTestCase {
         )
     }
 
+    /// The production derivation behind `getNetworkAttachments`, with nothing
+    /// installed.
+    ///
+    /// This is the test the stub-driven one below cannot replace. A stub proves
+    /// the seam carries a failure; it says nothing about whether the source
+    /// production actually reads is wired up. MEASURED, mutating the production
+    /// default and leaving the seam intact -- `attachmentSource` reduced to
+    ///
+    ///     private var attachmentSource: any NetworkAttachmentSource {
+    ///         installedAttachmentSource ?? EmptyAttachments()
+    ///     }
+    ///
+    /// with `EmptyAttachments` answering `[:]` and `[]`:
+    /// `swift test --filter ArcaEngineTests` -> `Executed 43 tests, with 4
+    /// failures`, this test on `("[]") is not equal to
+    /// ("["ffff…ffff"]") - getNetworkAttachments must read the attachment out
+    /// of the StateStore` and `testContainerNetworksAreReadFromTheStore` on
+    /// `("[]") is not equal to ("["probe-attached"]")` -- two failing tests,
+    /// two assertions each. Both stub-driven tests below stayed green through
+    /// it (`testGetNetworkAttachmentsReportsAStoreFailureRatherThanNoAttachments
+    /// … passed`, `testGetContainerNetworksReportsAStoreFailureRatherThanNoNetworks
+    /// … passed`), and so did `NetworkPruneGateTests`, whose 2 tests still
+    /// reported `Test run with 2 tests in 1 suite passed`. This is the mutation
+    /// a seam-only test cannot see.
+    func testNetworkAttachmentsAreReadFromTheStore() async throws {
+        let fixture = try await Self.attachmentFixture()
+
+        let attachments = try await fixture.manager.getNetworkAttachments(
+            networkID: Self.attachedNetworkID
+        )
+
+        XCTAssertEqual(
+            attachments.keys.sorted(),
+            [Self.attachedContainerID],
+            "getNetworkAttachments must read the attachment out of the StateStore"
+        )
+        XCTAssertEqual(
+            attachments[Self.attachedContainerID]?.ip,
+            "172.18.0.2",
+            "the attachment must carry the stored address, not a placeholder"
+        )
+    }
+
+    /// The failure half for the same method, and the one that gates a deletion.
+    ///
+    /// `[:]` is what "nothing is attached" looks like, so a swallowed store
+    /// failure told `docker network prune` every network was unused.
+    /// `NetworkPruneGateTests` in `ArcaTests` asserts on the deletion itself;
+    /// this asserts the read that gate depends on reports rather than returns
+    /// empty.
+    ///
+    /// MEASURED, restoring the swallow -- `getNetworkAttachments`' body
+    /// returned to `if let attachments = try? await
+    /// attachmentSource.getNetworkAttachments(networkID: networkID) { return
+    /// attachments }; return [:]`: `swift test --filter ArcaEngineTests` ->
+    /// `Executed 43 tests, with 1 failure`, this test on `getNetworkAttachments
+    /// returned 0 attachments instead of reporting the store failure`. The
+    /// three other tests added here stayed green through it, including
+    /// `testGetContainerNetworksReportsAStoreFailureRatherThanNoNetworks` --
+    /// which is why that one exists separately.
+    func testGetNetworkAttachmentsReportsAStoreFailureRatherThanNoAttachments() async throws {
+        let manager = SandboxEngineService.forTesting().networkManager
+        await manager.setNetworkAttachmentSource(StubNetworkAttachmentSource.failing)
+
+        do {
+            let swallowed = try await manager.getNetworkAttachments(
+                networkID: Self.attachedNetworkID
+            )
+            XCTFail(
+                "getNetworkAttachments returned \(swallowed.count) attachments instead of "
+                    + "reporting the store failure"
+            )
+        } catch is NetworkAttachmentsUnreachable {
+            // The store's failure reached the caller, which is the point.
+        }
+    }
+
+    /// The production derivation behind `getContainerNetworks`, with nothing
+    /// installed. The other half of the mutation measured above: proving one of
+    /// these two methods leaves the other unproven, because each reads its own
+    /// direction of the attachment table.
+    func testContainerNetworksAreReadFromTheStore() async throws {
+        let fixture = try await Self.attachmentFixture()
+
+        let networks = try await fixture.manager.getContainerNetworks(
+            containerID: Self.attachedContainerID
+        )
+
+        XCTAssertEqual(
+            networks.map(\.name),
+            ["probe-attached"],
+            "getContainerNetworks must read the container's networks out of the StateStore"
+        )
+        XCTAssertEqual(
+            networks.first?.containers,
+            [Self.attachedContainerID],
+            "the network must carry its attached containers, as the backend's copy did"
+        )
+    }
+
+    /// The failure half for `getContainerNetworks`, proved separately from
+    /// `getNetworkAttachments` above.
+    ///
+    /// An empty answer here reads to `getWireGuardClient` as "not attached to
+    /// any WireGuard network", and its caller publishes no port mappings on the
+    /// strength of that -- a container that comes up with its ports silently
+    /// unmapped.
+    ///
+    /// MEASURED, restoring the swallow to this method alone -- `return (try?
+    /// await attachmentSource.getContainerNetworks(containerID: containerID))
+    /// ?? []`: `swift test --filter ArcaEngineTests` -> `Executed 43 tests,
+    /// with 1 failure`, this test on `getContainerNetworks returned 0 networks
+    /// instead of reporting the store failure`.
+    /// `testGetNetworkAttachmentsReportsAStoreFailureRatherThanNoAttachments`
+    /// stayed green through it (`… passed (0.009 seconds)`), which is why both
+    /// exist.
+    func testGetContainerNetworksReportsAStoreFailureRatherThanNoNetworks() async throws {
+        let manager = SandboxEngineService.forTesting().networkManager
+        await manager.setNetworkAttachmentSource(StubNetworkAttachmentSource.failing)
+
+        do {
+            let swallowed = try await manager.getContainerNetworks(
+                containerID: Self.attachedContainerID
+            )
+            XCTFail(
+                "getContainerNetworks returned \(swallowed.count) networks instead of "
+                    + "reporting the store failure"
+            )
+        } catch is NetworkAttachmentsUnreachable {
+            // The store's failure reached the caller rather than an empty list.
+        }
+    }
+
+    private static let attachedNetworkID = String(repeating: "e", count: 64)
+    private static let attachedContainerID = String(repeating: "f", count: 64)
+
+    /// A manager over a throwaway state root holding one network, one
+    /// container, and the attachment joining them.
+    ///
+    /// The rows go in through `StateStore`'s own writers -- the ones
+    /// `createNetwork` and `attachContainerToNetwork` call -- so what the two
+    /// tests above exercise is the real read path over real rows. The
+    /// `StateStore` is returned alongside the manager so it stays alive for the
+    /// test's duration.
+    private static func attachmentFixture() async throws -> (
+        manager: NetworkManager, store: StateStore
+    ) {
+        let stateRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("arca-attachment-tests-\(UUID().uuidString)")
+        let paths = EnginePaths(stateRoot: stateRoot)
+        let logger = Logger(label: "arca-engine-tests")
+
+        let seedStore = try StateStore(path: paths.stateDatabase.path, logger: logger)
+        try await seedStore.saveNetwork(
+            id: attachedNetworkID,
+            name: "probe-attached",
+            driver: "bridge",
+            scope: "local",
+            createdAt: Date(),
+            subnet: "172.18.0.0/16",
+            gateway: "172.18.0.1",
+            ipRange: nil,
+            optionsJSON: nil,
+            labelsJSON: nil,
+            isDefault: false
+        )
+
+        // The attachment row carries foreign keys to both tables, so the
+        // container has to exist before it can be attached.
+        let encoder = JSONEncoder()
+        try await seedStore.saveContainer(
+            id: attachedContainerID,
+            name: "attached-probe",
+            image: "arca/probe:latest",
+            imageID: "sha256:probe",
+            createdAt: Date(),
+            status: "running",
+            running: true,
+            paused: false,
+            restarting: false,
+            pid: 0,
+            exitCode: 0,
+            startedAt: Date(),
+            finishedAt: nil,
+            stoppedByUser: false,
+            entrypoint: nil,
+            configJSON: String(
+                decoding: try encoder.encode(ContainerConfiguration(image: "arca/probe:latest")),
+                as: UTF8.self
+            ),
+            hostConfigJSON: String(decoding: try encoder.encode(HostConfig()), as: UTF8.self)
+        )
+
+        try await seedStore.saveNetworkAttachment(
+            containerID: attachedContainerID,
+            networkID: attachedNetworkID,
+            ipAddress: "172.18.0.2",
+            macAddress: "02:42:ac:12:00:02",
+            aliases: ["attached-probe"]
+        )
+
+        return (SandboxEngineService.forTesting(stateRoot: stateRoot).networkManager, seedStore)
+    }
+
     /// The one bridge network the succeeding half of the first test expects
     /// back, so the assertion is an equality rather than a non-emptiness check.
     private static let probeNetwork = NetworkMetadata(
@@ -306,5 +510,28 @@ struct StubNetworkLister: NetworkLister {
 
     func listNetworks() async throws -> [NetworkMetadata] {
         try result.get()
+    }
+}
+
+/// The error a failing attachment source reports. At file scope for the reason
+/// `NetworkListerUnreachable` is, and distinct from it so a test cannot pass by
+/// catching the wrong seam's failure.
+struct NetworkAttachmentsUnreachable: Error {}
+
+/// An attachment source that cannot reach the store.
+///
+/// Only the failing direction is offered: the answering direction is what the
+/// production `StoredNetworkAttachments` already does over a real StateStore,
+/// and the tests that need it install nothing rather than stand a stub in its
+/// place. A stub that answers would only prove the stub answers.
+struct StubNetworkAttachmentSource: NetworkAttachmentSource {
+    static let failing = StubNetworkAttachmentSource()
+
+    func getNetworkAttachments(networkID: String) async throws -> [String: NetworkAttachment] {
+        throw NetworkAttachmentsUnreachable()
+    }
+
+    func getContainerNetworks(containerID: String) async throws -> [NetworkMetadata] {
+        throw NetworkAttachmentsUnreachable()
     }
 }

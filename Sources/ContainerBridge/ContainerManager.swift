@@ -2488,8 +2488,10 @@ public actor ContainerManager {
                 return
             }
 
-            // Get WireGuard client for this container
-            if let wireguardClient = await networkManager.getWireGuardClient(containerID: dockerID) {
+            // Get WireGuard client for this container. `try`, not `try?`: the
+            // container has port bindings, and a failure to read which networks
+            // it is on would otherwise publish none of them silently.
+            if let wireguardClient = try await networkManager.getWireGuardClient(containerID: dockerID) {
                 // Ensure we disconnect when done
                 defer {
                     Task {

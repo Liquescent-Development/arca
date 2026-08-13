@@ -31,6 +31,64 @@ struct NullDriverNetworks: NetworkLister {
     }
 }
 
+/// The source `NetworkManager` reads container attachments from -- both
+/// directions of the same table: which containers are on a network, and which
+/// networks a container is on.
+///
+/// A second seam rather than two more methods on `NetworkLister`. The two
+/// protocols name different capabilities over different tables, and widening
+/// `NetworkLister` would force `NullDriverNetworks` -- which knows only how to
+/// list `--driver null` networks -- to carry two attachment methods it has no
+/// answer for. It would also let one stub stand in for both concerns, and a
+/// test that fails "some source" cannot say which read it proved. `package`
+/// for the reason `NetworkLister` is: the only implementors outside this file
+/// are in this package's tests.
+package protocol NetworkAttachmentSource: Sendable {
+    func getNetworkAttachments(networkID: String) async throws -> [String: NetworkAttachment]
+    func getContainerNetworks(containerID: String) async throws -> [NetworkMetadata]
+}
+
+/// Attachments as the StateStore holds them.
+///
+/// This is where attachments actually live: `WireGuardNetworkBackend`'s two
+/// methods of these names read `network_attachments` and nothing else -- no
+/// in-memory backend state at all -- and `NetworkManager` was their only
+/// caller. Reading the store directly, rather than through a backend that
+/// `initialize()` alone can install, is what lets the production derivation be
+/// driven with no stub in place: a test can seed a row and read it back
+/// through the same code the daemon runs.
+struct StoredNetworkAttachments: NetworkAttachmentSource {
+    let stateStore: StateStore
+
+    func getNetworkAttachments(networkID: String) async throws -> [String: NetworkAttachment] {
+        var attachments: [String: NetworkAttachment] = [:]
+
+        for stored in try await stateStore.loadAttachmentsForNetwork(networkID: networkID) {
+            attachments[stored.containerID] = NetworkAttachment(
+                networkID: networkID,
+                ip: stored.ipAddress,
+                mac: stored.macAddress,
+                aliases: stored.aliases
+            )
+        }
+
+        return attachments
+    }
+
+    func getContainerNetworks(containerID: String) async throws -> [NetworkMetadata] {
+        let attachedIDs = try await stateStore.getContainerNetworks(containerID: containerID)
+        var networks: [NetworkMetadata] = []
+
+        for persisted in try await stateStore.loadAllNetworks() where attachedIDs.contains(persisted.id) {
+            var network = NetworkMetadata(persisted: persisted)
+            network.containers = try await stateStore.getNetworkContainers(networkID: persisted.id)
+            networks.append(network)
+        }
+
+        return networks
+    }
+}
+
 extension NetworkMetadata {
     /// One stored network as metadata. The single mapping from a persisted row,
     /// so `NullDriverNetworks` and `NetworkManager.getNetwork(id:)` cannot come
@@ -90,6 +148,25 @@ public actor NetworkManager {
     /// way to break deterministically.
     private var installedBridgeNetworkLister: (any NetworkLister)?
     private var installedNullNetworkLister: (any NetworkLister)?
+
+    /// The source standing in for `StoredNetworkAttachments`. `nil` in
+    /// production, and set only by the `package` setter below. Unlike the two
+    /// listers above, the source this replaces *is* reachable without
+    /// `initialize()` -- it reads the StateStore directly -- so the tests that
+    /// matter most here install nothing at all. This exists for the one thing
+    /// they cannot do: make that store read fail on demand.
+    private var installedAttachmentSource: (any NetworkAttachmentSource)?
+
+    /// The source the two attachment reads below derive from, and their only
+    /// reader.
+    ///
+    /// Computed, not stored, for the reason `networkListers` is: a stored copy
+    /// would have to be assigned somewhere, and dropping that assignment would
+    /// leave production reading no attachments -- `docker network prune`
+    /// deleting in-use networks -- with every test still green.
+    private var attachmentSource: any NetworkAttachmentSource {
+        installedAttachmentSource ?? StoredNetworkAttachments(stateStore: stateStore)
+    }
 
     /// The sources `listNetworks()` reads, and its only reader.
     ///
@@ -152,6 +229,19 @@ public actor NetworkManager {
     /// surfaces, not that the null-driver read is one of the sources.
     package func setNullNetworkLister(_ lister: any NetworkLister) {
         self.installedNullNetworkLister = lister
+    }
+
+    /// Install the attachment source `getNetworkAttachments` and
+    /// `getContainerNetworks` read, in place of the StateStore-backed one.
+    ///
+    /// `package` for the reason the two above are, and it exists for one
+    /// purpose: `StateStore` is a concrete actor whose SQLite connection a test
+    /// has no way to break deterministically, so a partial store failure -- the
+    /// one that used to let `docker network prune` delete an in-use network --
+    /// can be reproduced no other way. Production never calls this; it takes
+    /// the `??` default in `attachmentSource`.
+    package func setNetworkAttachmentSource(_ source: any NetworkAttachmentSource) {
+        self.installedAttachmentSource = source
     }
 
     /// Initialize the network manager and backends
@@ -613,20 +703,29 @@ public actor NetworkManager {
     }
 
     /// Get container attachments for a network
-    public func getNetworkAttachments(networkID: String) async -> [String: NetworkAttachment] {
-        // Try WireGuard backend first (default for bridge)
-        if let backend = wireGuardBackend {
-            if let attachments = try? await backend.getNetworkAttachments(networkID: networkID) {
-                return attachments
-            }
-        }
-
-        // Try vmnet backend
+    ///
+    /// Throws rather than returning `[:]`, which is indistinguishable from
+    /// "nothing attached". This is the gate `docker network prune` reads to
+    /// skip networks with active containers: swallowed with `try?`, a transient
+    /// store failure on the attachment read -- while `listNetworks()` still
+    /// succeeded -- made every network look unused and prune **deleted an
+    /// in-use network** and reported success. Task 3 closed the total-failure
+    /// case by making `listNetworks()` throw; the partial failure is what is
+    /// left, and it is the harder one to notice.
+    ///
+    /// vmnet is asked first, and only for a network vmnet owns. Under the old
+    /// order the WireGuard branch answered first and its `[:]` for a vmnet
+    /// network counted as an answer, so the vmnet branch was unreachable
+    /// whenever the backend was up -- which is always, after `initialize()`.
+    /// Routing on which backend owns the network is what `deleteNetwork(id:)`
+    /// already does.
+    public func getNetworkAttachments(networkID: String) async throws -> [String: NetworkAttachment] {
+        // vmnet keeps its attachments in memory, not in the StateStore.
         if let backend = vmnetBackend, await backend.getNetwork(id: networkID) != nil {
             return await backend.getNetworkAttachments(networkID: networkID)
         }
 
-        return [:]
+        return try await attachmentSource.getNetworkAttachments(networkID: networkID)
     }
 
     /// List all networks
@@ -650,21 +749,17 @@ public actor NetworkManager {
     }
 
     /// Get networks for a container
-    public func getContainerNetworks(containerID: String) async -> [NetworkMetadata] {
-        var networks: [NetworkMetadata] = []
-
-        if vmnetBackend != nil {
-            // vmnet backend doesn't track container networks separately
-            // (containers are attached at creation time)
-        }
-
-        if let backend = wireGuardBackend {
-            if let wgNetworks = try? await backend.getContainerNetworks(containerID: containerID) {
-                networks.append(contentsOf: wgNetworks)
-            }
-        }
-
-        return networks
+    ///
+    /// Throws for the same reason `getNetworkAttachments` does, one table over.
+    /// Swallowed with `try?`, a store failure here read to `getWireGuardClient`
+    /// as "this container is on no WireGuard network", and the caller that acts
+    /// on that answer skips publishing the container's port mappings -- a
+    /// container that comes up with its ports silently unmapped.
+    ///
+    /// vmnet is not consulted: it does not track container networks separately,
+    /// as the branch this replaced recorded by doing nothing.
+    public func getContainerNetworks(containerID: String) async throws -> [NetworkMetadata] {
+        return try await attachmentSource.getContainerNetworks(containerID: containerID)
     }
 
     /// Resolve network ID from short ID or name
@@ -705,13 +800,18 @@ public actor NetworkManager {
     /// Create a WireGuard client for a container (for port mapping)
     /// Returns nil if container is not attached to any WireGuard networks or container not found
     /// Caller must disconnect the client when done
-    public func getWireGuardClient(containerID: String) async -> WireGuardClient? {
+    ///
+    /// Throws when the attachment read fails. `nil` here means "no client is
+    /// wanted" and the caller publishes no ports on the strength of it, so a
+    /// failure that cannot say whether the container is attached must not
+    /// arrive as `nil`.
+    public func getWireGuardClient(containerID: String) async throws -> WireGuardClient? {
         guard wireGuardBackend != nil else {
             return nil
         }
 
         // Get container networks - if not attached to any WireGuard networks, return nil
-        let networks = await getContainerNetworks(containerID: containerID)
+        let networks = try await getContainerNetworks(containerID: containerID)
         guard !networks.isEmpty else {
             return nil
         }
