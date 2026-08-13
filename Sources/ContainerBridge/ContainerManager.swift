@@ -292,7 +292,7 @@ public actor ContainerManager {
 
     /// Load persisted containers from StateStore and reconcile with actual state
     ///
-    /// `public` rather than `private` because it is the only VM-free way in
+    /// Reachable outside `initialize()` because it is the only VM-free way in
     /// which `containers` is populated: `initialize()` needs a kernel file and a
     /// `VmnetNetwork` before it reaches this call, and `createContainer` boots a
     /// VM. A test that cannot reach this restore loop can only assert on
@@ -302,9 +302,18 @@ public actor ContainerManager {
     /// filter-derived `showInternal`, `swift test --filter ArcaEngineTests`
     /// still reported `Executed 35 tests, with 0 failures`).
     ///
+    /// `package` and NOT `public`, because this must not become callable from
+    /// outside the package: it is not idempotent. A second call takes the
+    /// crash-recovery branch below for every container whose stored status is
+    /// `running`, recording it as exited with code 137 in memory *and* writing
+    /// that back through `stateStore.updateContainerStatus`. Called on a live
+    /// daemon it would orphan every running VM -- the engine would stop
+    /// believing it holds a container that is still running, which is the leak
+    /// class this work exists to close.
+    ///
     /// Nothing here touches a VM: it reads the StateStore, decodes the stored
     /// config, and registers log paths that already exist on disk.
-    public func loadPersistedState() async throws {
+    package func loadPersistedState() async throws {
         logger.info("Loading persisted container state...")
 
         // Load all containers from database
