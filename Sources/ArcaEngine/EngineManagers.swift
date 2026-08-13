@@ -86,6 +86,53 @@ public struct EngineManagers: Sendable {
         self.execManager = ExecManager(containerManager: containerManager, logger: logger)
     }
 
+    /// Hands `ContainerManager` the two collaborators it holds optionally.
+    ///
+    /// `ContainerManager` takes these by setter rather than by initializer
+    /// because `NetworkManager.init` already takes a `ContainerManager`: the two
+    /// refer to each other, so one edge has to be set after construction. That
+    /// makes the edge easy to omit, and omitting it is silent. `ArcaDaemon` sets
+    /// both (`ArcaDaemon.swift:236`, `:262`); until this existed the engine set
+    /// neither, and `ContainerBridge` had already written down what that costs:
+    ///
+    /// - `ContainerManager.swift:1743` throws `volumeManagerNotAvailable` for
+    ///   any container with anonymous volumes, so `Create` could not serve one.
+    /// - `ContainerManager.swift:4129` `cleanupVolumesForContainer` **returns
+    ///   silently** when `volumeManager` is nil, so `Remove` would delete the
+    ///   container, report success, and leave its anonymous volumes on disk with
+    ///   nothing in the store pointing at them. A leak the consumer cannot see
+    ///   is the failure `ListResources` exists to prevent.
+    /// - `ContainerManager.swift:826` builds a container's `NetworkSettings`
+    ///   only when `networkManager` is set, so `Inspect` would report a
+    ///   container on a network as attached to nothing.
+    ///
+    /// Called after all three `initialize()` calls, which is what `ArcaDaemon`
+    /// does and what the setters' own comments ask for. Nothing read during
+    /// `initialize()` consults either collaborator: the network restoration that
+    /// does (`ContainerManager.swift:2427`) is inside `startContainer`, not
+    /// inside `loadPersistedState`.
+    ///
+    /// Separate from the `initialize()` sequence, and VM-free, because that is
+    /// what lets it be proved at all. `ContainerManager.initialize()` constructs
+    /// a real `VmnetNetwork`, so no test may call a method containing it; this
+    /// one a test can call, and `EngineManagerWiringTests` drives each line
+    /// through behaviour rather than through the call. MEASURED, one line
+    /// removed at a time, `swift test --filter ArcaEngineTests`:
+    ///
+    /// - without `setVolumeManager`: `Executed 63 tests, with 1 failure` --
+    ///   `testRemovingAContainerDeletesItsAnonymousVolumeAndSparesTheNamedOne`,
+    ///   which found `["anon-vol", "named-vol"]` both still present after
+    ///   `Remove` had reported success.
+    /// - without `setNetworkManager`: `Executed 63 tests, with 3 failures`, all
+    ///   in `testAnAttachedContainerReportsTheNetworkItIsOn`, whose networks
+    ///   dictionary came back `[]`.
+    ///
+    /// Restored: `Executed 63 tests, with 0 failures`.
+    public func wireCollaborators() async {
+        await containerManager.setVolumeManager(volumeManager)
+        await containerManager.setNetworkManager(networkManager)
+    }
+
     /// The service over these managers.
     ///
     /// Here rather than at each call site for the reason the wiring above is:

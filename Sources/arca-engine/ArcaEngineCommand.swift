@@ -82,9 +82,23 @@ struct ArcaEngineCommand: AsyncParsableCommand {
             logger: logger
         )
 
-        // Order matters and mirrors ArcaDaemon: the vminit image must be in the
-        // store before ContainerManager.initialize() asks for it, and
-        // NetworkManager needs a ContainerManager to resolve containers.
+        // Order matters, and it is NOT ArcaDaemon's -- an earlier revision of
+        // this comment claimed parity and there is none. The daemon runs
+        // imageManager, containerManager, networkManager, volumeManager
+        // (ArcaDaemon.swift:74, 208, 232, 258). This runs volume, container,
+        // network, for three reasons of its own:
+        //
+        //   - the vminit image must be in the store before
+        //     ContainerManager.initialize() resolves an initfs from it, which
+        //     the loadVminit above has just done;
+        //   - VolumeManager is first because it is the only one of the three
+        //     that touches nothing but the filesystem and the StateStore. The
+        //     cheap VM-free step ahead of the one that claims a host resource
+        //     means a bad state root is refused before any vmnet network is
+        //     created -- and it is the seam EngineCommandRefusalTests drives,
+        //     since no test may reach the vmnet step;
+        //   - NetworkManager is last of the three because it resolves
+        //     containers through a ContainerManager.
         //
         // Running this at all is what a private state root bought. The restore
         // loop inside ContainerManager.initialize() marks every container the
@@ -92,7 +106,8 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // a root shared with a live ArcaDaemon that write orphaned the daemon's
         // running VMs. Over this engine's own root the containers it rewrites
         // are the ones that died with the previous instance of this engine,
-        // which is what crash recovery is for.
+        // which is what crash recovery is for -- CrashRecoveryTests drives that
+        // loop directly, which `restored=0` against a fresh root never could.
         //
         // A failure here propagates out of run() and the process exits
         // non-zero. Nothing below binds a socket, so a client never reaches an
@@ -104,6 +119,12 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         try await managers.volumeManager.initialize()
         try await managers.containerManager.initialize()
         try await managers.networkManager.initialize()
+
+        // After all three, as ArcaDaemon does. Without this the engine holds a
+        // ContainerManager that cannot create a container with anonymous
+        // volumes, silently leaks them on Remove, and reports a networked
+        // container as attached to nothing. See EngineManagers.wireCollaborators.
+        await managers.wireCollaborators()
 
         let service = managers.makeService()
 
