@@ -26,8 +26,17 @@ public func engineVersion(from string: String) -> Arca_Engine_V1_Version? {
 /// One predicate rather than one per direction. Both directions below decide
 /// the same question, and two copies of it are two chances for the engine to
 /// accept on the way in what it refuses on the way out.
+///
+/// `isASCII` first, and it is load-bearing rather than defensive: Swift's
+/// `Character.isNumber` is true for every Unicode number, so without it a run
+/// of 64 ARABIC-INDIC DIGIT THREEs (U+0663) passes a gate whose own
+/// documentation and whose refusal message both say "hex". No store can hold
+/// such a digest, so the only consequence was a `not_found` where an
+/// `invalid_resource_identity` belonged -- but a predicate that admits what its
+/// name forbids is one a later `Ack` could be built on, and it made two
+/// shipped sentences say more than the code enforced.
 private func isSHA256Hex(_ hex: String) -> Bool {
-    hex.count == 64 && hex.allSatisfy { $0.isNumber || ("a"..."f").contains($0) }
+    hex.count == 64 && hex.allSatisfy { $0.isASCII && ($0.isNumber || ("a"..."f").contains($0)) }
 }
 
 /// Splits an exact digest reference into the two fields the contract carries.

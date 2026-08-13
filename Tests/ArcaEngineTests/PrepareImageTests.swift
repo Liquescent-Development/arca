@@ -122,9 +122,50 @@ final class PrepareImageTests: XCTestCase {
         XCTAssertEqual(error.resource, "not-the-workspace@sha256:\(engine.hex)")
         XCTAssertEqual(
             error.message,
-            "this engine holds that content digest under repository workspace, "
-                + "not not-the-workspace"
+            "this engine does not hold that content digest under repository not-the-workspace; "
+                + "it holds it under workspace"
         )
+    }
+
+    /// One piece of content, two references, and both must be prepared.
+    ///
+    /// A store holds a row per reference, and `tagImage` adds a row to content
+    /// that is already there -- so a digest can be held under two names at
+    /// once. The first revision of this method asked
+    /// `imageStore.list().first(where: digest matches)` and then tested *that*
+    /// row's repository, which refused one of the two names for content the
+    /// engine demonstrably held, and named the other one while doing it. Which
+    /// of the two lost was decided by store ordering, so it was not even stable
+    /// across runs.
+    ///
+    /// Both directions are asserted in one test on purpose. Asserting only the
+    /// tagged name would pass against the defect whenever the store happened to
+    /// list the tag first, which is exactly how it went unnoticed.
+    func testADigestHeldUnderTwoReferencesIsPreparedUnderEitherName() async throws {
+        let engine = try await preparedEngine()
+        try await engine.service.imageManager.tagImage(
+            source: Self.reference, target: "other/workspace:latest"
+        )
+
+        // The premise: two rows, one digest. Stated rather than assumed,
+        // because a tag that silently did not land would make both assertions
+        // below pass for the wrong reason.
+        let rows = try await engine.service.imageManager.listImages()
+            .filter { $0.repoDigests.contains("sha256:\(engine.hex)") }
+        XCTAssertEqual(
+            rows.flatMap(\.repoTags).sorted(), ["other/workspace:latest", "workspace:latest"],
+            "the tag must add a second row to the same content"
+        )
+
+        for repository in [Self.repository, "other/workspace"] {
+            let response = await engine.service.prepareImage(request: request(
+                repository: repository, hex: engine.hex
+            ))
+            guard case .ok = response.outcome else {
+                XCTFail("\(repository) names content the engine holds, got \(response.outcome as Any)")
+                continue
+            }
+        }
     }
 
     /// An image row can outlive the blobs it names, and this is the case that
@@ -165,8 +206,8 @@ final class PrepareImageTests: XCTestCase {
         XCTAssertEqual(error.resource, "\(Self.repository)@sha256:\(engine.hex)")
         XCTAssertEqual(
             error.message,
-            "the image stored as \(Self.reference) carries that content digest, but this engine "
-                + "does not hold 1 of the blobs it names: \(layer)"
+            "this engine has that content digest in its store under \(Self.reference), but does "
+                + "not hold 1 of the blobs it names: \(layer)"
         )
     }
 
@@ -183,8 +224,16 @@ final class PrepareImageTests: XCTestCase {
     /// The unset request is in the table on purpose: `image` is a message
     /// field, so a request that omits it arrives with both halves empty and
     /// must not be read as a lookup for the empty digest.
+    ///
+    /// So is the non-ASCII row, and it is not exotic padding. `uppercase hex`
+    /// covers the wrong-case class and nothing else; U+0663 covers the class
+    /// Swift's own `Character.isNumber` lets through, which is every Unicode
+    /// number. Without `isASCII` in `isSHA256Hex` this row is answered
+    /// `not_found`, and the engine says "hex" in a message about a string that
+    /// is not.
     func testARequestThatIsNotADigestIsAnInvalidIdentity() async throws {
         let service = SandboxEngineService.forTesting()
+        let arabicIndicThrees = String(repeating: "\u{0663}", count: 64)
         let cases: [(name: String, request: Arca_Engine_V1_PrepareImageRequest, resource: String)] = [
             ("unset", Arca_Engine_V1_PrepareImageRequest(), "@sha256:"),
             (
@@ -207,6 +256,11 @@ final class PrepareImageTests: XCTestCase {
                 "prefixed hex",
                 request(repository: "workspace", hex: "sha256:" + String(repeating: "a", count: 57)),
                 "workspace@sha256:sha256:" + String(repeating: "a", count: 57)
+            ),
+            (
+                "64 non-ASCII digits",
+                request(repository: "workspace", hex: arabicIndicThrees),
+                "workspace@sha256:" + arabicIndicThrees
             ),
         ]
 

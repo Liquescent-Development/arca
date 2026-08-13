@@ -666,16 +666,32 @@ public actor ImageManager {
     /// such image", "the store has a row and cannot produce its bytes", and
     /// "the read itself failed" into `false`. Those demand different reports.
     ///
+    /// **Every row carrying the digest is reported, not the first one found.**
+    /// A store holds one row per *reference*, and `tagImage(source:target:)`
+    /// above adds a second reference to content that is already there, so two
+    /// rows can carry one digest. An earlier revision of this returned the
+    /// first match, and a caller that then tested that one reference against
+    /// the name it asked about got a `not_found` decided by `imageStore.list()`
+    /// ordering -- for content the store demonstrably held, naming the wrong
+    /// reference while it did so. The blob walk below is unaffected by that
+    /// multiplicity and is done once: the rows share a root descriptor and a
+    /// content store, so they reference identical blobs by construction.
+    ///
     /// - Parameter digest: The content digest, in the `sha256:<hex>` form the
     ///   store records. Anything else matches nothing.
     /// - Throws: Whatever listing the store throws. A store that cannot be read
     ///   is not a store that holds nothing.
-    public func heldImageContent(digest: String) async throws -> HeldImageContent {
+    package func heldImageContent(digest: String) async throws -> HeldImageContent {
         let images = try await imageStore.list()
-        guard let image = images.first(where: { $0.digest == digest }) else {
+        let matches = images.filter { $0.digest == digest }
+        guard let image = matches.first else {
             logger.debug("No image holds this content digest", metadata: ["digest": "\(digest)"])
             return .noImageForDigest
         }
+        // Sorted for the reason the missing digests below are: `list()`'s order
+        // is the store's, and a caller putting these in a message would
+        // otherwise report one store two different ways across two runs.
+        let references = matches.map(\.reference).sorted()
 
         // `referencedDigests()` reads the image's own index blob before it can
         // name anything else, so a throw here is that blob being absent or
@@ -686,11 +702,11 @@ public actor ImageManager {
             referenced = try await image.referencedDigests()
         } catch {
             logger.warning("Image index unreadable", metadata: [
-                "reference": "\(image.reference)",
+                "references": "\(references.joined(separator: ", "))",
                 "digest": "\(digest)",
                 "error": "\(error)"
             ])
-            return .blobsMissing(reference: image.reference, digests: [image.digest])
+            return .blobsMissing(references: references, digests: [image.digest])
         }
 
         // Every blob the image names, fetched from the content store. This is
@@ -716,21 +732,21 @@ public actor ImageManager {
         }
         guard missing.isEmpty else {
             logger.warning("Image is missing content it references", metadata: [
-                "reference": "\(image.reference)",
+                "references": "\(references.joined(separator: ", "))",
                 "digest": "\(digest)",
                 "missing": "\(missing.joined(separator: ", "))"
             ])
             // Sorted because the walk's order follows the index, and a caller
             // that puts these in a message would otherwise report the same
             // damaged image two different ways.
-            return .blobsMissing(reference: image.reference, digests: missing.sorted())
+            return .blobsMissing(references: references, digests: missing.sorted())
         }
 
         logger.debug("Image content held in full", metadata: [
-            "reference": "\(image.reference)",
+            "references": "\(references.joined(separator: ", "))",
             "digest": "\(digest)"
         ])
-        return .held(reference: image.reference)
+        return .held(references: references)
     }
 
     /// Normalize image reference to Docker Hub format
@@ -821,20 +837,24 @@ public actor ImageManager {
 /// arrived has to be sent, content whose blobs are gone has to be sent again,
 /// and content that is here in full needs nothing. `Equatable` so a test can
 /// state the whole answer rather than one field of it.
-public enum HeldImageContent: Sendable, Equatable {
-    /// The store holds an image under this digest and every blob that image
-    /// names is present. `reference` is the reference it is stored under, so a
-    /// caller that also cares which repository the content arrived as can check
-    /// it without a second lookup.
-    case held(reference: String)
+///
+/// Both content-bearing cases carry `references` as a sorted list and not a
+/// single name, because a store holds one row per reference and a tag adds a
+/// row to content that is already there. A caller deciding anything about the
+/// *name* the content arrived under has to see all of them or it decides on
+/// whichever row the store happened to list first.
+package enum HeldImageContent: Sendable, Equatable {
+    /// The store holds this digest under every reference listed, and every blob
+    /// those rows name is present.
+    case held(references: [String])
 
     /// No image in this store carries this digest.
     case noImageForDigest
 
-    /// An image carries the digest, but the content store cannot produce these
-    /// blobs, in `sha256:<hex>` form. Nothing can be created from the image
-    /// until they arrive.
-    case blobsMissing(reference: String, digests: [String])
+    /// The digest is in the store under these references, but the content store
+    /// cannot produce these blobs, in `sha256:<hex>` form. Nothing can be
+    /// created from the image until they arrive.
+    case blobsMissing(references: [String], digests: [String])
 }
 
 // MARK: - Errors

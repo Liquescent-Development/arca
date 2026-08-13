@@ -312,6 +312,15 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// not found under a requested repository of `alpine`. That is the safe
     /// direction and it is chosen deliberately: a false `not_found` is visible
     /// and recoverable, a false `Ack` is neither.
+    ///
+    /// It is compared against **every** reference the digest is held under, and
+    /// that is a correction rather than a nicety: a store holds one row per
+    /// reference, `ImageManager.tagImage(source:target:)` adds a row to content
+    /// that is already there, and the first revision of this method tested the
+    /// request against whichever row `imageStore.list()` returned first. Two
+    /// rows on one digest then made the answer depend on store ordering --
+    /// `not_found` for content the engine held, naming a repository the caller
+    /// had not asked about.
     func prepareImage(request: Arca_Engine_V1_PrepareImageRequest) async -> Arca_Engine_V1_PrepareImageResponse {
         let resource = imageReference(forDigest: request.image)
         guard let key = imageStoreDigest(request.image) else {
@@ -336,26 +345,31 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
                 message: "this engine holds no image with that content digest and will not fetch "
                     + "one; load it with 'arca-engine image load --oci-layout <dir>'"
             ))
-        case .success(.blobsMissing(let reference, let digests)):
+        case .success(.blobsMissing(let references, let digests)):
             return Self.prepareImageFailure(engineError(
                 .notFound,
                 resource: resource,
-                message: "the image stored as \(reference) carries that content digest, but this "
-                    + "engine does not hold \(digests.count) of the blobs it names: "
-                    + digests.joined(separator: ", ")
+                message: "this engine has that content digest in its store under "
+                    + "\(references.joined(separator: ", ")), but does not hold \(digests.count) "
+                    + "of the blobs it names: " + digests.joined(separator: ", ")
             ))
-        case .success(.held(let reference)):
-            let stored = imageRepository(ofReference: reference)
-            guard stored == request.image.repository else {
+        case .success(.held(let references)):
+            // Every reference the digest is held under, because a tag puts a
+            // second row on one piece of content and the request names one of
+            // them. Testing a single row would refuse content the engine holds,
+            // by whichever row the store listed first.
+            let stored = Set(references.map(imageRepository(ofReference:))).sorted()
+            guard stored.contains(request.image.repository) else {
                 return Self.prepareImageFailure(engineError(
                     .notFound,
                     resource: resource,
-                    message: "this engine holds that content digest under repository "
-                        + "\(stored), not \(request.image.repository)"
+                    message: "this engine does not hold that content digest under repository "
+                        + "\(request.image.repository); it holds it under "
+                        + stored.joined(separator: ", ")
                 ))
             }
             logger.info("image content is held in full", metadata: [
-                "reference": "\(reference)",
+                "references": "\(references.joined(separator: ", "))",
                 "digest": "\(key)",
             ])
             return Arca_Engine_V1_PrepareImageResponse.with { $0.ok = Arca_Engine_V1_Ack() }
