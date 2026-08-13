@@ -714,13 +714,24 @@ public actor NetworkManager {
     /// left, and it is the harder one to notice.
     ///
     /// vmnet is asked first, and only for a network vmnet owns. Under the old
-    /// order the WireGuard branch answered first and its `[:]` for a vmnet
-    /// network counted as an answer, so the vmnet branch was unreachable
-    /// whenever the backend was up -- which is always, after `initialize()`.
-    /// Routing on which backend owns the network is what `deleteNetwork(id:)`
-    /// already does.
+    /// order the WireGuard branch answered first and its `[:]` counted as an
+    /// answer, so the vmnet branch was unreachable whenever the backend was up
+    /// -- which is always, after `initialize()`. Routing on which backend owns
+    /// the network is what `deleteNetwork(id:)` already does.
+    ///
+    /// What that reordering changes, stated in the direction it actually runs:
+    /// for a vmnet-owned network this now returns `[:]` *without* reading the
+    /// store, where the old order read the store for every ID. It is
+    /// behaviour-neutral today because nothing ever writes a vmnet attachment
+    /// row -- `attachContainerToNetwork`'s `vmnet` case throws
+    /// `dynamicAttachNotSupported` before any store write -- so the store
+    /// answers `[:]` for those networks anyway, and
+    /// `VmnetNetworkBackend.getNetworkAttachments` is itself a hardcoded `[:]`.
+    /// Both orders return `[:]`; the difference is which code is reachable if
+    /// vmnet ever grows real attachments.
     public func getNetworkAttachments(networkID: String) async throws -> [String: NetworkAttachment] {
-        // vmnet keeps its attachments in memory, not in the StateStore.
+        // vmnet tracks no attachment detail of its own, and writes none to the
+        // StateStore -- see the note above.
         if let backend = vmnetBackend, await backend.getNetwork(id: networkID) != nil {
             return await backend.getNetworkAttachments(networkID: networkID)
         }
