@@ -141,6 +141,16 @@ final class PrepareImageTests: XCTestCase {
     /// Both directions are asserted in one test on purpose. Asserting only the
     /// tagged name would pass against the defect whenever the store happened to
     /// list the tag first, which is exactly how it went unnoticed.
+    ///
+    /// **The third repository is the pairing this file's discipline requires,
+    /// and its absence was a real hole rather than a missing nicety.** Written
+    /// with the two `Ack`s alone, this test passed against the whole-body
+    /// `Ack` mutation -- it was one of two in the file that a method looking
+    /// nothing up survives, and it was added by the very diff that fixed the
+    /// widening. It also covers what nothing else does: a refusal while two
+    /// references are in play, which is the widening's own hazard. The message
+    /// must name **both** holders, so a fix that widened `.held` to every row
+    /// but left the diagnostic reporting one of them is caught here too.
     func testADigestHeldUnderTwoReferencesIsPreparedUnderEitherName() async throws {
         let engine = try await preparedEngine()
         try await engine.service.imageManager.tagImage(
@@ -148,7 +158,7 @@ final class PrepareImageTests: XCTestCase {
         )
 
         // The premise: two rows, one digest. Stated rather than assumed,
-        // because a tag that silently did not land would make both assertions
+        // because a tag that silently did not land would make every assertion
         // below pass for the wrong reason.
         let rows = try await engine.service.imageManager.listImages()
             .filter { $0.repoDigests.contains("sha256:\(engine.hex)") }
@@ -166,6 +176,20 @@ final class PrepareImageTests: XCTestCase {
                 continue
             }
         }
+
+        let refused = await engine.service.prepareImage(request: request(
+            repository: "not-the-workspace", hex: engine.hex
+        ))
+        guard case .error(let error) = refused.outcome else {
+            return XCTFail("a third repository must still be refused, got \(refused.outcome as Any)")
+        }
+        XCTAssertEqual(error.code, "not_found")
+        XCTAssertEqual(error.resource, "not-the-workspace@sha256:\(engine.hex)")
+        XCTAssertEqual(
+            error.message,
+            "this engine does not hold that content digest under repository not-the-workspace; "
+                + "it holds it under other/workspace, workspace"
+        )
     }
 
     /// An image row can outlive the blobs it names, and this is the case that
