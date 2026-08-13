@@ -362,8 +362,15 @@ final class ImageLoadTests: XCTestCase {
     /// subcommand, replacing the derivation with the literal `"load"` leaves
     /// both sides equal and this test green. It goes red the moment the two
     /// disagree, which with one subcommand means only that the message is
-    /// wrong -- and that is what it was proved on. Task 10 adds `prepare`; if it
-    /// reaches `subcommands` and not the message, this is what fails.
+    /// wrong -- and that is what it was proved on.
+    ///
+    /// What it is waiting for is a second action reaching `subcommands` without
+    /// reaching the message. **Nothing in this milestone schedules one**: the
+    /// remaining work is the engine's gRPC methods, `PrepareImage` among them
+    /// (`proto/arca/engine/v1/engine.proto:41`), which are served over the
+    /// socket and add no subcommand here. So this guards a hazard that is real
+    /// and unscheduled, which is the only reason its cost is two spawned runs
+    /// and not more.
     func testTheRefusalNamesEveryActionTheGroupAdvertises() throws {
         let help = try runEngine(arguments: ["image", "--help"])
         XCTAssertEqual(help.status, 0, "image --help must succeed; stderr: \(help.errorText)")

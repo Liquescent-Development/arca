@@ -26,12 +26,14 @@ struct ImageCommand: ParsableCommand {
 
     func run() throws {
         // Read off the configuration rather than written out beside it, so an
-        // action a later task adds cannot go missing from the message that
+        // action added to `subcommands` cannot go missing from the message that
         // lists what this group can do. Held to by
         // ImageLoadTests.testTheRefusalNamesEveryActionTheGroupAdvertises,
         // which compares this list against the one `image --help` generates
-        // from the same array -- a guard that can only bite once there are two
-        // subcommands, which is Task 10.
+        // from the same array. That guard can only bite once a second
+        // subcommand exists, and none is scheduled -- the rest of this
+        // milestone is gRPC methods served over the socket, which add nothing
+        // to this command line.
         //
         // Spelt as an explicit closure and not `compactMap(\.configuration...)`:
         // the key-path form crashes swiftc 6.3.3 in SILGen, `signal 5` while
