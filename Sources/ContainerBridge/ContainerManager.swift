@@ -291,7 +291,20 @@ public actor ContainerManager {
     }
 
     /// Load persisted containers from StateStore and reconcile with actual state
-    private func loadPersistedState() async throws {
+    ///
+    /// `public` rather than `private` because it is the only VM-free way in
+    /// which `containers` is populated: `initialize()` needs a kernel file and a
+    /// `VmnetNetwork` before it reaches this call, and `createContainer` boots a
+    /// VM. A test that cannot reach this restore loop can only assert on
+    /// `internalContainersRequested(in:)`, the helper -- and a test of the helper
+    /// alone does not notice `listContainers` ignoring `includeInternal`
+    /// (MEASURED: with the `includeInternal` guard reverted to the old
+    /// filter-derived `showInternal`, `swift test --filter ArcaEngineTests`
+    /// still reported `Executed 35 tests, with 0 failures`).
+    ///
+    /// Nothing here touches a VM: it reads the StateStore, decodes the stored
+    /// config, and registers log paths that already exist on disk.
+    public func loadPersistedState() async throws {
         logger.info("Loading persisted container state...")
 
         // Load all containers from database
@@ -552,16 +565,24 @@ public actor ContainerManager {
 
     // MARK: - Container Lifecycle
 
+    /// Docker's rule for asking to see internal containers: a `label` filter
+    /// mentioning `com.arca.internal`. Named and lifted out because the engine
+    /// does not use it -- the engine asks with `includeInternal:` directly --
+    /// and a rule that exists in two places diverges.
+    public static func internalContainersRequested(in filters: [String: [String]]) -> Bool {
+        filters["label"]?.contains { $0.contains("com.arca.internal") } ?? false
+    }
+
     /// List all containers
-    public func listContainers(all: Bool = false, filters: [String: [String]] = [:]) async throws -> [ContainerSummary] {
+    public func listContainers(
+        all: Bool = false,
+        filters: [String: [String]] = [:],
+        includeInternal: Bool
+    ) async throws -> [ContainerSummary] {
         logger.debug("Listing containers", metadata: [
             "all": "\(all)",
             "filters": "\(filters)"
         ])
-
-        // Check if user wants to see internal containers
-        // By default, internal containers (com.arca.internal=true) are hidden
-        let showInternal = filters["label"]?.contains(where: { $0.contains("com.arca.internal") }) ?? false
 
         // Extract label filters for matching
         let labelFilters = filters["label"] ?? []
@@ -586,7 +607,7 @@ public actor ContainerManager {
             }
 
             // Filter out internal containers unless explicitly requested
-            if !showInternal && info.labels["com.arca.internal"] == "true" {
+            if !includeInternal && info.labels["com.arca.internal"] == "true" {
                 return nil
             }
 

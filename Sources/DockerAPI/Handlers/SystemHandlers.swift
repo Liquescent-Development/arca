@@ -67,7 +67,7 @@ public struct SystemHandlers: Sendable {
         let processInfo = ProcessInfo.processInfo
 
         // Get actual container counts
-        let containers = (try? await containerManager.listContainers(all: true, filters: [:])) ?? []
+        let containers = (try? await containerManager.listContainers(all: true, filters: [:], includeInternal: false)) ?? []
         let totalContainers = containers.count
         let runningContainers = containers.filter { $0.state == "running" }.count
         let pausedContainers = containers.filter { $0.state == "paused" }.count
