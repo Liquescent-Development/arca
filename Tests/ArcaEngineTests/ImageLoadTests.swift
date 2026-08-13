@@ -279,6 +279,63 @@ final class ImageLoadTests: XCTestCase {
         )
     }
 
+    // MARK: - What the command line itself promises
+
+    /// `arca-engine --help` documents how to start the engine.
+    ///
+    /// The subcommand split cost this and nothing noticed, because nothing in
+    /// this suite read help output at all. A root command with no options of
+    /// its own generates `USAGE: arca-engine <subcommand>` and an OPTIONS list
+    /// holding only `-h`, so the four options the engine cannot start without
+    /// became reachable only by first knowing to type `arca-engine serve
+    /// --help`. Milestone 4 writes a launchd plist against this binary; whoever
+    /// writes it, or debugs a start that failed, reads `--help`.
+    ///
+    /// Asserted against the `--help` invocation's own STDOUT at exit 0, which
+    /// is what keeps it out of reach of the usage line ArgumentParser prints on
+    /// every parse error -- that goes to stderr, with exit 64. Task 4's review
+    /// found assertions satisfied by exactly that text.
+    func testHelpDocumentsTheOptionsTheEngineCannotStartWithout() throws {
+        let run = try runEngine(arguments: ["--help"])
+
+        XCTAssertEqual(
+            run.status, 0,
+            "--help must succeed; stderr: \(run.errorText)"
+        )
+        for option in ["--socket-path", "--state-root", "--kernel-path", "--vminit-layout"] {
+            XCTAssertTrue(
+                run.outputText.contains(option),
+                "arca-engine --help must document \(option), which the engine cannot "
+                    + "start without; got: \(run.outputText)"
+            )
+        }
+        XCTAssertTrue(
+            run.outputText.contains("serve --help"),
+            "arca-engine --help must point at where the options are described; "
+                + "got: \(run.outputText)"
+        )
+    }
+
+    /// `arca-engine image` does not exit 0 having done nothing.
+    ///
+    /// ArgumentParser's default for a bare group is help and exit 0, so
+    /// `arca-engine image && echo ok` printed `ok` having loaded no image. That
+    /// is the shape this project guards against elsewhere: Gas Can's
+    /// `build-arca-engine.sh` grew a listing guard because
+    /// `swift test --filter <no match>` exits 0 having run nothing.
+    func testTheImageGroupRefusesToDoNothing() throws {
+        let run = try runEngine(arguments: ["image"])
+
+        XCTAssertNotEqual(
+            run.status, 0,
+            "a group that loaded no image must not report success; stdout: \(run.outputText)"
+        )
+        XCTAssertTrue(
+            run.errorText.contains("load"),
+            "the refusal must name the action that was missing, got: \(run.errorText)"
+        )
+    }
+
     // MARK: - Fixtures
 
     /// A real OCI layout holding one workspace image.

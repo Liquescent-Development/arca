@@ -5,14 +5,36 @@ import Foundation
 /// `arca-engine image ...`, the group that owns everything to do with the
 /// engine's own image store.
 ///
-/// A group with no `run()` of its own: ArgumentParser prints its help when it
-/// is invoked bare, which is what should happen to `arca-engine image`.
+/// It has a `run()` only to refuse. ArgumentParser's default for a bare group
+/// is to print help and exit 0, so `arca-engine image && echo ok` printed `ok`
+/// having loaded nothing -- the same "exits 0 having done nothing" shape Gas
+/// Can's `build-arca-engine.sh` grew a listing guard for, after
+/// `swift test --filter <no match>` passed a gate by running no tests.
+/// `ValidationError` is the exit 64 ArgumentParser uses for a command line it
+/// could not act on, and it prints the group's usage with it.
 struct ImageCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "image",
         abstract: "Manages the images in this engine's own store.",
         subcommands: [ImageLoadCommand.self]
     )
+
+    func run() throws {
+        // Read off the configuration rather than written out beside it, so an
+        // action a later task adds cannot go missing from the message that
+        // lists what this group can do.
+        //
+        // Spelt as an explicit closure and not `compactMap(\.configuration...)`:
+        // the key-path form crashes swiftc 6.3.3 in SILGen, `signal 5` while
+        // lowering this function, on the conversion of a key path rooted in an
+        // existential metatype. MEASURED here; the closure compiles.
+        let actions = Self.configuration.subcommands
+            .compactMap { subcommand in subcommand.configuration.commandName }
+            .joined(separator: ", ")
+        throw ValidationError(
+            "'arca-engine image' does nothing on its own; name an action: \(actions)"
+        )
+    }
 }
 
 /// `arca-engine image load --state-root <dir> --oci-layout <dir>`.

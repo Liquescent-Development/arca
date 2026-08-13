@@ -22,11 +22,35 @@ import NIOPosix
 /// --vminit-layout ...`, with no subcommand named -- still reaches
 /// `ServeCommand.run()` unchanged. That is not assumed: every test in
 /// `EngineCommandRefusalTests` spawns exactly that form.
+///
+/// `usage` and `discussion` are spelt out because the split cost them. A root
+/// holding no options of its own generates `USAGE: arca-engine <subcommand>`
+/// and an OPTIONS list holding nothing but `-h`, which is what `--help`
+/// printed until this was written: the four options the engine cannot start
+/// without were reachable only by knowing to type `arca-engine serve --help`
+/// first. Milestone 4 writes a launchd plist against this binary, and whoever
+/// writes it -- or debugs a start that failed -- reads `--help`.
+/// `ImageLoadTests.testHelpDocumentsTheOptionsTheEngineCannotStartWithout` is
+/// what stops this regressing a second time; it regressed silently the first
+/// time because nothing in the suite read help output at all.
 @main
 struct ArcaEngineCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "arca-engine",
         abstract: "Serves the arca.engine.v1 sandbox-engine contract over a Unix socket.",
+        usage: """
+            arca-engine --socket-path <socket-path> --state-root <state-root> \
+            --kernel-path <kernel-path> --vminit-layout <vminit-layout> [--log-level <log-level>]
+            arca-engine image load --state-root <state-root> --oci-layout <oci-layout>
+            """,
+        discussion: """
+            Named with no subcommand -- the first form under USAGE -- arca-engine serves \
+            the contract over the socket given. All four of those options are required and \
+            none is defaulted, because a default is how a process silently ends up pointed \
+            at another product's state; 'arca-engine serve --help' describes what each \
+            takes. 'arca-engine image load --help' covers loading an image into this \
+            engine's own store without serving anything.
+            """,
         subcommands: [ServeCommand.self, ImageCommand.self],
         defaultSubcommand: ServeCommand.self
     )
