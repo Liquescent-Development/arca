@@ -53,9 +53,21 @@ final class CreateTests: XCTestCase {
     ///
     /// - the two volumes are IN the report, so they were created before the
     ///   network step ran;
-    /// - the container is NOT in the report, and `getContainer` confirms none
-    ///   was made, so the container step is genuinely after the network step
-    ///   rather than merely listed after it.
+    /// - **`failed.error.resource` is the network's name**, so the run stopped
+    ///   at the network step and the container step never ran. That is the
+    ///   assertion which catches a reorder: moving the container block above the
+    ///   network block makes the resource the sandbox id instead. MEASURED in
+    ///   Task 11's review, which performed exactly that move and caught it here
+    ///   and nowhere else.
+    ///
+    /// The `getContainer` check at the end is a **host cross-check, not the
+    /// ordering proof**, and the distinction was a review finding: this doc
+    /// comment used to credit it with the ordering. `createContainer` throws
+    /// `notInitialized` before doing any work (`ContainerManager.swift:1659`),
+    /// so `getContainer` returns nil whatever the order is, and that assertion
+    /// cannot fail in this fixture. It stays because "the engine reported no
+    /// container" and "no container is on the host" are different claims and
+    /// both are worth making -- but it is credited only for what it shows.
     ///
     /// `created` is asserted as a whole set, not for non-emptiness. A create
     /// that reported only its first volume would pass any weaker check while
@@ -97,8 +109,59 @@ final class CreateTests: XCTestCase {
         let container = try await engine.managers.containerManager.getContainer(id: Self.sandboxId)
         XCTAssertNil(
             container,
-            "the container step must not have run: it comes after the network step, and the "
-                + "network step failed"
+            "host cross-check: no container may be left behind by a create that failed before "
+                + "the container step. This cannot fail in this fixture -- see the note above "
+                + "-- so the ordering is proved by the error.resource assertion, not by this"
+        )
+    }
+
+    /// **`create` hands `createContainer` the exact digest reference, not a
+    /// stored tag.**
+    ///
+    /// This is the one assertion the whole of Problem 1 rests on. Widening
+    /// `ImageManager.resolveImage` -- a resolver shared with Arca's Docker
+    /// surface -- was justified by `create` needing to pass
+    /// `repository@sha256:<hex>`, because that same string is what
+    /// `createContainer` records as `ContainerInfo.image` (`:1901`), what
+    /// `startContainer:2218` re-resolves after a restart, and what `Inspect`
+    /// re-parses (`SandboxEngineService.swift:196`).
+    ///
+    /// **Nothing pinned it until now.** Task 11's review replaced the deciding
+    /// line with `references.first ?? …` -- the arrangement Problem 1 explicitly
+    /// rejected -- and all 123 tests passed. Every sandbox would have recorded
+    /// `workspace:latest`, and `Inspect` would have answered `invalid_output`
+    /// for every one of them, with a green suite.
+    ///
+    /// It goes through `createSpec(for:)`, which is the seam `create(request:)`
+    /// itself calls -- not a reconstruction of what it might build -- so there
+    /// is no second path this can drift onto. The digest is the store's own,
+    /// read back from the loaded image, so a spec carrying any other string
+    /// fails here.
+    func testCreateHandsContainerBridgeTheExactDigestReferenceAndNotAStoredTag() async throws {
+        let engine = try await preparedEngine()
+
+        let spec: SandboxContainerSpec
+        switch await engine.service.createSpec(for: engine.request()) {
+        case .failure(let error):
+            return XCTFail("the fixture must translate, got \(error.code): \(error.message)")
+        case .success(let translated):
+            spec = translated
+        }
+
+        XCTAssertEqual(
+            spec.image, "workspace@sha256:\(engine.hex)",
+            "createContainer must be handed the exact digest reference; a stored tag resolves "
+                + "but makes Inspect answer invalid_output for every sandbox this engine creates"
+        )
+        // The store really does hold that content under a TAG, so this is not a
+        // test that would pass by the two strings happening to coincide.
+        let stored = try await engine.managers.imageManager.inspectImage(
+            nameOrId: "workspace:latest"
+        )
+        XCTAssertEqual(
+            stored?.repoTags, ["workspace:latest"],
+            "the store's own reference is a tag, so the digest form above was constructed "
+                + "rather than copied from the row"
         )
     }
 

@@ -243,6 +243,34 @@ package func sandboxContainerSpec(
     let networkMode: String
     switch request.network.mode {
     case .offline:
+        // **An offline sandbox cannot publish a port, so a request for both is
+        // refused rather than half-served.** Offline means no network
+        // attachment, so `getWireGuardClient` returns nil for the container
+        // (`NetworkManager.swift:819-833`) and the publish gate it feeds has no
+        // `else` (`ContainerManager.swift:2494-2541`). Accepting this request
+        // produces a sandbox that is created, started, and reported successful,
+        // whose `Inspect` names the binding -- because Task 7 reports what the
+        // store holds -- and which nothing on the host can connect to. Every
+        // check green over a port that does not exist.
+        //
+        // The combination is the contract's to permit: `Network` is a `oneof`
+        // and `ports` is a separate `repeated` field (engine.proto:238-246),
+        // with nothing saying which wins. That is a gap in the contract and is
+        // recorded as one; what this engine will not do is resolve it silently.
+        //
+        // `unsupported_capability` rather than a bad-request code: the request
+        // is well formed and this build cannot serve it, which is what that
+        // code says.
+        guard request.ports.isEmpty else {
+            return .failure(engineError(
+                .unsupportedCapability,
+                resource: name,
+                message: "this engine cannot publish ports for an offline sandbox: offline "
+                    + "means no network attachment, so there is nothing to publish through "
+                    + "and the \(request.ports.count) requested port mapping(s) would be "
+                    + "silently dropped"
+            ))
+        }
         networkMode = "none"
     case .networkedName(let networkName):
         guard !networkName.isEmpty else {

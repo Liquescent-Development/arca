@@ -65,6 +65,12 @@ final class CreateTranslationTests: XCTestCase {
         )))
         XCTAssertEqual(refusal?.code, "invalid_resource_identity")
         XCTAssertEqual(refusal?.resource, Self.sandboxId)
+        XCTAssertEqual(
+            refusal?.message,
+            "create requires both owner labels; this request carries managed_by 'gascan' and "
+                + "sandbox_id '', and a resource created under a half-set owner is one the "
+                + "consumer cannot recognise as its own"
+        )
     }
 
     /// The carried-over finding from Task 7: a pure-hex sandbox id is refused.
@@ -83,6 +89,12 @@ final class CreateTranslationTests: XCTestCase {
         let refusal = Self.refusal(of: Self.request(sandboxId: hex))
         XCTAssertEqual(refusal?.code, "invalid_resource_identity")
         XCTAssertEqual(refusal?.resource, hex)
+        XCTAssertEqual(
+            refusal?.message,
+            "sandbox id \(hex) is pure hexadecimal, which this engine's container resolver "
+                + "reads as a Docker id prefix and would match against an unrelated container; "
+                + "a gascan sandbox id always contains a hyphen"
+        )
 
         let hyphenated = "deadbeef-cafe"
         let spec = try translated(Self.request(sandboxId: hyphenated))
@@ -117,7 +129,63 @@ final class CreateTranslationTests: XCTestCase {
     func testAnUnsetNetworkModeIsRefused() {
         var request = Self.request()
         request.network.mode = nil
-        XCTAssertEqual(Self.refusal(of: request)?.code, "invalid_state")
+        let refusal = Self.refusal(of: request)
+        XCTAssertEqual(refusal?.code, "invalid_state")
+        XCTAssertEqual(
+            refusal?.message,
+            "create must state a network mode -- offline or a named network -- and this "
+                + "request states neither"
+        )
+    }
+
+    /// A networked sandbox that names no network is refused.
+    func testANamedNetworkWithNoNameIsRefused() {
+        let refusal = Self.refusal(of: Self.request(network: .networkedName("")))
+        XCTAssertEqual(refusal?.code, "invalid_resource_identity")
+        XCTAssertEqual(
+            refusal?.message,
+            "a networked sandbox must name its network and this one names none"
+        )
+    }
+
+    /// **An offline sandbox that asks for ports is refused.**
+    ///
+    /// This is the combination the contract permits and no engine can honour.
+    /// Offline means no network attachment, so `getWireGuardClient` returns nil
+    /// (`NetworkManager.swift:819-833`) and the publish gate it feeds has no
+    /// `else` (`ContainerManager.swift:2494-2541`). Accepted, it produces a
+    /// sandbox reported as created and started, whose `Inspect` names the
+    /// binding, that nothing can connect to.
+    ///
+    /// The pairing is what makes this a test of the combination rather than of
+    /// offline or of ports: the same offline request without ports translates,
+    /// and the same ports on a networked request translate. Only the pair is
+    /// refused.
+    func testAnOfflineSandboxThatAsksForPortsIsRefused() throws {
+        let refusal = Self.refusal(of: Self.request(
+            ports: [(host: 18080, guest: 8080)],
+            network: .offline(Arca_Engine_V1_Offline())
+        ))
+        XCTAssertEqual(refusal?.code, "unsupported_capability")
+        XCTAssertEqual(refusal?.resource, Self.sandboxId)
+        XCTAssertEqual(
+            refusal?.message,
+            "this engine cannot publish ports for an offline sandbox: offline means no network "
+                + "attachment, so there is nothing to publish through and the 1 requested port "
+                + "mapping(s) would be silently dropped"
+        )
+
+        let offlineWithoutPorts = try translated(
+            Self.request(network: .offline(Arca_Engine_V1_Offline()))
+        )
+        XCTAssertEqual(offlineWithoutPorts.networkMode, "none", "offline alone is fine")
+
+        let networkedWithPorts = try translated(Self.request(
+            ports: [(host: 18080, guest: 8080)], network: .networkedName("sbx-net")
+        ))
+        XCTAssertEqual(
+            networkedWithPorts.portBindings.keys.sorted(), ["8080/tcp"], "ports alone are fine"
+        )
     }
 
     // MARK: - Ports
@@ -176,12 +244,20 @@ final class CreateTranslationTests: XCTestCase {
     /// Zero is not a port. `PortMapping` is `uint32` on the wire, so it is
     /// representable, and `UInt16(0)` would convert cleanly into a binding that
     /// means nothing.
+    ///
+    /// Both arms assert the message, and the two messages differ, so the host
+    /// and guest halves cannot be transposed without this failing.
     func testPortZeroIsRefused() {
+        let hostZero = Self.refusal(of: Self.request(ports: [(host: 0, guest: 8080)]))
+        XCTAssertEqual(hostZero?.code, "invalid_state")
         XCTAssertEqual(
-            Self.refusal(of: Self.request(ports: [(host: 0, guest: 8080)]))?.code, "invalid_state"
+            hostZero?.message, "port mapping 0:8080 names a number that is not a port"
         )
+
+        let guestZero = Self.refusal(of: Self.request(ports: [(host: 18080, guest: 0)]))
+        XCTAssertEqual(guestZero?.code, "invalid_state")
         XCTAssertEqual(
-            Self.refusal(of: Self.request(ports: [(host: 18080, guest: 0)]))?.code, "invalid_state"
+            guestZero?.message, "port mapping 18080:0 names a number that is not a port"
         )
     }
 
@@ -210,6 +286,20 @@ final class CreateTranslationTests: XCTestCase {
         ]))
         XCTAssertEqual(refusal?.code, "invalid_state")
         XCTAssertEqual(refusal?.resource, "gascan-cache-x")
+        XCTAssertEqual(
+            refusal?.message,
+            "volume gascan-cache-x needs an absolute guest path and carries "
+                + "'home/workspace/.cache'"
+        )
+    }
+
+    /// A volume with no name is refused.
+    func testAVolumeWithNoNameIsRefused() {
+        let refusal = Self.refusal(of: Self.request(volumes: [
+            (name: "", path: "/home/workspace/.cache", capacity: 0),
+        ]))
+        XCTAssertEqual(refusal?.code, "invalid_resource_identity")
+        XCTAssertEqual(refusal?.message, "a volume in this request carries no name")
     }
 
     /// A request with no project mount is refused rather than creating a
@@ -220,7 +310,13 @@ final class CreateTranslationTests: XCTestCase {
     func testAMissingProjectMountIsRefused() {
         var request = Self.request()
         request.project = Arca_Engine_V1_ProjectMount()
-        XCTAssertEqual(Self.refusal(of: request)?.code, "invalid_state")
+        let refusal = Self.refusal(of: request)
+        XCTAssertEqual(refusal?.code, "invalid_state")
+        XCTAssertEqual(
+            refusal?.message,
+            "the project mount needs an absolute host path and an absolute guest path; this "
+                + "request carries '' and ''"
+        )
     }
 
     /// A capacity picks the one driver that can honour it; no capacity picks the
@@ -249,8 +345,19 @@ final class CreateTranslationTests: XCTestCase {
         let spec = try translated(Self.request(environment: [("TERM", "xterm"), ("LANG", "")]))
         XCTAssertEqual(spec.env, ["TERM=xterm", "LANG="])
 
+        let named = Self.refusal(of: Self.request(environment: [("A=B", "c")]))
+        XCTAssertEqual(named?.code, "invalid_state")
         XCTAssertEqual(
-            Self.refusal(of: Self.request(environment: [("A=B", "c")]))?.code, "invalid_state"
+            named?.message,
+            "environment variable name 'A=B' is empty or contains '=', and environment is "
+                + "passed as NAME=value"
+        )
+
+        let unnamed = Self.refusal(of: Self.request(environment: [("", "c")]))
+        XCTAssertEqual(
+            unnamed?.message,
+            "environment variable name '' is empty or contains '=', and environment is "
+                + "passed as NAME=value"
         )
     }
 
@@ -287,14 +394,27 @@ final class CreateTranslationTests: XCTestCase {
     /// opposite things about whether to change the request or give up. The
     /// sibling backend refuses the same two
     /// (`crates/gascan-apple/src/translate.rs:214-219`).
+    ///
+    /// **The messages are what tell these two apart.** Both refusals carry the
+    /// same code and the same `resource`, so asserting those alone leaves the
+    /// pair mutually indistinguishable -- a review mutation collapsed seven
+    /// refusal messages to the literal "unsupported" and the whole suite stayed
+    /// green, this test included. A consumer debugging a refused `Create` has
+    /// only that string.
     func testADiskOrProcessLimitIsRefusedAsUnsupported() {
         var disk = Self.request()
         disk.resources.diskBytes = 1 << 40
-        XCTAssertEqual(Self.refusal(of: disk)?.code, "unsupported_capability")
+        let diskRefusal = Self.refusal(of: disk)
+        XCTAssertEqual(diskRefusal?.code, "unsupported_capability")
+        XCTAssertEqual(diskRefusal?.message, "this engine cannot apply a disk limit")
 
         var processes = Self.request()
         processes.resources.processCount = 512
-        XCTAssertEqual(Self.refusal(of: processes)?.code, "unsupported_capability")
+        let processRefusal = Self.refusal(of: processes)
+        XCTAssertEqual(processRefusal?.code, "unsupported_capability")
+        XCTAssertEqual(
+            processRefusal?.message, "this engine cannot apply a process-count limit"
+        )
     }
 
     /// Both users the contract names are translated; an unspecified one is
@@ -302,7 +422,12 @@ final class CreateTranslationTests: XCTestCase {
     func testBothUsersTranslateAndAnUnspecifiedUserIsRefused() throws {
         XCTAssertEqual(try translated(Self.request(user: .workspace)).user, "workspace")
         XCTAssertEqual(try translated(Self.request(user: .root)).user, "root")
-        XCTAssertEqual(Self.refusal(of: Self.request(user: .unspecified))?.code, "invalid_state")
+        let refusal = Self.refusal(of: Self.request(user: .unspecified))
+        XCTAssertEqual(refusal?.code, "invalid_state")
+        XCTAssertEqual(
+            refusal?.message,
+            "create must name the user the workspace process runs as, and this request names none"
+        )
     }
 
     /// `init: false` is refused, because this engine cannot serve it.
@@ -364,7 +489,13 @@ final class CreateTranslationTests: XCTestCase {
         volumes: [(name: String, path: String, capacity: UInt64)] = [],
         ports: [(host: UInt32, guest: UInt32)] = [],
         environment: [(String, String)] = [],
-        network: Arca_Engine_V1_Network.OneOf_Mode = .offline(Arca_Engine_V1_Offline()),
+        // Networked, NOT offline. This default was `.offline`, which made every
+        // port test above build an offline request carrying port mappings --
+        // the combination this engine refuses -- so the suite positively
+        // asserted the forbidden behaviour while the refusal was missing
+        // altogether. A fixture default is not neutral: it decides what every
+        // test that does not override it is actually about.
+        network: Arca_Engine_V1_Network.OneOf_Mode = .networkedName("sbx-net"),
         user: Arca_Engine_V1_User = .workspace
     ) -> Arca_Engine_V1_CreateRequest {
         Arca_Engine_V1_CreateRequest.with { request in

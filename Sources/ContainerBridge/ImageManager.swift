@@ -435,6 +435,41 @@ public actor ImageManager {
         // Check if image is in use by containers (if not force)
         if !force {
             // TODO: Check with ContainerManager if image is in use
+
+            // **A digest reference must not delete a row it did not name.**
+            // This method deletes by the RESOLVED row's reference below, not by
+            // the string it was given, and `resolveImage` now resolves
+            // `repo@sha256:<hex>` by content. Without this guard,
+            // `docker rmi alpha@sha256:<digest>` against a store whose only row
+            // is `alpha:latest` untags `alpha:latest` and cleans up the content
+            // behind it -- removing a name the caller never typed. MEASURED in
+            // Task 11's review, before this guard existed:
+            // `deleteImage(alpha@digest)` returned
+            // `untagged: alpha:latest, deleted: sha256:f056fb09b4cd…`, and
+            // `alpha:latest` was gone afterwards. Before the resolver arm the
+            // same call threw `No such image`, so the widening turned an error
+            // into a destructive success.
+            //
+            // Docker's own behaviour is the model, and it is NOT "the digest
+            // form just works": `rmi` by digest removes the digest reference,
+            // and refuses to remove content carrying other references without
+            // `--force`. So a digest reference naming an actual stored row still
+            // deletes exactly that row -- the equality below holds for it -- and
+            // one that resolves to a differently-named row is refused, with the
+            // message saying what to do instead.
+            if let requested = ImageIdentity.exactDigest(of: nameOrId),
+               imageReference != nameOrId {
+                logger.warning("Refusing to delete a row the digest reference did not name", metadata: [
+                    "requested": "\(nameOrId)",
+                    "resolved": "\(imageReference)"
+                ])
+                throw ImageManagerError.deleteFailed(
+                    "\(nameOrId) resolves to \(imageReference), which is a different reference; "
+                        + "deleting it would remove a name that was not asked for. Delete "
+                        + "\(imageReference) by name, or repeat with force to remove the content "
+                        + "held under \(requested.repository)."
+                )
+            }
         }
 
         // Delete the image by reference

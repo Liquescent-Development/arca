@@ -280,20 +280,8 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     ///   precisely so that this engine never touches the file Apple's tooling
     ///   shares.
     func create(request: Arca_Engine_V1_CreateRequest) async -> Arca_Engine_V1_CreateResponse {
-        let image: String
-        switch await heldImageReferences(for: request.image) {
-        case .failure(let error):
-            return Self.createFailed([], error)
-        case .success:
-            // Problem 1's decision, in one expression. See
-            // `heldImageReferences(for:)` above for why the store is consulted
-            // at all, and `SandboxContainerSpec.image` for why the reference
-            // handed on is the digest form rather than a stored tag.
-            image = imageReference(forDigest: request.image)
-        }
-
         let spec: SandboxContainerSpec
-        switch sandboxContainerSpec(for: request, image: image) {
+        switch await createSpec(for: request) {
         case .failure(let error):
             return Self.createFailed([], error)
         case .success(let translated):
@@ -385,6 +373,43 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         return Arca_Engine_V1_CreateResponse.with { response in
             response.created = Arca_Engine_V1_Created.with { $0.created = created }
         }
+    }
+
+    /// Both gates a create passes before anything is made: the engine really
+    /// holds the content, and the request really translates.
+    ///
+    /// **This is a seam and not a convenience, and the reason is a mutation that
+    /// survived.** The whole of Problem 1 -- the justification for widening a
+    /// resolver shared with Arca's Docker surface -- rests on `create` handing
+    /// `createContainer` the exact digest reference rather than a stored tag,
+    /// because that same string is what `Inspect` re-parses
+    /// (`imageDigest(fromReference:)`, `:196`) and what `startContainer:2218`
+    /// re-resolves after a restart. Task 11's review replaced the one line that
+    /// decides it with `references.first ?? …` -- the arrangement Problem 1
+    /// explicitly rejected -- and the whole suite stayed green. Every sandbox
+    /// would have recorded `workspace:latest` and every `Inspect` would have
+    /// answered `invalid_output`, with 123 tests passing.
+    ///
+    /// `ImageResolutionTests` proves the *resolver* accepts the digest form.
+    /// Nothing proved the *caller* produced it. The resolution itself is
+    /// genuinely unreachable without a VM -- `createContainer`'s `nativeManager`
+    /// guard throws first -- but the string is a pure value, so this returns it
+    /// where a test can see it. `create(request:)` calls exactly this and builds
+    /// no spec of its own; there is no second path for a test to drift onto.
+    ///
+    /// The order of the two gates decides only which refusal a malformed request
+    /// hears first, since neither creates anything. The image goes first because
+    /// it is the failure `PrepareImage` exists to pre-empt, and hearing it here
+    /// means the `Ack` that preceded it was wrong.
+    package func createSpec(
+        for request: Arca_Engine_V1_CreateRequest
+    ) async -> Result<SandboxContainerSpec, Arca_Engine_V1_EngineError> {
+        if case .failure(let error) = await heldImageReferences(for: request.image) {
+            return .failure(error)
+        }
+        // Problem 1's decision, in one expression: the digest form, never a
+        // stored reference. See `SandboxContainerSpec.image`.
+        return sandboxContainerSpec(for: request, image: imageReference(forDigest: request.image))
     }
 
     /// A create failure with the evidence attached.

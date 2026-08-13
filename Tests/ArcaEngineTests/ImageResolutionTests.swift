@@ -175,6 +175,92 @@ final class ImageResolutionTests: XCTestCase {
         )
     }
 
+    // MARK: - The other callers the widened resolver reaches
+
+    /// `inspectImage` must accept the digest form too, and this pins why the arm
+    /// cannot be scoped to `getImage` alone.
+    ///
+    /// **`createContainer` calls both with the SAME string**, one line apart:
+    /// `getImage(nameOrId: image)` at `ContainerManager.swift:1698` and
+    /// `inspectImage(nameOrId: image)` at `:1701`. `inspectImage` swallows a
+    /// resolution failure with `try?` and returns nil, and the call site takes
+    /// `imageDetails?.id ?? "sha256:" + String(repeating: "0", count: 64)`
+    /// (`:1702`). So narrowing the arm to `getImage` would raise no error -- it
+    /// would silently record an all-zero image ID on every sandbox this engine
+    /// creates.
+    ///
+    /// Task 11's review preferred narrowing, precisely so the Docker-surface
+    /// change would disappear, and asked for this to be traced rather than
+    /// guessed. This test is the trace, and it fails if the arm is narrowed.
+    func testInspectImageResolvesTheDigestFormBecauseTheCreatePathAsksItTo() async throws {
+        let store = try await preparedStore()
+
+        let details = try await store.manager.inspectImage(
+            nameOrId: "workspace@sha256:\(store.hex)"
+        )
+        let found = try XCTUnwrap(
+            details,
+            "inspectImage must resolve the digest form: createContainer passes it the same "
+                + "string it passes getImage, and swallows a nil into an all-zero image ID"
+        )
+        XCTAssertEqual(found.repoTags, ["workspace:latest"])
+        XCTAssertNotEqual(
+            found.id, "sha256:" + String(repeating: "0", count: 64),
+            "the all-zero fallback is what a narrowed arm would record instead"
+        )
+    }
+
+    /// `rmi` by digest reference does not delete a row it did not name.
+    ///
+    /// **This is the destructive consequence the widening introduced**, found by
+    /// Task 11's review and measured there: over a store whose only row was
+    /// `alpha:latest`, `deleteImage("alpha@sha256:<digest>")` untagged
+    /// `alpha:latest` and cleaned up the content behind it. Before the resolver
+    /// arm the same call threw `No such image`, so the widening turned an error
+    /// into an unforced destructive success on the Docker socket.
+    ///
+    /// `deleteImage` deletes by the RESOLVED row's reference
+    /// (`ImageManager.swift:441`), not by the string it was given, which is why
+    /// resolving more inputs makes it delete more things.
+    ///
+    /// The second half is the pair that keeps the refusal honest: a digest
+    /// reference that names an actual stored row still deletes exactly that row,
+    /// and only that row. A guard that refused every digest form would pass the
+    /// first half on its own.
+    func testDeletingByDigestRefusesToRemoveARowItDidNotName() async throws {
+        let store = try await preparedStore()
+
+        do {
+            let removed = try await store.manager.deleteImage(
+                nameOrId: "workspace@sha256:\(store.hex)"
+            )
+            XCTFail("must refuse to untag workspace:latest, removed \(removed)")
+        } catch {
+            XCTAssertTrue(
+                "\(error)".contains("which is a different reference"),
+                "the refusal must say the resolved row was not the one named, got \(error)"
+            )
+        }
+
+        let survived = try await store.manager.inspectImage(nameOrId: "workspace:latest")
+        XCTAssertNotNil(
+            survived, "the tag the caller never typed must still be there after the refusal"
+        )
+
+        // A row that really is named by the digest form deletes normally.
+        let notTheDigest = String(repeating: "c", count: 64)
+        try await store.manager.tagImage(
+            source: "workspace:latest", target: "legacy@sha256:\(notTheDigest)"
+        )
+        _ = try await store.manager.deleteImage(nameOrId: "legacy@sha256:\(notTheDigest)")
+        let deleted = try await store.manager.inspectImage(
+            nameOrId: "legacy@sha256:\(notTheDigest)"
+        )
+        XCTAssertNil(deleted, "a digest reference naming a real row must still delete that row")
+        let untouched = try await store.manager.inspectImage(nameOrId: "workspace:latest")
+        XCTAssertNotNil(untouched, "and must not take the other reference with it")
+    }
+
     // MARK: - The parser the arm is built on
 
     /// `ImageIdentity.exactDigest` recognises the form and nothing near it.
