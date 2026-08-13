@@ -19,12 +19,33 @@ struct ArcaEngineCommand: AsyncParsableCommand {
     @Option(name: .customLong("state-root"), help: "Directory holding engine state.")
     var stateRoot: String
 
+    // Read-only inputs, separate from --state-root and from each other. None of
+    // the three is defaulted and none falls back to ~/.arca: a default is how a
+    // process silently ends up pointed at another product's state.
+    @Option(name: .customLong("kernel-path"), help: "Path of the Linux kernel image to boot sandboxes with.")
+    var kernelPath: String
+
+    @Option(name: .customLong("vminit-layout"), help: "Directory holding the arca-vminit OCI layout.")
+    var vminitLayout: String
+
     @Option(name: .customLong("log-level"), help: "trace, debug, info, notice, warning, error.")
     var logLevel: String = "info"
 
     func run() async throws {
         var logger = Logger(label: "arca-engine")
         logger.logLevel = Logger.Level(rawValue: logLevel) ?? .info
+
+        // First, and before anything is created or constructed: a bad input
+        // must cost a clear error naming which option and which path, not a
+        // half-initialised engine that answers unsupported_capability for
+        // everything that matters. This runs ahead of the socket directory too,
+        // so a refusal leaves nothing behind on disk.
+        let inputs = EngineInputs(
+            stateRoot: URL(fileURLWithPath: stateRoot),
+            kernelPath: URL(fileURLWithPath: kernelPath),
+            vminitLayout: URL(fileURLWithPath: vminitLayout)
+        )
+        try validateEngineInputs(inputs)
 
         // The socket's mode is set to 0600 immediately after bind (EngineServer),
         // but bind returns an already-listening server, so there is a brief
@@ -38,7 +59,9 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // suite stay green while the engine's real image-store root changed:
         // TestSupport held a hand-copy of these lines, so the tests exercised a
         // replica of the wiring rather than the wiring. See EnginePaths.
-        let paths = EnginePaths(stateRoot: URL(fileURLWithPath: stateRoot))
+        // The kernel is not among them: it is a read-only input the engine is
+        // handed, not state the engine owns.
+        let paths = EnginePaths(stateRoot: inputs.stateRoot)
 
         // initialize() is deliberately never called on any manager here, and
         // the reason it cannot be is worth stating in full, because it decides
@@ -71,9 +94,10 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         //
         // So Inspect and ListResources answer unsupported_capability rather
         // than "absent" and "nothing here" -- see the notes on each in
-        // SandboxEngineService. A later milestone gives ContainerBridge a
-        // read-only load path that neither starts a VM nor writes, calls it
-        // here behind a --kernel-path option, and restores both methods.
+        // SandboxEngineService. --kernel-path and --vminit-layout now name the
+        // first two of those three preconditions, and a later task in this
+        // milestone calls initialize() once the third is in hand and restores
+        // both methods.
         //
         // The managers are still constructed and handed to the service: the
         // dependency edge they create is a property gascan's release gate
@@ -88,14 +112,14 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         )
         let containerManager = ContainerManager(
             imageManager: imageManager,
-            kernelPath: paths.kernel.path,
+            kernelPath: inputs.kernelPath.path,
             imageStoreRoot: paths.imageStoreRoot,
             layerCachePath: paths.layerCache,
             stateStore: stateStore,
             logger: logger
         )
         let config = ArcaConfig(
-            kernelPath: paths.kernel.path,
+            kernelPath: inputs.kernelPath.path,
             socketPath: paths.socket.path,
             logLevel: logLevel
         )

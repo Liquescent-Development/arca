@@ -5,6 +5,12 @@ import XCTest
 @testable import ArcaEngine
 
 final class ListFilterTests: XCTestCase {
+    /// A kernel path for services whose sandboxes are never booted. Nothing in
+    /// this suite starts a VM, so the value is never read; it is named rather
+    /// than derived from the state root so that no test here quietly reasserts
+    /// the derivation `--kernel-path` replaced.
+    private static let unbootedKernel = URL(fileURLWithPath: "/opt/arca/vmlinux")
+
     /// gascan's drift and leak detection reads ListResources. A container that
     /// exists but is not listed is a leak the consumer can never see, so the
     /// engine asks for everything explicitly.
@@ -168,7 +174,9 @@ final class ListFilterTests: XCTestCase {
             isDefault: true
         )
 
-        let manager = SandboxEngineService.forTesting(stateRoot: stateRoot).networkManager
+        let manager = SandboxEngineService
+            .forTesting(stateRoot: stateRoot, kernelPath: Self.unbootedKernel)
+            .networkManager
 
         let networks = try await manager.listNetworks()
         XCTAssertEqual(
@@ -379,7 +387,12 @@ final class ListFilterTests: XCTestCase {
             aliases: ["attached-probe"]
         )
 
-        return (SandboxEngineService.forTesting(stateRoot: stateRoot).networkManager, seedStore)
+        return (
+            SandboxEngineService
+                .forTesting(stateRoot: stateRoot, kernelPath: unbootedKernel)
+                .networkManager,
+            seedStore
+        )
     }
 
     /// The one bridge network the succeeding half of the first test expects
@@ -472,7 +485,7 @@ final class ListFilterTests: XCTestCase {
 
         return ContainerManager(
             imageManager: try ImageManager(logger: logger, imageStorePath: paths.imageStoreRoot),
-            kernelPath: paths.kernel.path,
+            kernelPath: unbootedKernel.path,
             imageStoreRoot: paths.imageStoreRoot,
             layerCachePath: paths.layerCache,
             stateStore: stateStore,

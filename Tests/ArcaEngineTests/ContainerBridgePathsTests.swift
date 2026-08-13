@@ -10,21 +10,32 @@ final class ContainerBridgePathsTests: XCTestCase {
             .appendingPathComponent("arca-paths-\(UUID().uuidString)")
     }
 
+    /// A kernel deliberately outside any state root, because that is the shape
+    /// `--kernel-path` exists to allow: one read-only image shared by however
+    /// many engines, each owning its own state root.
+    private static let externalKernel = URL(fileURLWithPath: "/opt/arca/vmlinux")
+
     /// The engine must not share Apple's containerization image store, because
     /// `initfs.ext4` is derived from it -- Containerization's ContainerManager
     /// builds `imageStore.path/initfs.ext4`. Sharing that store is what forces
     /// ArcaDaemon to delete the file on every start; a private root removes the
     /// need for any coordination.
     ///
-    /// This drives `SandboxEngineService.forTesting(stateRoot:)`, which derives
-    /// its paths from `EnginePaths` exactly as `arca-engine` does, and reads
-    /// `containerizationRoot()`, the value `initialize()` hands to
-    /// Containerization. Both ends are the production ones: nothing here
+    /// This drives `SandboxEngineService.forTesting(stateRoot:kernelPath:)`,
+    /// which derives its paths from `EnginePaths` exactly as `arca-engine`
+    /// does, and reads `containerizationRoot()`, the value `initialize()` hands
+    /// to Containerization. Both ends are the production ones: nothing here
     /// restates the derivation, so a derivation that changed would be caught
     /// rather than followed.
+    ///
+    /// The kernel is passed in from outside the root, as `--kernel-path` allows
+    /// and the assertions below require: nothing the engine *derives* may
+    /// escape the state root, and the kernel is no longer derived.
     func testTheEngineImageStoreIsUnderItsStateRootAndNotApples() {
         let root = temporaryRoot()
-        let service = SandboxEngineService.forTesting(stateRoot: root)
+        let service = SandboxEngineService.forTesting(
+            stateRoot: root, kernelPath: Self.externalKernel
+        )
 
         let selected = service.containerManager.containerizationRoot()
         XCTAssertTrue(
@@ -41,7 +52,9 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// write its layer cache into Arca's tree.
     func testTheEngineLayerCacheIsUnderItsStateRootAndNotArcas() {
         let root = temporaryRoot()
-        let service = SandboxEngineService.forTesting(stateRoot: root)
+        let service = SandboxEngineService.forTesting(
+            stateRoot: root, kernelPath: Self.externalKernel
+        )
 
         let cache = service.containerManager.layerCachePath
         XCTAssertTrue(
@@ -57,8 +70,12 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// Nothing the engine derives escapes the state root. The two tests above
     /// cover the image store and the layer cache through the wiring; this
     /// covers the rest of `EnginePaths` -- the state database, the volumes
-    /// directory, the kernel and the configured socket -- which are handed to
-    /// managers this suite does not otherwise read back.
+    /// directory and the configured socket -- which are handed to managers this
+    /// suite does not otherwise read back.
+    ///
+    /// The kernel is absent because it is no longer derived: it arrives as
+    /// `--kernel-path`, a read-only input the engine may share, and validating
+    /// it is `validateEngineInputs`' job rather than this one's.
     func testNoEnginePathEscapesTheStateRoot() {
         let root = temporaryRoot()
         let paths = EnginePaths(stateRoot: root)
@@ -68,7 +85,6 @@ final class ContainerBridgePathsTests: XCTestCase {
             ("layerCache", paths.layerCache),
             ("stateDatabase", paths.stateDatabase),
             ("volumesRoot", paths.volumesRoot),
-            ("kernel", paths.kernel),
             ("socket", paths.socket),
         ] {
             XCTAssertTrue(

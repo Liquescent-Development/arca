@@ -2,9 +2,14 @@ import Foundation
 
 /// Every path the engine derives from its `--state-root`.
 ///
+/// Only mutable state the engine owns is derived here. Read-only inputs are
+/// not: the kernel image arrives as `--kernel-path` and the vminit OCI layout
+/// as `--vminit-layout`, because a file two processes read is safe to share and
+/// a state root is not. See `EngineInputs`.
+///
 /// One derivation, in the library, called by `arca-engine` and by the tests
 /// alike. Before this existed, `ArcaEngineCommand` and `TestSupport` each spelt
-/// out `root.appendingPathComponent("images")` and its five siblings, so the
+/// out `root.appendingPathComponent("images")` and its siblings, so the
 /// suite exercised a hand-copy of the wiring rather than the wiring: changing
 /// the engine's real image-store root left every test green.
 ///
@@ -36,9 +41,6 @@ public struct EnginePaths: Sendable, Equatable {
     /// Base directory for named volumes.
     public let volumesRoot: URL
 
-    /// The Linux kernel image the engine boots containers with.
-    public let kernel: URL
-
     /// The socket recorded in `ArcaConfig`. Note that the socket the process
     /// actually serves on comes from `--socket-path`; this is the configured
     /// value the managers are handed.
@@ -50,7 +52,6 @@ public struct EnginePaths: Sendable, Equatable {
         self.layerCache = stateRoot.appendingPathComponent("layers")
         self.stateDatabase = stateRoot.appendingPathComponent("state.db")
         self.volumesRoot = stateRoot.appendingPathComponent("volumes")
-        self.kernel = stateRoot.appendingPathComponent("vmlinux")
         self.socket = stateRoot.appendingPathComponent("arca.sock")
     }
 }

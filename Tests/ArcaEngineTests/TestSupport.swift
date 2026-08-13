@@ -15,23 +15,32 @@ extension SandboxEngineService {
     static func forTesting() -> SandboxEngineService {
         forTesting(
             stateRoot: URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("arca-engine-tests-\(UUID().uuidString)")
+                .appendingPathComponent("arca-engine-tests-\(UUID().uuidString)"),
+            // Outside the state root on purpose. Nothing here boots a sandbox,
+            // so it is never read, and putting it under the root would quietly
+            // restate the derivation `--kernel-path` replaced.
+            kernelPath: URL(fileURLWithPath: "/opt/arca/vmlinux")
         )
     }
 
-    /// The same service against a state root the caller names, so a test can
-    /// assert on where the managers were actually rooted.
+    /// The same service against a state root and kernel the caller names, so a
+    /// test can assert on where the managers were actually rooted.
     ///
-    /// Paths come from `EnginePaths` -- the derivation `arca-engine` itself
-    /// calls -- and not from a copy of its `appendingPathComponent` lines. The
-    /// copy is what made this helper a replica of the wiring rather than the
-    /// wiring: while it stood, changing the engine's real image-store root left
-    /// the whole suite green.
+    /// State-root paths come from `EnginePaths` -- the derivation `arca-engine`
+    /// itself calls -- and not from a copy of its `appendingPathComponent`
+    /// lines. The copy is what made this helper a replica of the wiring rather
+    /// than the wiring: while it stood, changing the engine's real image-store
+    /// root left the whole suite green.
     ///
-    /// No default for `stateRoot`, in keeping with the rule the path parameters
-    /// on `ContainerManager` follow: the no-argument overload above states the
-    /// throwaway root it wants.
-    static func forTesting(stateRoot: URL) -> SandboxEngineService {
+    /// The kernel is a parameter rather than an `EnginePaths` member for the
+    /// same reason it is a separate CLI option: it is a read-only input the
+    /// engine is handed, not state the engine owns. Deriving it here while
+    /// `arca-engine` took it from `--kernel-path` would put the drift back.
+    ///
+    /// No defaults on either, in keeping with the rule the path parameters on
+    /// `ContainerManager` follow: the no-argument overload above states the
+    /// throwaway values it wants.
+    static func forTesting(stateRoot: URL, kernelPath: URL) -> SandboxEngineService {
         let logger = Logger(label: "arca-engine-tests")
         let paths = EnginePaths(stateRoot: stateRoot)
 
@@ -45,14 +54,14 @@ extension SandboxEngineService {
         )
         let containerManager = ContainerManager(
             imageManager: imageManager,
-            kernelPath: paths.kernel.path,
+            kernelPath: kernelPath.path,
             imageStoreRoot: paths.imageStoreRoot,
             layerCachePath: paths.layerCache,
             stateStore: stateStore,
             logger: logger
         )
         let config = ArcaConfig(
-            kernelPath: paths.kernel.path,
+            kernelPath: kernelPath.path,
             socketPath: paths.socket.path,
             logLevel: "info"
         )
