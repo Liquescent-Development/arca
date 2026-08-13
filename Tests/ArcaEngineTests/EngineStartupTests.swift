@@ -326,6 +326,17 @@ final class EngineStartupTests: XCTestCase {
                     && error.description.contains(layout.path),
                 "a refusal that does not say what to fix is worse than a crash, got: \(error)"
             )
+            // The payload assertions above pin what the case carries; this pins
+            // what the user is shown. MEASURED: with `\(actual)` dropped from
+            // `description`, every assertion above still passed and the whole
+            // suite reported `Executed 58 tests, with 0 failures`. `holds ` is
+            // the anchor because `vminit:latest` is a substring of
+            // `arca-vminit:latest`, so an unanchored `contains` for the found
+            // reference is satisfied by the wanted one.
+            XCTAssertTrue(
+                error.description.contains("holds vminit:latest"),
+                "the rendered refusal must name the image actually found, got: \(error)"
+            )
         }
 
         XCTAssertNil(

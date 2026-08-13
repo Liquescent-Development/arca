@@ -86,9 +86,19 @@ final class EngineCommandRefusalTests: XCTestCase {
     /// well-formed, and holds `vminit:latest`, so the engine can only learn that
     /// by loading it.
     ///
-    /// Both assertions carry the layout's own temp path, which no usage line
-    /// can contain, so neither can be satisfied by an ArgumentParser parse
-    /// error printed before `run()` was entered.
+    /// Neither message assertion below can be satisfied by ArgumentParser's
+    /// usage line, which it prints on any parse error before `run()` is
+    /// entered: the first carries the layout's own temp path, invented
+    /// microseconds earlier, and the second carries a phrase only
+    /// `EngineStartupError`'s rendering produces.
+    ///
+    /// That second one is deliberately coupled to the message's wording, and
+    /// has to be. `vminit:latest` is a *substring* of `arca-vminit:latest`, so
+    /// `contains("vminit:latest")` is implied by `contains("arca-vminit:latest")`
+    /// and asserts nothing about the found reference. MEASURED: with `\(actual)`
+    /// dropped from `EngineStartupError.description`, the substring pair
+    /// reported `Executed 58 tests, with 0 failures`. Anchoring on `holds ` and
+    /// `not ` is what distinguishes the two, at the cost of a reword going red.
     func testTheCommandRefusesALayoutHoldingAnotherImage() throws {
         let root = try temporaryRoot()
         let kernel = root.appendingPathComponent("vmlinux")
@@ -118,8 +128,9 @@ final class EngineCommandRefusalTests: XCTestCase {
             "the refusal must name the option and the layout it read, got: \(run.errorText)"
         )
         XCTAssertTrue(
-            run.errorText.contains("arca-vminit:latest") && run.errorText.contains("vminit:latest"),
-            "the refusal must say which image was wanted and which was found, got: \(run.errorText)"
+            run.errorText.contains("holds vminit:latest")
+                && run.errorText.contains("not arca-vminit:latest"),
+            "the refusal must say which image was found and which was wanted, got: \(run.errorText)"
         )
     }
 
