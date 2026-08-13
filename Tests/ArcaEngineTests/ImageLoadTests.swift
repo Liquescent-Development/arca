@@ -323,17 +323,96 @@ final class ImageLoadTests: XCTestCase {
     /// is the shape this project guards against elsewhere: Gas Can's
     /// `build-arca-engine.sh` grew a listing guard because
     /// `swift test --filter <no match>` exits 0 having run nothing.
-    func testTheImageGroupRefusesToDoNothing() throws {
+    ///
+    /// The message half is read out of the refusal's own action list and NOT as
+    /// `errorText.contains("load")`, which is the trap this file already carries
+    /// a comment about and which the fix for the `--help` regression walked
+    /// straight into: the root's `usage:` puts `arca-engine image load
+    /// --state-root <state-root> --oci-layout <oci-layout>` on stderr with every
+    /// `ValidationError`, so `contains("load")` was satisfied by static usage
+    /// text with no contribution from the refusal at all. MEASURED by the
+    /// reviewer: with the message body replaced by the constant `"nope"` and the
+    /// throw kept, the binary printed `Error: nope` and this test passed.
+    ///
+    /// `name an action: ` appears in no usage line, no abstract and no help
+    /// text, so reaching the list at all requires the message to have produced
+    /// it.
+    func testTheImageGroupRefusesToDoNothingAndNamesWhatItCanDo() throws {
         let run = try runEngine(arguments: ["image"])
 
         XCTAssertNotEqual(
             run.status, 0,
             "a group that loaded no image must not report success; stdout: \(run.outputText)"
         )
-        XCTAssertTrue(
-            run.errorText.contains("load"),
-            "the refusal must name the action that was missing, got: \(run.errorText)"
+        XCTAssertEqual(
+            actionsNamed(inRefusal: run.errorText), ["load"],
+            "the refusal must name the actions the group has, got: \(run.errorText)"
         )
+    }
+
+    /// The refusal lists every action the group advertises.
+    ///
+    /// This is the property `ImageCommand.run()`'s derivation off
+    /// `configuration.subcommands` exists for, asserted rather than asserted
+    /// about in a comment. Both sides are the binary's own: the advertised set
+    /// is parsed out of `arca-engine image --help`, which ArgumentParser
+    /// generates from that same array, and the named set is the refusal's list.
+    ///
+    /// **It is a forward guard and cannot bite today.** With `load` the only
+    /// subcommand, replacing the derivation with the literal `"load"` leaves
+    /// both sides equal and this test green. It goes red the moment the two
+    /// disagree, which with one subcommand means only that the message is
+    /// wrong -- and that is what it was proved on. Task 10 adds `prepare`; if it
+    /// reaches `subcommands` and not the message, this is what fails.
+    func testTheRefusalNamesEveryActionTheGroupAdvertises() throws {
+        let help = try runEngine(arguments: ["image", "--help"])
+        XCTAssertEqual(help.status, 0, "image --help must succeed; stderr: \(help.errorText)")
+
+        let advertised = subcommandsAdvertised(inHelp: help.outputText)
+        XCTAssertFalse(
+            advertised.isEmpty,
+            "the group must advertise at least one action, or this test proves nothing "
+                + "by comparing two empty lists; help was: \(help.outputText)"
+        )
+
+        let refusal = try runEngine(arguments: ["image"])
+        XCTAssertEqual(
+            actionsNamed(inRefusal: refusal.errorText), advertised,
+            "every action 'arca-engine image --help' advertises must appear in the refusal, "
+                + "got \(refusal.errorText)"
+        )
+    }
+
+    /// The phrase only `ImageCommand`'s refusal produces. Deliberately long
+    /// enough that no usage line, abstract or help text carries it.
+    private static let actionListMarker = "name an action: "
+
+    /// The actions a refusal named, or an empty list if it named none.
+    private func actionsNamed(inRefusal errorText: String) -> [String] {
+        guard let line = errorText.split(separator: "\n")
+            .first(where: { $0.contains(Self.actionListMarker) }),
+            let marker = line.range(of: Self.actionListMarker) else { return [] }
+        return line[marker.upperBound...]
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// The subcommand names in a help listing's SUBCOMMANDS section.
+    ///
+    /// The section runs from its heading to the first blank line, which is what
+    /// separates the entries from the `See 'arca-engine help …'` footer that is
+    /// indented the same. An entry begins in column three; the continuation
+    /// lines of a wrapped abstract are indented far deeper, so a first token
+    /// taken from a two-space indent is a name and never a stray word.
+    private func subcommandsAdvertised(inHelp helpText: String) -> [String] {
+        let lines = helpText.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let heading = lines.firstIndex(where: { $0.hasPrefix("SUBCOMMANDS:") }) else {
+            return []
+        }
+        return lines[lines.index(after: heading)...]
+            .prefix { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .filter { $0.hasPrefix("  ") && !$0.hasPrefix("   ") }
+            .compactMap { $0.split(separator: " ").first.map(String.init) }
     }
 
     // MARK: - Fixtures

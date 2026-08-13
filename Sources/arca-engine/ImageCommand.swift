@@ -11,7 +11,12 @@ import Foundation
 /// Can's `build-arca-engine.sh` grew a listing guard for, after
 /// `swift test --filter <no match>` passed a gate by running no tests.
 /// `ValidationError` is the exit 64 ArgumentParser uses for a command line it
-/// could not act on, and it prints the group's usage with it.
+/// could not act on. What it prints beneath the message is the ROOT's custom
+/// `usage:` -- both forms, then `See 'arca-engine --help'` -- and not this
+/// group's own usage line. MEASURED against the built binary, and it matters to
+/// whoever asserts on this output: the root's usage carries the literal
+/// `arca-engine image load ...`, so a test reading stderr for `load` learns
+/// nothing about the message above it.
 struct ImageCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "image",
@@ -22,7 +27,11 @@ struct ImageCommand: ParsableCommand {
     func run() throws {
         // Read off the configuration rather than written out beside it, so an
         // action a later task adds cannot go missing from the message that
-        // lists what this group can do.
+        // lists what this group can do. Held to by
+        // ImageLoadTests.testTheRefusalNamesEveryActionTheGroupAdvertises,
+        // which compares this list against the one `image --help` generates
+        // from the same array -- a guard that can only bite once there are two
+        // subcommands, which is Task 10.
         //
         // Spelt as an explicit closure and not `compactMap(\.configuration...)`:
         // the key-path form crashes swiftc 6.3.3 in SILGen, `signal 5` while
