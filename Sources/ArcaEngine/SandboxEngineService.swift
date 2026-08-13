@@ -17,7 +17,7 @@ import SandboxEngineProto
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
 /// uninitialised manager does not report "I cannot tell", it reports "nothing
-/// exists". `ArcaEngineCommand.run()` now initializes all three before it binds
+/// exists". `ServeCommand.run()` now initializes all three before it binds
 /// the socket, so that reason has expired for both, and both now answer from
 /// that loaded state below.
 public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvider {
@@ -355,7 +355,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// of this method returned `[]` under every input: `initialize()` had been
     /// called on no manager, so containers and volumes had no loaded rows and
     /// `NetworkManager.listNetworks()` read two backends that were both nil.
-    /// `ArcaEngineCommand.run()` now initializes all three before it binds the
+    /// `ServeCommand.run()` now initializes all three before it binds the
     /// socket, so the state these three calls read is really there.
     ///
     /// Two further defects sat behind that emptiness and would have surfaced the

@@ -8,7 +8,7 @@ import Foundation
 /// a state root is not. See `EngineInputs`.
 ///
 /// One derivation, in the library, called by `arca-engine` and by the tests
-/// alike. Before this existed, `ArcaEngineCommand` and `TestSupport` each spelt
+/// alike. Before this existed, `ServeCommand` and `TestSupport` each spelt
 /// out `root.appendingPathComponent("images")` and its siblings, so the
 /// suite exercised a hand-copy of the wiring rather than the wiring: changing
 /// the engine's real image-store root left every test green.

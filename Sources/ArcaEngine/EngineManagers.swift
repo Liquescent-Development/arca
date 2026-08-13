@@ -6,7 +6,7 @@ import Logging
 ///
 /// `EnginePaths` unified where the paths come *from*; this unifies which derived
 /// path reaches which constructor argument, which was the half still spelt out
-/// twice -- once in `ArcaEngineCommand.run()` and once in the tests' own
+/// twice -- once in `ServeCommand.run()` and once in the tests' own
 /// `SandboxEngineService.forTesting`. Task 1's review measured that arrangement:
 /// swapping `imageStoreRoot: paths.layerCache` in the command alone left all 34
 /// tests of the day green, because the tests drove a parallel wiring over the
@@ -25,7 +25,7 @@ import Logging
 ///
 /// Constructing this does not initialize anything. `initialize()` needs a live
 /// `Containerization.VmnetNetwork` and boots nothing until the engine asks --
-/// see the ordering note at `ArcaEngineCommand.run()`, which is the only caller
+/// see the ordering note at `ServeCommand.run()`, which is the only caller
 /// that may ask.
 public struct EngineManagers: Sendable {
     /// The derivation every path below came from, exposed so a caller can name
@@ -57,9 +57,7 @@ public struct EngineManagers: Sendable {
         self.logger = logger
 
         self.stateStore = try StateStore(path: paths.stateDatabase.path, logger: logger)
-        self.imageManager = try ImageManager(
-            logger: logger, imageStorePath: paths.imageStoreRoot
-        )
+        self.imageManager = try Self.makeImageManager(paths: paths, logger: logger)
         self.containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: kernelPath.path,
@@ -84,6 +82,23 @@ public struct EngineManagers: Sendable {
             logger: logger
         )
         self.execManager = ExecManager(containerManager: containerManager, logger: logger)
+    }
+
+    /// The engine's own image store, rooted the one way.
+    ///
+    /// Static, and called by `init` above rather than duplicated by it, so that
+    /// a caller needing the image store and nothing else -- `arca-engine image
+    /// load`, which has no kernel, no state database and no VM -- reaches the
+    /// same `imageStorePath: paths.imageStoreRoot` mapping the served engine
+    /// does. `EnginePaths` already unified where the path comes from; this is
+    /// the other half, which derived path reaches which constructor argument,
+    /// and it is the half Task 1's review measured going wrong silently.
+    ///
+    /// This is not a second construction path for tests. Tests drive it because
+    /// `loadWorkspaceImages` does, exactly as they drive `init` through
+    /// `SandboxEngineService.forTesting`.
+    package static func makeImageManager(paths: EnginePaths, logger: Logger) throws -> ImageManager {
+        try ImageManager(logger: logger, imageStorePath: paths.imageStoreRoot)
     }
 
     /// Hands `ContainerManager` the two collaborators it holds optionally.

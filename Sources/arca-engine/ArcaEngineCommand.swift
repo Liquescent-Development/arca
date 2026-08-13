@@ -6,10 +6,38 @@ import Logging
 import NIOCore
 import NIOPosix
 
+/// The entry point, and nothing else.
+///
+/// It carries no options of its own, and that is forced rather than tidy.
+/// ArgumentParser parses every command in the chain, so a parent holding
+/// REQUIRED options makes them required of its subcommands too: with
+/// `--socket-path` and its three siblings declared here, `arca-engine image
+/// load --state-root R --oci-layout L` exited with `Error: Missing expected
+/// argument '--socket-path <socket-path>'` -- MEASURED against the built binary
+/// before this split. An image load cannot be made to name a socket it will
+/// never bind.
+///
+/// `serve` is the `defaultSubcommand`, so the invocation Gas Can already
+/// ships -- `arca-engine --socket-path ... --state-root ... --kernel-path ...
+/// --vminit-layout ...`, with no subcommand named -- still reaches
+/// `ServeCommand.run()` unchanged. That is not assumed: every test in
+/// `EngineCommandRefusalTests` spawns exactly that form.
 @main
 struct ArcaEngineCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "arca-engine",
+        abstract: "Serves the arca.engine.v1 sandbox-engine contract over a Unix socket.",
+        subcommands: [ServeCommand.self, ImageCommand.self],
+        defaultSubcommand: ServeCommand.self
+    )
+}
+
+/// Serves the contract until it is told to stop. The engine's whole reason for
+/// existing, and now one subcommand among others only because a sibling needed
+/// a parent that demanded nothing.
+struct ServeCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "serve",
         abstract: "Serves the arca.engine.v1 sandbox-engine contract over a Unix socket."
     )
 
@@ -32,8 +60,7 @@ struct ArcaEngineCommand: AsyncParsableCommand {
     var logLevel: String = "info"
 
     func run() async throws {
-        var logger = Logger(label: "arca-engine")
-        logger.logLevel = Logger.Level(rawValue: logLevel) ?? .info
+        let logger = engineLogger(logLevel: logLevel)
 
         // First, and before anything is created or constructed: a bad input
         // must cost a clear error naming which option and which path, not a

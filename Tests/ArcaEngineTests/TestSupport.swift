@@ -30,7 +30,7 @@ extension SandboxEngineService {
     /// itself calls -- and not from a copy of its constructor calls. The copy is
     /// what made this helper a replica of the wiring rather than the wiring:
     /// while it stood, Task 1's review measured that swapping
-    /// `imageStoreRoot: paths.layerCache` in `ArcaEngineCommand` left the whole
+    /// `imageStoreRoot: paths.layerCache` in `ServeCommand` left the whole
     /// suite green. See the measurement recorded on `EngineManagers` for what
     /// the same swap costs now.
     ///

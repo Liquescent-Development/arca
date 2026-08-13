@@ -66,15 +66,37 @@ public func validateEngineInputs(_ inputs: EngineInputs) throws {
         )
     }
 
-    isDirectory = false
-    guard fileManager.fileExists(atPath: inputs.vminitLayout.path, isDirectory: &isDirectory) else {
-        throw EngineStartupError.missingInput(
-            name: "--vminit-layout", path: inputs.vminitLayout.path
-        )
+    try validateOCILayoutDirectory(inputs.vminitLayout, option: vminitLayoutOption)
+}
+
+/// Refuses a directory that is not an OCI image layout, naming the option the
+/// caller would change and the path it tried.
+///
+/// Parameterised by option name rather than fixed to `--vminit-layout` because
+/// two options now point at OCI layouts: `--vminit-layout`, the startup input,
+/// and `--oci-layout` on `arca-engine image load`, the workspace image a
+/// consumer pushes afterwards. They are separate options over separate
+/// mechanisms on purpose (a startup input is not pushed content), but "what
+/// makes a directory an OCI layout" is one question, and answering it twice is
+/// two answers free to drift -- the defect Task 1's duplicated wiring already
+/// cost this milestone in another form.
+///
+/// The marker check is EXISTENCE-ONLY, which is deliberate and bounded: it
+/// rejects an empty directory, a file, and a half-written layout, but a layout
+/// whose `oci-layout` and `index.json` are both zero bytes passes here and
+/// fails inside `ImageStore.load`. That residue is why `loadWorkspaceImages`
+/// wraps the load itself rather than trusting this check to be the only
+/// refusal.
+package func validateOCILayoutDirectory(_ directory: URL, option: String) throws {
+    let fileManager = FileManager.default
+
+    var isDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+        throw EngineStartupError.missingInput(name: option, path: directory.path)
     }
     guard isDirectory.boolValue else {
         throw EngineStartupError.unreadableInput(
-            name: "--vminit-layout", path: inputs.vminitLayout.path,
+            name: option, path: directory.path,
             cause: "is a file, not an OCI layout directory"
         )
     }
@@ -83,18 +105,18 @@ public func validateEngineInputs(_ inputs: EngineInputs) throws {
     // directory exists would accept an empty directory and fail later, inside
     // ImageManager, with a message about the wrong thing.
     for marker in ["oci-layout", "index.json"] {
-        let path = inputs.vminitLayout.appendingPathComponent(marker).path
+        let path = directory.appendingPathComponent(marker).path
         guard fileManager.fileExists(atPath: path) else {
             throw EngineStartupError.unreadableInput(
-                name: "--vminit-layout", path: inputs.vminitLayout.path,
+                name: option, path: directory.path,
                 cause: "is not an OCI layout: no \(marker)"
             )
         }
     }
 }
 
-/// The option `loadVminit` refuses on behalf of, so a refusal names the thing
-/// the user would change.
+/// The option `validateEngineInputs` and `loadVminit` refuse on behalf of, so a
+/// refusal names the thing the user would change.
 private let vminitLayoutOption = "--vminit-layout"
 
 /// The reference the exported layout carries. VERIFIED against the real one:

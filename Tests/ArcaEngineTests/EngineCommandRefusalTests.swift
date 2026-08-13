@@ -5,7 +5,7 @@ import XCTest
 ///
 /// `EngineStartupTests` calls the validation function directly, which proves the
 /// function and never the call. MEASURED: with `try validateEngineInputs(inputs)`
-/// deleted outright from `ArcaEngineCommand.run()`, all six of those tests, and
+/// deleted outright from `ServeCommand.run()`, all six of those tests, and
 /// the whole suite, reported `Executed 49 tests, with 0 failures`. The same hole
 /// hides the ordering: moving the call after `createSocketParentDirectory` was
 /// equally invisible. Task 6 edits exactly that region of `run()` to add
@@ -21,7 +21,7 @@ final class EngineCommandRefusalTests: XCTestCase {
     /// side effect. Splitting them would spawn the binary three times to assert
     /// three things about the same run.
     func testTheCommandRefusesAMissingKernelBeforeCreatingTheSocketDirectory() throws {
-        let root = try temporaryRoot()
+        let root = try temporaryEngineRoot()
         let socketDirectory = root.appendingPathComponent("sock")
         let absentKernel = root.appendingPathComponent("vmlinux")
         let layout = try validVminitLayout(in: root)
@@ -53,7 +53,7 @@ final class EngineCommandRefusalTests: XCTestCase {
         // prints a usage line on *any* parse error, on stderr, before `run()` is
         // entered -- and that usage line contains the literal `--kernel-path`.
         // MEASURED: with one unrelated required option added to
-        // `ArcaEngineCommand` that this test does not pass, all four of the other
+        // `ServeCommand` that this test does not pass, all four of the other
         // assertions passed on a pure parse failure while `validateEngineInputs`
         // was never reached.
         //
@@ -100,7 +100,7 @@ final class EngineCommandRefusalTests: XCTestCase {
     /// reported `Executed 58 tests, with 0 failures`. Anchoring on `holds ` and
     /// `not ` is what distinguishes the two, at the cost of a reword going red.
     func testTheCommandRefusesALayoutHoldingAnotherImage() throws {
-        let root = try temporaryRoot()
+        let root = try temporaryEngineRoot()
         let kernel = root.appendingPathComponent("vmlinux")
         try Data("k".utf8).write(to: kernel)
         let layout = root.appendingPathComponent("vminit")
@@ -164,7 +164,7 @@ final class EngineCommandRefusalTests: XCTestCase {
     /// MEASURED with the three calls deleted outright: three failures in this
     /// one test, `exitedOnItsOwn` first, since the engine then serves.
     func testAManagerThatCannotInitializeRefusesBeforeBindingTheSocket() throws {
-        let root = try temporaryRoot()
+        let root = try temporaryEngineRoot()
         let kernel = root.appendingPathComponent("vmlinux")
         try Data("k".utf8).write(to: kernel)
         let layout = root.appendingPathComponent("vminit")
@@ -231,100 +231,7 @@ final class EngineCommandRefusalTests: XCTestCase {
         )
     }
 
-    // MARK: - Running the binary
-
-    private struct EngineRun {
-        /// Whether the process ended before the deadline. False means it was
-        /// still running and this test killed it -- the shape a deleted
-        /// validation call takes, since the engine then goes on to serve.
-        let exitedOnItsOwn: Bool
-        let status: Int32
-        let errorText: String
-    }
-
-    /// The built `arca-engine`, found beside the test bundle.
-    ///
-    /// Not a hardcoded `.build/debug/arca-engine`: Gas Can's gate builds the
-    /// checkout with `--configuration release`, which puts both the bundle and
-    /// the binary in `.build/release` instead. Deriving from the bundle is
-    /// correct under either configuration.
-    ///
-    /// A missing binary fails the test. There is no skip: the whole point of
-    /// this file is that the call site is otherwise unproved, so a version that
-    /// quietly passes when it cannot find the binary would restore the hole.
-    private func engineBinary() throws -> URL {
-        let binary = Bundle(for: Self.self)
-            .bundleURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("arca-engine")
-        guard FileManager.default.isExecutableFile(atPath: binary.path) else {
-            throw EngineBinaryMissing(path: binary.path)
-        }
-        return binary
-    }
-
-    private struct EngineBinaryMissing: Error, CustomStringConvertible {
-        let path: String
-        var description: String {
-            "arca-engine was not built beside the test bundle at \(path)"
-        }
-    }
-
-    /// Runs the engine and waits, but never indefinitely.
-    ///
-    /// `waitUntilExit()` alone would hang forever in the exact case this test
-    /// exists to catch: an engine that does not refuse goes on to serve, and a
-    /// hung suite reports nothing.
-    private func runEngine(arguments: [String]) throws -> EngineRun {
-        let process = Process()
-        process.executableURL = try engineBinary()
-        process.arguments = arguments
-
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        process.standardOutput = Pipe()
-
-        try process.run()
-
-        let deadline = Date().addingTimeInterval(30)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-
-        let exitedOnItsOwn = !process.isRunning
-        if !exitedOnItsOwn {
-            // SIGTERM, which the engine turns into a graceful shutdown, so the
-            // socket is unlinked and nothing is left listening for the next test.
-            process.terminate()
-        }
-        process.waitUntilExit()
-
-        let errorText = String(
-            decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
-        )
-        return EngineRun(
-            exitedOnItsOwn: exitedOnItsOwn,
-            status: process.terminationStatus,
-            errorText: errorText
-        )
-    }
-
     // MARK: - Fixtures
-
-    /// A short root, removed when the test ends.
-    ///
-    /// Short because a macOS Unix socket path is capped near 104 characters, and
-    /// `NSTemporaryDirectory()` already spends about half of that. With a full
-    /// UUID the engine would fail to bind for that reason instead of the one
-    /// under test -- which matters in the mutation case, where the engine is
-    /// meant to get far enough to serve.
-    private func temporaryRoot() throws -> URL {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("arca-cmd-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-        return root
-    }
 
     /// A well-formed vminit layout, so the kernel is the only thing wrong.
     private func validVminitLayout(in root: URL) throws -> URL {
