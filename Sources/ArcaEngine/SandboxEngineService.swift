@@ -10,32 +10,33 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, two of the eleven are implemented: `Capabilities` and
-/// `Inspect`.** The other nine answer `unsupported_capability` inside their
-/// response `oneof`.
+/// **In this build, three of the eleven are implemented: `Capabilities`,
+/// `Inspect` and `ListResources`.** The other eight answer
+/// `unsupported_capability` inside their response `oneof`.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
 /// uninitialised manager does not report "I cannot tell", it reports "nothing
 /// exists". `ArcaEngineCommand.run()` now initializes all three before it binds
-/// the socket, so that reason has expired for both: `Inspect` answers from that
-/// loaded state below, and `ListResources` still answers
-/// `unsupported_capability` because it is unwritten -- Task 8's work -- not
-/// because the state behind it is empty.
+/// the socket, so that reason has expired for both, and both now answer from
+/// that loaded state below.
 public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvider {
     public let interceptors: Arca_Engine_V1_SandboxEngineServerInterceptorFactoryProtocol? = nil
 
-    // `containerManager` is read by `inspect(request:)` below. The other four
-    // are held and, in this build, unread. Deliberate on both counts.
+    // `containerManager` is read by `inspect(request:)` and, with
+    // `volumeManager` and `networkManager`, by `listResources(request:)` below.
+    // `imageManager` and `execManager` are held and, in this build, unread.
+    // Deliberate on both counts.
     //
-    // Unread because the methods that would consult them are the ones this
-    // build does not implement. Held because the dependency edge is itself a
-    // shipped property: gascan's tests/release/engine-targets-check.sh asserts
-    // that `arca-engine` and `ArcaEngine` reach neither `DockerAPI` nor
-    // `ArcaDaemon`, and that assertion measures something only while this
-    // target genuinely depends on ContainerBridge. Dropping the four to silence
-    // an unused-property reading would make the release gate pass for a reason
-    // that has nothing to do with what it exists to prove.
+    // Unread because the methods that would consult them -- `PrepareImage`,
+    // `Exec` -- are among the eight this build does not implement. Held because
+    // the dependency edge is itself a shipped property: gascan's
+    // tests/release/engine-targets-check.sh asserts that `arca-engine` and
+    // `ArcaEngine` reach neither `DockerAPI` nor `ArcaDaemon`, and that
+    // assertion measures something only while this target genuinely depends on
+    // ContainerBridge. Dropping the two to silence an unused-property reading
+    // would make the release gate pass for a reason that has nothing to do with
+    // what it exists to prove.
     let containerManager: ContainerManager
     let volumeManager: VolumeManager
     let networkManager: NetworkManager
@@ -337,31 +338,66 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
 
     /// See the note on the `create(request:)` overload above.
     ///
-    /// Unimplemented in this build, for the reason `inspect` used to give and
-    /// with a sharper edge.
-    ///
     /// `engine.proto`'s contract for this method is "Every resource the engine
-    /// holds, labelled or not", because a consumer's drift and leak detection
-    /// depends on seeing the unlabelled ones. An earlier revision walked
-    /// `ContainerManager`, `VolumeManager` and `NetworkManager`; with
-    /// `initialize()` called on none of them all three were permanently empty --
-    /// containers and volumes had no loaded rows, and
-    /// `NetworkManager.listNetworks()` read two backends that were both nil --
-    /// so it returned `[]` under every input. An
-    /// empty `ResourceList` is not an error arm: it is a confident report of a
-    /// clean host, which is precisely the report that hides a leak.
+    /// holds, labelled or not" (engine.proto:387-391), because a consumer's
+    /// drift and leak detection depends on seeing the unlabelled ones. Nothing
+    /// here filters: an unlabelled resource is reported with `owner` unset,
+    /// which is how the consumer sees one it does not own
+    /// (engine.proto:169-173). That is deliberately NOT what `inspect` does one
+    /// method up, where an unlabelled container is refused as
+    /// `foreign_resource_refused` -- these answer different questions. This one
+    /// reports what the engine holds; that one asserts a named container is the
+    /// sandbox that was asked for, and it cannot assert that without labels.
     ///
-    /// Two further defects sat behind that emptiness and would have surfaced
-    /// the moment state was loaded: `listContainers(all: true)` with no filters
+    /// **An empty `ResourceList` is not an error arm.** It is a confident report
+    /// of a clean host, which is precisely the report that hides a leak, so the
+    /// two must stay distinguishable at every source below. An earlier revision
+    /// of this method returned `[]` under every input: `initialize()` had been
+    /// called on no manager, so containers and volumes had no loaded rows and
+    /// `NetworkManager.listNetworks()` read two backends that were both nil.
+    /// `ArcaEngineCommand.run()` now initializes all three before it binds the
+    /// socket, so the state these three calls read is really there.
+    ///
+    /// Two further defects sat behind that emptiness and would have surfaced the
+    /// moment state was loaded: `listContainers(all: true)` with no filters
     /// dropped every container labelled `com.arca.internal=true`, and
-    /// `NetworkManager.listNetworks()` swallowed a WireGuard-backend failure
-    /// with `try?`, turning a real failure into a clean answer. Both are now
-    /// fixed in `ContainerBridge` -- `listContainers` takes an `includeInternal:`
-    /// argument and `listNetworks()` throws -- and this method must use both
-    /// when it is written, because a silently incomplete list is worse than no
-    /// list.
+    /// `listNetworks()` swallowed a WireGuard-backend failure with `try?`,
+    /// turning a real failure into a clean answer. Both are fixed in
+    /// `ContainerBridge`, and this method uses both: `includeInternal: true`, and
+    /// a `try` that carries a backend failure out as `command_io` rather than as
+    /// a short list. A silently incomplete list is worse than no list.
     func listResources(request: Arca_Engine_V1_ListResourcesRequest) async -> Arca_Engine_V1_ListResourcesResponse {
-        Arca_Engine_V1_ListResourcesResponse.with { $0.error = Self.notImplemented("ListResources") }
+        let collected = await engineErrorCatching(.commandIo) {
+            var resources: [Arca_Engine_V1_Resource] = []
+            for container in try await self.containerManager.listContainers(
+                all: true, includeInternal: true
+            ) {
+                resources.append(resourceMessage(
+                    kind: .container,
+                    name: containerResourceName(names: container.names, id: container.id),
+                    labels: container.labels
+                ))
+            }
+            for volume in try await self.volumeManager.listVolumes() {
+                resources.append(resourceMessage(
+                    kind: .volume, name: volume.name, labels: volume.labels
+                ))
+            }
+            for network in try await self.networkManager.listNetworks() {
+                resources.append(resourceMessage(
+                    kind: .network, name: network.name, labels: network.labels
+                ))
+            }
+            return resources
+        }
+        switch collected {
+        case .failure(let error):
+            return Arca_Engine_V1_ListResourcesResponse.with { $0.error = error }
+        case .success(let resources):
+            return Arca_Engine_V1_ListResourcesResponse.with { response in
+                response.resources = Arca_Engine_V1_ResourceList.with { $0.resources = resources }
+            }
+        }
     }
 
     public func listResources(
