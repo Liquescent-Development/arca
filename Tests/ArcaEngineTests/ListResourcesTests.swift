@@ -15,15 +15,24 @@ final class ListResourcesTests: XCTestCase {
     ///
     /// **Unfiltered, and that is the point of this test.** Every other
     /// assertion in this file narrows to one kind first, and a per-kind
-    /// assertion cannot see a walk that stops early. MEASURED: with
+    /// assertion cannot see a walk that stops early. The mutation that shows it
+    /// is
     ///
     ///     if resources.count >= 3 { return resources }
     ///
-    /// after the container loop, an engine holding three or more containers
-    /// reports no volumes and no networks at all -- the silently incomplete list
-    /// `listResources`' own doc comment calls worse than no list -- and the
-    /// suite stayed green at `Executed 75 tests, with 0 failures`. Comparing
-    /// against a list holding every kind is what closes that: a walk that stops
+    /// after the container loop, which makes an engine holding three or more
+    /// containers report no volumes and no networks at all -- the silently
+    /// incomplete list `listResources`' own doc comment calls worse than no
+    /// list.
+    ///
+    /// MEASURED twice with `swift test --filter ArcaEngineTests`, and the two
+    /// results are the reason this test has its present shape. Against the
+    /// per-kind assertions this test carried **before it was widened**, that
+    /// mutation left `Executed 75 tests, with 0 failures`: nothing in the suite
+    /// saw it. Against the assertion **below**, the same mutation reports
+    /// `Executed 75 tests, with 1 failure` -- this test, its actual list holding
+    /// the three containers and neither the volume nor the network. Comparing
+    /// against a list holding every kind is what closed that: a walk that stops
     /// after any source fails here, whichever source it was.
     ///
     /// **Five resources, three kinds, mixed ownership.** This is also the
@@ -135,17 +144,19 @@ final class ListResourcesTests: XCTestCase {
     /// The volume and network halves of the same rule, read back through the
     /// real path with **nothing installed**.
     ///
-    /// Two of each kind, one labelled and one not, for the reason the container
-    /// test seeds three: a list that drops the unlabelled resources and a list
-    /// that drops the kind entirely are different regressions and must produce
-    /// different failures.
+    /// Two of each kind, one labelled and one not, for the reason the all-kinds
+    /// test above seeds three containers: a list that drops the unlabelled
+    /// resources and a list that drops the kind entirely are different
+    /// regressions and must produce different failures. That test spans the
+    /// kinds; this one goes deeper within two of them.
     ///
     /// Nothing is installed on `NetworkManager` here, deliberately. Task 3's
     /// review measured that a stub-driven test stays green through the mutation
     /// that matters -- dropping the production default while leaving the
-    /// installed-stub path intact -- so the network half of this method is only
-    /// proved by a test that runs the manager's own `NullDriverNetworks` over
-    /// the store the seed was written to.
+    /// installed-stub path intact -- so the network half of this method is
+    /// proved only by a test that runs the manager's own `NullDriverNetworks`
+    /// over the store the seed was written to. This is one such test; the
+    /// all-kinds test above installs nothing either, and is the other.
     func testALabelledAndAnUnlabelledVolumeAndNetworkAreAllReported() async throws {
         let managers = try Self.managers()
         try await Self.seedVolume(
@@ -226,8 +237,9 @@ final class ListResourcesTests: XCTestCase {
     /// Driven through `setBridgeNetworkLister`, the seam Task 3 built so a
     /// backend can fail without standing in for the rest of
     /// `WireGuardNetworkBackend`. What this seam cannot prove is that the
-    /// production source is wired up at all; that is the previous test's job,
-    /// and the two are guard-proved against different mutations.
+    /// production source is wired up at all; that is the job of the two tests
+    /// above, which install nothing, and all three are guard-proved against
+    /// different mutations.
     func testANetworkBackendFailureIsTheErrorArmRatherThanAShortList() async throws {
         let managers = try Self.managers()
         try await Self.seedContainer(

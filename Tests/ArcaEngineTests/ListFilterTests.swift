@@ -512,9 +512,13 @@ struct NetworkListerUnreachable: Error, CustomStringConvertible {
     /// `ListResourcesTests.testANetworkBackendFailureIsTheErrorArmRatherThanAShortList`
     /// pins that message by exact equality -- which is what distinguishes
     /// "carried the source's own failure out" from "substituted engine prose",
-    /// and what `contains` would not. Left to the default `String(describing:)`
-    /// the asserted string was this type's *name*, so renaming the type would
-    /// have silently changed what that assertion meant.
+    /// and what `contains` would not.
+    ///
+    /// Before this conformance existed that assertion pinned the default
+    /// `String(describing:)` output, which is this type's *name*: renaming the
+    /// type would have changed what the assertion meant with nothing failing.
+    /// Stated here, the two are the right way round -- changing this
+    /// `description` fails that assertion, and renaming the type does not.
     var description: String { "the bridge network source could not be reached" }
 }
 
