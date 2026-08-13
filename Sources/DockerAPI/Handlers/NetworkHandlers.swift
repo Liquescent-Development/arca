@@ -39,9 +39,13 @@ public struct NetworkHandlers: Sendable {
             "filters": "\(filters)"
         ])
 
-        // networkManager.listNetworks() doesn't throw - it returns an array directly
-        // No failure case for listing (empty array on no networks)
-        let allNetworks = await networkManager.listNetworks()
+        let allNetworks: [NetworkMetadata]
+        do {
+            allNetworks = try await networkManager.listNetworks()
+        } catch {
+            logger.error("Failed to list networks", metadata: ["error": "\(error)"])
+            return .failure(NetworkError.listFailed(errorDescription(error)))
+        }
 
         // Apply sync filters first
         var filteredMetadata = applyFilters(allNetworks, filters: filters)
@@ -99,9 +103,18 @@ public struct NetworkHandlers: Sendable {
         }
 
         // Try resolving as name or ID
-        let resolvedID = await networkManager.resolveNetworkID(id) ?? id
+        let resolvedID: String
+        do {
+            resolvedID = try await networkManager.resolveNetworkID(id) ?? id
+        } catch {
+            logger.error("Failed to resolve network", metadata: [
+                "id": "\(id)",
+                "error": "\(error)"
+            ])
+            return .failure(NetworkError.inspectFailed(errorDescription(error)))
+        }
 
-        // networkManager methods don't throw - they return optionals
+        // networkManager.getNetwork does not throw - it returns an optional
         // Failure case handled via guard statement
         guard let metadata = await networkManager.getNetwork(id: resolvedID) else {
             return .failure(NetworkError.notFound(id))
@@ -201,7 +214,7 @@ public struct NetworkHandlers: Sendable {
 
         do {
             // Resolve network name or ID to full network ID
-            guard let resolvedID = await networkManager.resolveNetworkID(id) else {
+            guard let resolvedID = try await networkManager.resolveNetworkID(id) else {
                 return .failure(NetworkError.notFound(id))
             }
 
@@ -265,7 +278,7 @@ public struct NetworkHandlers: Sendable {
             }
 
             // Resolve network name or ID to full network ID
-            guard let resolvedNetworkID = await networkManager.resolveNetworkID(networkID) else {
+            guard let resolvedNetworkID = try await networkManager.resolveNetworkID(networkID) else {
                 return .failure(NetworkError.notFound("network \(networkID) not found"))
             }
 
@@ -518,7 +531,13 @@ public struct NetworkHandlers: Sendable {
         }
 
         // Get all networks from NetworkManager
-        let allNetworks = await networkManager.listNetworks()
+        let allNetworks: [NetworkMetadata]
+        do {
+            allNetworks = try await networkManager.listNetworks()
+        } catch {
+            logger.error("Failed to list networks for prune", metadata: ["error": "\(error)"])
+            return .failure(NetworkError.pruneFailed(errorDescription(error)))
+        }
 
         var deletedNetworkNames: [String] = []
 

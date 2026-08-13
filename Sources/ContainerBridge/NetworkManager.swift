@@ -2,6 +2,17 @@ import Foundation
 import Logging
 import Containerization
 
+/// The source `NetworkManager.listNetworks()` reads bridge networks from.
+///
+/// `NetworkManager` owns this abstraction rather than the backend: it names the
+/// one capability the listing needs, so a caller can supply a source that fails
+/// without standing in for the rest of `WireGuardNetworkBackend`. `package`
+/// because the only such caller is `ArcaEngineTests`, which is in this package;
+/// nothing outside it has a reason to implement this.
+package protocol BridgeNetworkLister: Sendable {
+    func listNetworks() async throws -> [NetworkMetadata]
+}
+
 /// Manages Docker networks with WireGuard as the default bridge backend:
 /// - WireGuard backend (default): Full Docker compatibility with ~1ms latency
 /// - vmnet backend: High performance native vmnet (limited features, user-created only)
@@ -18,6 +29,27 @@ public actor NetworkManager {
     // Backends
     private var vmnetBackend: VmnetNetworkBackend?
     private var wireGuardBackend: WireGuardNetworkBackend?
+
+    /// A bridge-network source standing in for the WireGuard backend. `nil` in
+    /// production and set only by `setBridgeNetworkLister(_:)`, which exists
+    /// because `listNetworks()` has no other reachable failure: a backend is
+    /// otherwise populated only by `initialize()`, which also creates the
+    /// default `host` network over vmnet and so cannot run in a unit test.
+    private var installedBridgeNetworkLister: (any BridgeNetworkLister)?
+
+    /// The source `listNetworks()` reads, and its only reader.
+    ///
+    /// Computed rather than stored: a stored second reference would have to be
+    /// assigned alongside `wireGuardBackend` in `initialize()`, and dropping
+    /// that one line would leave production listing no bridge networks with
+    /// every test still green. Derived, the backend cannot be installed without
+    /// this seeing it.
+    private var bridgeNetworkLister: (any BridgeNetworkLister)? {
+        if let installed = installedBridgeNetworkLister {
+            return installed
+        }
+        return wireGuardBackend
+    }
 
     // Central network routing: networkID -> driver
     // This avoids "try all backends" pattern and provides O(1) backend lookup
@@ -40,6 +72,17 @@ public actor NetworkManager {
     /// Set the EventEmitter for emitting Docker events
     public func setEventEmitter(_ emitter: EventEmitter) {
         self.eventEmitter = emitter
+    }
+
+    /// Install the bridge-network source `listNetworks()` reads, in place of
+    /// the WireGuard backend, without the rest of `initialize()`.
+    ///
+    /// `package` rather than `public` for the reason `BridgeNetworkLister` is:
+    /// this exists so `ArcaEngineTests` can drive `listNetworks()` against a
+    /// backend that fails. The daemon has no use for it -- it calls
+    /// `initialize()`, which installs the real backend itself.
+    package func setBridgeNetworkLister(_ lister: any BridgeNetworkLister) {
+        self.installedBridgeNetworkLister = lister
     }
 
     /// Initialize the network manager and backends
@@ -542,17 +585,20 @@ public actor NetworkManager {
     }
 
     /// List all networks
-    public func listNetworks() async -> [NetworkMetadata] {
+    ///
+    /// Throws rather than returning a short list. A WireGuard-backend failure
+    /// swallowed by `try?` turns a real failure into a confident report of a
+    /// clean host, which is the report that hides a leak. gascan maps a thrown
+    /// failure to `command_io`; it has no way to see a silently short list.
+    public func listNetworks() async throws -> [NetworkMetadata] {
         var networks: [NetworkMetadata] = []
 
         if let backend = vmnetBackend {
             networks.append(contentsOf: await backend.listNetworks())
         }
 
-        if let backend = wireGuardBackend {
-            if let wgNetworks = try? await backend.listNetworks() {
-                networks.append(contentsOf: wgNetworks)
-            }
+        if let lister = bridgeNetworkLister {
+            networks.append(contentsOf: try await lister.listNetworks())
         }
 
         // Add null driver networks from StateStore
@@ -585,7 +631,11 @@ public actor NetworkManager {
     }
 
     /// Resolve network ID from short ID or name
-    public func resolveNetworkID(_ idOrName: String) async -> String? {
+    ///
+    /// Throws for the same reason `listNetworks()` does: the prefix match below
+    /// is a listing, and a swallowed backend failure here would report "no such
+    /// network" for a network that exists.
+    public func resolveNetworkID(_ idOrName: String) async throws -> String? {
         // Try exact name match first
         if let network = await getNetworkByName(name: idOrName) {
             return network.id
@@ -597,7 +647,7 @@ public actor NetworkManager {
         }
 
         // Try prefix match
-        let allNetworks = await listNetworks()
+        let allNetworks = try await listNetworks()
         let matches = allNetworks.filter { $0.id.hasPrefix(idOrName) }
 
         if matches.count == 1 {

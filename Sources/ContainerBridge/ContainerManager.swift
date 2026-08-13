@@ -2358,7 +2358,7 @@ public actor ContainerManager {
 
                 do {
                     // Resolve network name/ID to actual network ID
-                    if let resolvedNetworkID = await networkManager.resolveNetworkID(targetNetwork) {
+                    if let resolvedNetworkID = try await networkManager.resolveNetworkID(targetNetwork) {
                         let containerName = info.name ?? String(dockerID.prefix(12))
                         let attachment = try await networkManager.attachContainerToNetwork(
                             containerID: dockerID,

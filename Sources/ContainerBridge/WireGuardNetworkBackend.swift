@@ -22,6 +22,11 @@ import ArcaIP
 /// - ~1ms latency (kernel-space routing)
 /// - Single kernel-space routing decision per packet
 /// - No vsock relay overhead (direct vmnet UDP)
+/// The bridge-network source `NetworkManager.listNetworks()` reads in
+/// production. The conformance is empty: `listNetworks()` below already has the
+/// signature the protocol asks for.
+extension WireGuardNetworkBackend: BridgeNetworkLister {}
+
 public actor WireGuardNetworkBackend {
     private let logger: Logger
     private let stateStore: StateStore

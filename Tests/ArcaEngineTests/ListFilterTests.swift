@@ -54,6 +54,63 @@ final class ListFilterTests: XCTestCase {
         )
     }
 
+    /// The network half of the same rule. `listNetworks()` swallowed a
+    /// WireGuard-backend failure with `try?` and returned the networks it had
+    /// managed to collect, so a backend that could not answer read to gascan as
+    /// a host with no bridge networks -- the answer that hides a leak instead of
+    /// reporting one.
+    ///
+    /// Two-sided for the reason the container test above is. Asserting only
+    /// that the signature says `throws` would pass against the unfixed body the
+    /// moment someone wrote `throws` without deleting the `try?`, and asserting
+    /// only that the failing lister throws would pass against a `listNetworks()`
+    /// that threw no matter what. Both mutations were run against this test, and
+    /// `swift test --filter ArcaEngineTests` reported `Executed 37 tests, with 1
+    /// failure` for each:
+    ///
+    /// - the append put back to `if let wgNetworks = try? await
+    ///   lister.listNetworks()` -> `listNetworks() returned 0 networks instead
+    ///   of reporting the backend failure`
+    /// - `throw NetworkManagerError.networkNotFound(...)` as the first statement
+    ///   of `listNetworks()` -> `caught error: "network guard-proving mutation
+    ///   not found"`
+    func testListNetworksReportsABackendFailureRatherThanAShortList() async throws {
+        let failing = SandboxEngineService.forTesting().networkManager
+        await failing.setBridgeNetworkLister(StubBridgeLister.failing)
+
+        do {
+            let swallowed = try await failing.listNetworks()
+            XCTFail(
+                "listNetworks() returned \(swallowed.count) networks instead of "
+                    + "reporting the backend failure"
+            )
+        } catch is BridgeBackendUnreachable {
+            // The backend's own error reached the caller, which is the point.
+        }
+
+        // The other side: the same seam, a lister that answers. Without this,
+        // a `listNetworks()` that threw no matter what would pass the half above.
+        let working = SandboxEngineService.forTesting().networkManager
+        await working.setBridgeNetworkLister(StubBridgeLister.listing([Self.probeNetwork]))
+
+        let networks = try await working.listNetworks()
+        XCTAssertEqual(
+            networks.map(\.name),
+            ["probe-bridge"],
+            "listNetworks() must return what the bridge lister reports"
+        )
+    }
+
+    /// The one bridge network the succeeding half of the test above expects
+    /// back, so the assertion is an equality rather than a non-emptiness check.
+    private static let probeNetwork = NetworkMetadata(
+        id: String(repeating: "c", count: 64),
+        name: "probe-bridge",
+        driver: "bridge",
+        subnet: "172.18.0.0/16",
+        gateway: "172.18.0.1"
+    )
+
     /// Container names in a stable order. `listContainers` maps over
     /// `containers.values`, and a Dictionary's iteration order is not
     /// guaranteed, so an order-sensitive assertion would flake.
@@ -140,5 +197,36 @@ final class ListFilterTests: XCTestCase {
             stateStore: stateStore,
             logger: logger
         )
+    }
+}
+
+/// The error a failing bridge backend reports.
+///
+/// At file scope, not nested inside `ListFilterTests`, and not nested inside
+/// `StubBridgeLister` either. MEASURED: nested, `catch is
+/// StubBridgeLister.BackendUnreachable` crashed the test binary --
+/// `swift test --filter ArcaEngineTests` reported `exited with unexpected
+/// signal code 11`, and driving the one test straight through `xctest` exited
+/// 139 on three runs out of three, faulting in `lookUpImpOrForward` in libobjc
+/// reached from that `catch` (`ListFilterTests.swift:82:17` in the backtrace).
+/// Moving these two declarations out, with nothing else changed, made the same
+/// test pass.
+struct BridgeBackendUnreachable: Error {}
+
+/// A bridge-network source that either fails or answers. This is the seam the
+/// network test needs and the container tests did not: `NetworkManager`
+/// populates its real backend only inside `initialize()`, which also creates the
+/// default `host` network over vmnet and so cannot run in a unit test.
+struct StubBridgeLister: BridgeNetworkLister {
+    let result: Result<[NetworkMetadata], BridgeBackendUnreachable>
+
+    static let failing = StubBridgeLister(result: .failure(BridgeBackendUnreachable()))
+
+    static func listing(_ networks: [NetworkMetadata]) -> StubBridgeLister {
+        StubBridgeLister(result: .success(networks))
+    }
+
+    func listNetworks() async throws -> [NetworkMetadata] {
+        try result.get()
     }
 }
