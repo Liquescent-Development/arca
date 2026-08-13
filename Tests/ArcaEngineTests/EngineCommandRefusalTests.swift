@@ -134,6 +134,103 @@ final class EngineCommandRefusalTests: XCTestCase {
         )
     }
 
+    /// A manager that cannot initialize is a refusal, and no socket is bound.
+    ///
+    /// This is the milestone's fail-fast claim, and only a spawned binary can
+    /// hold it: the three `initialize()` calls in `run()` are unreachable from a
+    /// unit test, because `ContainerManager.initialize()` constructs a real
+    /// `Containerization.VmnetNetwork` -- a host resource, and the reason no
+    /// test in this target may call it.
+    ///
+    /// `VolumeManager.initialize()` is the seam that makes this testable at all.
+    /// It runs FIRST of the three, so a failure there stops the sequence before
+    /// anything reaches vmnet, on an entitled machine and an unentitled one
+    /// alike. It fails here because `<state-root>/volumes` is a symlink to
+    /// itself: `fileExists` follows it and reports false, so `initialize()`
+    /// tries to create the directory and the kernel refuses the loop. MEASURED
+    /// on this machine: `NSPOSIXErrorDomain Code=5` under
+    /// `NSCocoaErrorDomain Code=512`, with no privileges and no external path
+    /// involved.
+    ///
+    /// The socket assertion is the one that carries the ordering. MEASURED with
+    /// the three calls moved to after `EngineServer.start`:
+    /// `swift test --filter ArcaEngineTests` reported `Executed 60 tests, with 1
+    /// failure`, and that failure was the socket assertion ALONE -- the exit
+    /// status and the message assertion both still passed, because the engine
+    /// binds, then initialize throws, and a throw out of `run()` runs no
+    /// graceful shutdown, so the bound socket is left on disk. Exit status
+    /// cannot tell those two arrangements apart.
+    ///
+    /// MEASURED with the three calls deleted outright: three failures in this
+    /// one test, `exitedOnItsOwn` first, since the engine then serves.
+    func testAManagerThatCannotInitializeRefusesBeforeBindingTheSocket() throws {
+        let root = try temporaryRoot()
+        let kernel = root.appendingPathComponent("vmlinux")
+        try Data("k".utf8).write(to: kernel)
+        let layout = root.appendingPathComponent("vminit")
+        try OCILayoutFixture.write(
+            at: layout, reference: "arca-vminit:latest", payload: "the engine's init"
+        )
+
+        // Named for this run, so the refusal it produces names a directory no
+        // usage line and no other test could have mentioned.
+        let stateRoot = root.appendingPathComponent("state-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: stateRoot, withIntermediateDirectories: true)
+        let volumes = stateRoot.appendingPathComponent("volumes")
+        try FileManager.default.createSymbolicLink(
+            atPath: volumes.path, withDestinationPath: volumes.path
+        )
+
+        let socket = root.appendingPathComponent("e.sock")
+        let run = try runEngine(arguments: [
+            "--socket-path", socket.path,
+            "--state-root", stateRoot.path,
+            "--kernel-path", kernel.path,
+            "--vminit-layout", layout.path,
+        ])
+
+        XCTAssertTrue(
+            run.exitedOnItsOwn,
+            "an engine whose managers cannot initialize must exit, not serve; stderr: \(run.errorText)"
+        )
+        XCTAssertNotEqual(
+            run.status, 0,
+            "a manager that cannot initialize must be a non-zero exit; stderr: \(run.errorText)"
+        )
+
+        // Which failure it was. Without this the test passes on any refusal at
+        // all -- a bad kernel, a bad layout, a failure to reach `initialize()`
+        // whatsoever -- and would prove nothing about the initialize sequence.
+        //
+        // Read from the `Error: ` line and NOT from the whole of stderr, which
+        // is the trap this assertion started in. `VolumeManager.initialize()`
+        // logs `volumesBasePath=<state-root>/volumes` at info on its way IN, so
+        // `errorText.contains("volumes") && errorText.contains(<state root>)`
+        // is satisfied by the success path's own log line -- it would have held
+        // over an engine that initialized the volume manager fine and then died
+        // at `VmnetNetwork()`, which is a different claim entirely. Only
+        // ArgumentParser's terminal `Error: ` line carries the thrown error, and
+        // the vmnet failure's line ("failed to create vmnet network with status
+        // ...") names no path at all.
+        let errorLine = run.errorText
+            .split(separator: "\n")
+            .first { $0.hasPrefix("Error: ") }
+            .map(String.init) ?? ""
+        XCTAssertTrue(
+            errorLine.contains(volumes.lastPathComponent)
+                && errorLine.contains(stateRoot.lastPathComponent),
+            "the refusal must be the volume manager's own, naming the directory it "
+                + "could not create under a state root named microseconds ago; "
+                + "the Error line was \(errorLine.isEmpty ? "absent" : errorLine), "
+                + "full stderr: \(run.errorText)"
+        )
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: socket.path),
+            "the socket must bind only after every manager initializes, but \(socket.path) exists"
+        )
+    }
+
     // MARK: - Running the binary
 
     private struct EngineRun {

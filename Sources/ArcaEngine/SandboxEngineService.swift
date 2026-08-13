@@ -12,10 +12,13 @@ import SandboxEngineProto
 ///
 /// **In this build, one of the eleven is implemented: `Capabilities`.** The
 /// other ten answer `unsupported_capability` inside their response `oneof`.
-/// `Inspect` and `ListResources` joined that list deliberately rather than by
-/// omission -- see the note on each -- because this process does not call
-/// `initialize()` on any manager, and an uninitialised manager does not report
-/// "I cannot tell", it reports "nothing exists".
+/// `Inspect` and `ListResources` joined that list because, when they were
+/// written, this process called `initialize()` on no manager, and an
+/// uninitialised manager does not report "I cannot tell", it reports "nothing
+/// exists". `ArcaEngineCommand.run()` now initializes all three before it binds
+/// the socket, so that reason has expired: implementing the two is Tasks 7 and
+/// 8's work, and until then they answer `unsupported_capability` because they
+/// are unwritten, not because the state behind them is empty.
 public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvider {
     public let interceptors: Arca_Engine_V1_SandboxEngineServerInterceptorFactoryProtocol? = nil
 
@@ -106,11 +109,11 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     ///
     /// Unimplemented in this build, and that is a deliberate reversal.
     ///
-    /// An earlier revision answered from `ContainerManager`. Because this
-    /// process never calls `ContainerManager.initialize()` -- see the reasoning
-    /// in `arca-engine`'s `ArcaEngineCommand.run()` -- the only two writers of
-    /// `ContainerManager.containers` never run, so that implementation could
-    /// return exactly one answer: `absent`. `engine.proto`'s `InspectResponse`
+    /// An earlier revision answered from `ContainerManager`. Because the process
+    /// then called `ContainerManager.initialize()` on no manager, the only two
+    /// writers of `ContainerManager.containers` never ran, so that
+    /// implementation could return exactly one answer: `absent`.
+    /// `engine.proto`'s `InspectResponse`
     /// has three arms specifically so that "it is not there" stays
     /// distinguishable from "I could not tell", and those "demand opposite
     /// behaviour from a reconciler": on `absent` a consumer creates the
@@ -120,9 +123,10 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// `unsupported_capability` is the honest answer for a build that holds no
     /// loaded state. It costs the consumer nothing it was getting -- the
     /// previous answer carried no information -- and it cannot be mistaken for
-    /// an observation. The milestone that loads persisted state restores this
-    /// method along with the `Sandbox` translation in `EngineTranslation`,
-    /// which stays in the target, tested, for that purpose.
+    /// an observation. `ArcaEngineCommand.run()` now calls `initialize()` on all
+    /// three managers before it binds the socket, so the state is there; Task 7
+    /// restores this method along with the `Sandbox` translation in
+    /// `EngineTranslation`, which stays in the target, tested, for that purpose.
     func inspect(request: Arca_Engine_V1_InspectRequest) async -> Arca_Engine_V1_InspectResponse {
         Arca_Engine_V1_InspectResponse.with { $0.error = Self.notImplemented("Inspect") }
     }
@@ -246,10 +250,11 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// `engine.proto`'s contract for this method is "Every resource the engine
     /// holds, labelled or not", because a consumer's drift and leak detection
     /// depends on seeing the unlabelled ones. An earlier revision walked
-    /// `ContainerManager`, `VolumeManager` and `NetworkManager`; without
-    /// `initialize()` all three are permanently empty -- containers and volumes
-    /// have no loaded rows, and `NetworkManager.listNetworks()` reads two
-    /// backends that are both nil -- so it returned `[]` under every input. An
+    /// `ContainerManager`, `VolumeManager` and `NetworkManager`; with
+    /// `initialize()` called on none of them all three were permanently empty --
+    /// containers and volumes had no loaded rows, and
+    /// `NetworkManager.listNetworks()` read two backends that were both nil --
+    /// so it returned `[]` under every input. An
     /// empty `ResourceList` is not an error arm: it is a confident report of a
     /// clean host, which is precisely the report that hides a leak.
     ///

@@ -54,35 +54,21 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // path to connect if the directory itself is 0700.
         try createSocketParentDirectory(for: socketPath)
 
-        // Every path below comes from this one derivation, which the tests call
-        // too. Spelling the components out here a second time is what let the
-        // suite stay green while the engine's real image-store root changed:
-        // TestSupport held a hand-copy of these lines, so the tests exercised a
-        // replica of the wiring rather than the wiring. See EnginePaths.
-        // The kernel is not among them: it is a read-only input the engine is
-        // handed, not state the engine owns.
-        let paths = EnginePaths(stateRoot: inputs.stateRoot)
-
         // Every manager below is rooted in the state root this engine owns, and
         // that ownership is the design: a state root shared with a live
         // ArcaDaemon is the hazard EngineInputs records, and an image store
-        // shared with it is the one EnginePaths records. Nothing here is
-        // derived a second way.
+        // shared with it is the one EnginePaths records.
         //
-        // initialize() is still not called on any manager. It needs a live
-        // Containerization.VmnetNetwork alongside the kernel and the vminit
-        // image (ContainerBridge/ContainerManager.swift:246-278), and until it
-        // is called, Inspect and ListResources answer unsupported_capability --
-        // see the notes on each in SandboxEngineService. The managers are
-        // constructed and handed to the service regardless: the dependency edge
-        // they create is a property gascan's release gate measures.
-        let stateStore = try StateStore(
-            path: paths.stateDatabase.path,
+        // One factory, which the tests call too. Neither the paths nor which
+        // path reaches which constructor argument is spelt out here a second
+        // time: a hand-copy of these lines in TestSupport is what let the suite
+        // stay green while the engine's real image-store root changed. See
+        // EngineManagers.
+        let managers = try EngineManagers(
+            stateRoot: inputs.stateRoot,
+            kernelPath: inputs.kernelPath,
+            logLevel: logLevel,
             logger: logger
-        )
-        let imageManager = try ImageManager(
-            logger: logger,
-            imageStorePath: paths.imageStoreRoot
         )
 
         // Before any manager that resolves an init image. This is the second of
@@ -91,42 +77,35 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // into the shared store.
         _ = try await loadVminit(
             from: inputs.vminitLayout,
-            into: imageManager,
+            into: managers.imageManager,
             stateRoot: inputs.stateRoot,
             logger: logger
         )
 
-        let containerManager = ContainerManager(
-            imageManager: imageManager,
-            kernelPath: inputs.kernelPath.path,
-            imageStoreRoot: paths.imageStoreRoot,
-            layerCachePath: paths.layerCache,
-            stateStore: stateStore,
-            logger: logger
-        )
-        let config = ArcaConfig(
-            kernelPath: inputs.kernelPath.path,
-            socketPath: paths.socket.path,
-            logLevel: logLevel
-        )
+        // Order matters and mirrors ArcaDaemon: the vminit image must be in the
+        // store before ContainerManager.initialize() asks for it, and
+        // NetworkManager needs a ContainerManager to resolve containers.
+        //
+        // Running this at all is what a private state root bought. The restore
+        // loop inside ContainerManager.initialize() marks every container the
+        // StateStore records as `running` exited 137 and writes that back; over
+        // a root shared with a live ArcaDaemon that write orphaned the daemon's
+        // running VMs. Over this engine's own root the containers it rewrites
+        // are the ones that died with the previous instance of this engine,
+        // which is what crash recovery is for.
+        //
+        // A failure here propagates out of run() and the process exits
+        // non-zero. Nothing below binds a socket, so a client never reaches an
+        // engine that cannot act -- pinned by
+        // EngineCommandRefusalTests.testAManagerThatCannotInitializeRefusesBeforeBindingTheSocket,
+        // which drives this binary because these three calls are unreachable
+        // from a unit test: ContainerManager.initialize() constructs a real
+        // Containerization.VmnetNetwork.
+        try await managers.volumeManager.initialize()
+        try await managers.containerManager.initialize()
+        try await managers.networkManager.initialize()
 
-        let service = SandboxEngineService(
-            containerManager: containerManager,
-            volumeManager: VolumeManager(
-                volumesBasePath: paths.volumesRoot.path,
-                stateStore: stateStore,
-                logger: logger
-            ),
-            networkManager: NetworkManager(
-                config: config,
-                stateStore: stateStore,
-                containerManager: containerManager,
-                logger: logger
-            ),
-            imageManager: imageManager,
-            execManager: ExecManager(containerManager: containerManager, logger: logger),
-            logger: logger
-        )
+        let service = managers.makeService()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
         try await serve(service: service, group: group, logger: logger)

@@ -26,11 +26,13 @@ extension SandboxEngineService {
     /// The same service against a state root and kernel the caller names, so a
     /// test can assert on where the managers were actually rooted.
     ///
-    /// State-root paths come from `EnginePaths` -- the derivation `arca-engine`
-    /// itself calls -- and not from a copy of its `appendingPathComponent`
-    /// lines. The copy is what made this helper a replica of the wiring rather
-    /// than the wiring: while it stood, changing the engine's real image-store
-    /// root left the whole suite green.
+    /// The managers come from `EngineManagers` -- the one factory `arca-engine`
+    /// itself calls -- and not from a copy of its constructor calls. The copy is
+    /// what made this helper a replica of the wiring rather than the wiring:
+    /// while it stood, Task 1's review measured that swapping
+    /// `imageStoreRoot: paths.layerCache` in `ArcaEngineCommand` left the whole
+    /// suite green. See the measurement recorded on `EngineManagers` for what
+    /// the same swap costs now.
     ///
     /// The kernel is a parameter rather than an `EnginePaths` member for the
     /// same reason it is a separate CLI option: it is a read-only input the
@@ -40,48 +42,16 @@ extension SandboxEngineService {
     /// No defaults on either, in keeping with the rule the path parameters on
     /// `ContainerManager` follow: the no-argument overload above states the
     /// throwaway values it wants.
+    ///
+    /// Nothing here calls `EngineManagers`' managers' `initialize()`. That needs
+    /// a live `Containerization.VmnetNetwork`, which is a host resource and not
+    /// state-root-scoped; `arca-engine` is the only caller that asks for one.
     static func forTesting(stateRoot: URL, kernelPath: URL) -> SandboxEngineService {
-        let logger = Logger(label: "arca-engine-tests")
-        let paths = EnginePaths(stateRoot: stateRoot)
-
-        let stateStore = try! StateStore(
-            path: paths.stateDatabase.path,
-            logger: logger
-        )
-        let imageManager = try! ImageManager(
-            logger: logger,
-            imageStorePath: paths.imageStoreRoot
-        )
-        let containerManager = ContainerManager(
-            imageManager: imageManager,
-            kernelPath: kernelPath.path,
-            imageStoreRoot: paths.imageStoreRoot,
-            layerCachePath: paths.layerCache,
-            stateStore: stateStore,
-            logger: logger
-        )
-        let config = ArcaConfig(
-            kernelPath: kernelPath.path,
-            socketPath: paths.socket.path,
-            logLevel: "info"
-        )
-
-        return SandboxEngineService(
-            containerManager: containerManager,
-            volumeManager: VolumeManager(
-                volumesBasePath: paths.volumesRoot.path,
-                stateStore: stateStore,
-                logger: logger
-            ),
-            networkManager: NetworkManager(
-                config: config,
-                stateStore: stateStore,
-                containerManager: containerManager,
-                logger: logger
-            ),
-            imageManager: imageManager,
-            execManager: ExecManager(containerManager: containerManager, logger: logger),
-            logger: logger
-        )
+        try! EngineManagers(
+            stateRoot: stateRoot,
+            kernelPath: kernelPath,
+            logLevel: "info",
+            logger: Logger(label: "arca-engine-tests")
+        ).makeService()
     }
 }

@@ -39,7 +39,7 @@ final class ContainerBridgePathsTests: XCTestCase {
 
         let selected = service.containerManager.containerizationRoot()
         XCTAssertTrue(
-            selected.path.hasPrefix(root.path),
+            selected.path.hasPrefix(root.path + "/"),
             "the engine's image store must live under the state root it was given, got \(selected.path)"
         )
         XCTAssertFalse(
@@ -58,7 +58,7 @@ final class ContainerBridgePathsTests: XCTestCase {
 
         let cache = service.containerManager.layerCachePath
         XCTAssertTrue(
-            cache.path.hasPrefix(root.path),
+            cache.path.hasPrefix(root.path + "/"),
             "the engine's layer cache must live under the state root it was given, got \(cache.path)"
         )
         XCTAssertFalse(
@@ -78,9 +78,57 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// it is `validateEngineInputs`' job rather than this one's.
     func testNoEnginePathEscapesTheStateRoot() {
         let root = temporaryRoot()
-        let paths = EnginePaths(stateRoot: root)
 
-        for (name, path) in [
+        for (name, path) in Self.derivedPaths(under: root) {
+            XCTAssertTrue(
+                path.path.hasPrefix(root.path + "/"),
+                "\(name) must live under the state root, got \(path.path)"
+            )
+        }
+    }
+
+    /// Under the state root is not enough: they must also be different places.
+    ///
+    /// The containment test above, and the two through the wiring, are each
+    /// satisfied by every path collapsing onto one directory. MEASURED with
+    /// `EnginePaths.layerCache` set to `stateRoot/"images"`:
+    /// `swift test --filter ArcaEngineTests` reported `Executed 60 tests, with 1
+    /// failure`, and that one failure was this test -- the other six in this
+    /// file, and every other test in the target, passed over an engine whose
+    /// OverlayFS layer cache would be unpacking layers directly into the
+    /// Containerization content store, beside the blobs and the 512MB
+    /// initfs.ext4 (that size MEASURED on a real start; see Task 6's report).
+    ///
+    /// Pairwise on the derived values rather than a restatement of the
+    /// derivation: spelling `stateRoot/"layers"` out here again is the tautology
+    /// Task 1's review removed, and it would pass over a collapse it had itself
+    /// copied.
+    func testNoTwoEnginePathsNameTheSamePlace() {
+        let root = temporaryRoot()
+        let derived = Self.derivedPaths(under: root)
+
+        for (offset, first) in derived.enumerated() {
+            XCTAssertNotEqual(
+                first.path, root,
+                "\(first.name) must not be the state root itself, got \(first.path.path)"
+            )
+            for second in derived[(offset + 1)...] {
+                XCTAssertNotEqual(
+                    first.path, second.path,
+                    "\(first.name) and \(second.name) must not be the same path, "
+                        + "both are \(first.path.path)"
+                )
+            }
+        }
+    }
+
+    /// Every path `EnginePaths` derives, named. A listing of its members, which
+    /// is why it is not a second derivation: adding a member without adding it
+    /// here leaves that member unchecked by both tests above, and adding it here
+    /// with the wrong spelling does not compile.
+    private static func derivedPaths(under root: URL) -> [(name: String, path: URL)] {
+        let paths = EnginePaths(stateRoot: root)
+        return [
             ("imageStoreRoot", paths.imageStoreRoot),
             ("initfs", paths.initfs),
             ("vminitDigest", paths.vminitDigest),
@@ -88,12 +136,7 @@ final class ContainerBridgePathsTests: XCTestCase {
             ("stateDatabase", paths.stateDatabase),
             ("volumesRoot", paths.volumesRoot),
             ("socket", paths.socket),
-        ] {
-            XCTAssertTrue(
-                path.path.hasPrefix(root.path + "/"),
-                "\(name) must live under the state root, got \(path.path)"
-            )
-        }
+        ]
     }
 
     /// ContainerBridge's own contract, independent of the engine: a
