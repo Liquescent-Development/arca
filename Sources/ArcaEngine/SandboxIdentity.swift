@@ -15,7 +15,7 @@ public enum SandboxIdentity {
     /// Safe because ContainerBridge applies no container-name grammar
     /// validation, and because a sandbox id always contains a hyphen -- which
     /// keeps resolveContainerID from reading it as a hex short ID
-    /// (Sources/ContainerBridge/ContainerManager.swift:1930-1934).
+    /// (Sources/ContainerBridge/ContainerManager.swift:2005-2023).
     public static func containerName(forSandboxId id: String) -> String { id }
 
     /// Stored verbatim, echoed back, never interpreted. Deciding whether a

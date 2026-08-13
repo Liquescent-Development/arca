@@ -106,6 +106,18 @@ final class InspectTests: XCTestCase {
     /// drift, so a count is satisfied by one mapping with the two numbers
     /// transposed -- which is a different published port and a different
     /// reconciliation.
+    ///
+    /// The `state` assertion is not decoration and does not belong to the ports
+    /// finding. It is the SECOND status this file pins: the round-trip test
+    /// above seeds `created` and expects `.creating`, this row seeds `exited`
+    /// and expects `.stopped`. One asserted status is satisfied by a hardcoded
+    /// constant -- MEASURED, `sandbox.state = .creating` in place of the
+    /// `sandboxState(fromStatus:)` call left `Executed 71 tests, with 0
+    /// failures`, so nothing proved the call site called it. Two statuses
+    /// mapping to two cases cannot be met by any constant. The consumer
+    /// switches on this field directly
+    /// (crates/gascan-arca/src/translate.rs:399-409), so a wrong case sends a
+    /// reconciler at the wrong action.
     func testASandboxPublishingEightyEightyToEightyReportsThatOneMapping() async throws {
         let managers = try Self.managers()
         try await Self.seed(
@@ -131,6 +143,11 @@ final class InspectTests: XCTestCase {
             "the stored binding 8080->80 is one mapping; an empty list reads as "
                 + "'publishes nothing' and a transposed one reads as a different port"
         )
+        XCTAssertEqual(
+            sandbox.state, .stopped,
+            "this row is seeded exited, and the round-trip test seeds created; a "
+                + "hardcoded state satisfies one of the two and cannot satisfy both"
+        )
     }
 
     /// `repeated` is ordered on the wire, and the bindings come out of a
@@ -138,9 +155,19 @@ final class InspectTests: XCTestCase {
     /// (`ContainerManager.swift:959`). Unsorted, two Inspects of one unchanged
     /// sandbox can report its ports in different orders.
     ///
-    /// Sorted by guest port, then host port, so both seeds below are pinned by a
-    /// single expected list rather than by a set comparison -- a set comparison
-    /// is exactly the assertion that cannot see the nondeterminism.
+    /// **Six bindings, not two, and the count is the guard.** A random order
+    /// matches the sorted one with probability 1/N!, so a two-binding fixture
+    /// catches a missing sort only about half the time. MEASURED with the sort
+    /// removed, `swift test --filter …/testPortsAreReportedInAStableOrder…`:
+    /// two bindings gave **3 RED / 10 runs**, six bindings gave **10 RED / 10**.
+    /// With the sort restored, six bindings gave **10 GREEN / 10**. The earlier
+    /// two-binding form of this test was a guard that missed 70% of the time.
+    ///
+    /// The host ports deliberately do not ascend with the guest ports
+    /// (62222, 8080, 8443, 13000, 25432, 19090 against 22, 80, 443, 3000, 5432,
+    /// 9090), so a sort keyed on the host port produces a different list and
+    /// fails. Sorting by `(guestPort, hostPort)` is the ordering asserted, not
+    /// merely "some deterministic ordering".
     func testPortsAreReportedInAStableOrderRatherThanDictionaryOrder() async throws {
         let managers = try Self.managers()
         try await Self.seed(
@@ -151,8 +178,12 @@ final class InspectTests: XCTestCase {
             status: "exited",
             labels: SandboxIdentity.labels(from: Self.ownerLabels),
             portBindings: [
-                "443/tcp": [PortBinding(hostPort: "8443")],
+                "5432/tcp": [PortBinding(hostPort: "25432")],
                 "80/tcp": [PortBinding(hostPort: "8080")],
+                "9090/tcp": [PortBinding(hostPort: "19090")],
+                "22/tcp": [PortBinding(hostPort: "62222")],
+                "443/tcp": [PortBinding(hostPort: "8443")],
+                "3000/tcp": [PortBinding(hostPort: "13000")],
             ]
         )
         try await managers.containerManager.loadPersistedState()
@@ -162,12 +193,28 @@ final class InspectTests: XCTestCase {
             sandbox.ports,
             [
                 Arca_Engine_V1_PortMapping.with {
+                    $0.hostPort = 62222
+                    $0.guestPort = 22
+                },
+                Arca_Engine_V1_PortMapping.with {
                     $0.hostPort = 8080
                     $0.guestPort = 80
                 },
                 Arca_Engine_V1_PortMapping.with {
                     $0.hostPort = 8443
                     $0.guestPort = 443
+                },
+                Arca_Engine_V1_PortMapping.with {
+                    $0.hostPort = 13000
+                    $0.guestPort = 3000
+                },
+                Arca_Engine_V1_PortMapping.with {
+                    $0.hostPort = 25432
+                    $0.guestPort = 5432
+                },
+                Arca_Engine_V1_PortMapping.with {
+                    $0.hostPort = 19090
+                    $0.guestPort = 9090
                 },
             ],
             "ports must come back in guest-port order every time, not in whatever "
@@ -263,6 +310,66 @@ final class InspectTests: XCTestCase {
             error.message,
             "container \(Self.taggedSandboxID) carries no gascan owner labels, so this "
                 + "engine cannot assert it is the sandbox that was asked for"
+        )
+    }
+
+    /// I5's other half: the labels that ARE present are echoed, not invented.
+    ///
+    /// The brief's ruling is "labels present -> return the Sandbox with them and
+    /// let the consumer judge", and `inspect`'s doc comment states it as a
+    /// behavioural claim. Nothing pinned it: every other fixture reaching the
+    /// sandbox arm carries `gascan` / `ownedSandboxID` and is inspected under
+    /// `ownedSandboxID`, so stored labels and labels fabricated from the request
+    /// were indistinguishable. MEASURED -- replacing the echo with
+    /// `managedBy = "gascan"; sandboxID = sandboxId` left `Executed 71 tests,
+    /// with 0 failures`.
+    ///
+    /// What that fabrication costs is worse than either finding this task fixed.
+    /// A container labelled for sandbox B, inspected as sandbox A, would report
+    /// `owner.sandbox_id = A`; the consumer's `sandbox_id != id` check
+    /// (crates/gascan-arca/src/translate.rs:421-425) never fires, and it adopts
+    /// and reconciles another sandbox's container.
+    ///
+    /// **Both label fields differ from any plausible fabrication, deliberately.**
+    /// `managed_by` is a tool this engine has never heard of, because the
+    /// contract says the engine stores labels verbatim and NEVER INTERPRETS THEM
+    /// (engine.proto:143-148) -- and because the consumer classifies a
+    /// `managed_by` that is not `gascan` as `Foreign` on its own
+    /// (crates/gascan-core/src/runtime.rs:100). An engine that hardcoded
+    /// `"gascan"` would report another tool's container as gascan's and delete
+    /// that classification before the consumer could make it.
+    ///
+    /// The two ids asserted here are `web-a1b2c3d4e5f6` (the envelope, which is
+    /// the REQUEST's) and `other-e1f2a3b4c5d6` (the label, which is the STORE's).
+    /// Neither is a substring of the other, and the test's whole point is that
+    /// they must not be equal.
+    func testAContainerLabelledForAnotherSandboxIsReturnedWithTheLabelsTheStoreHolds() async throws {
+        let managers = try Self.managers()
+        try await Self.seed(
+            into: managers.stateStore,
+            id: Self.mismatchedContainerID,
+            // The NAME is the sandbox id that will be asked for; the LABEL below
+            // names a different one. That is the collision under test.
+            name: Self.ownedSandboxID,
+            image: Self.workspaceRepository + "@sha256:" + Self.ownedDigestHex,
+            status: "exited",
+            labels: SandboxIdentity.labels(from: Self.mismatchedOwnerLabels),
+            portBindings: [:]
+        )
+        try await managers.containerManager.loadPersistedState()
+
+        let sandbox = try await Self.inspectedSandbox(managers, Self.ownedSandboxID)
+        XCTAssertEqual(
+            sandbox.owner, Self.mismatchedOwnerLabels,
+            "the owner must be the labels the store holds, verbatim; labels built "
+                + "from the request would make an ownership mismatch invisible to "
+                + "the only component allowed to judge it"
+        )
+        XCTAssertEqual(
+            sandbox.sandboxID, Self.ownedSandboxID,
+            "the envelope still answers the id that was asked for -- it is the "
+                + "owner labels that disagree with it, and that disagreement is "
+                + "the whole signal the consumer acts on"
         )
     }
 
@@ -451,6 +558,7 @@ final class InspectTests: XCTestCase {
     private static let ownedContainerID = String(repeating: "a", count: 64)
     private static let foreignContainerID = String(repeating: "b", count: 64)
     private static let taggedContainerID = String(repeating: "c", count: 64)
+    private static let mismatchedContainerID = String(repeating: "d", count: 64)
 
     /// `SandboxIdentity.containerName(forSandboxId:)` is the identity function,
     /// so these are both the sandbox ids and the seeded container names. Each
@@ -468,6 +576,14 @@ final class InspectTests: XCTestCase {
     private static let ownerLabels = Arca_Engine_V1_OwnerLabels.with {
         $0.managedBy = "gascan"
         $0.sandboxID = ownedSandboxID
+    }
+
+    /// Labels that agree with nothing the engine could invent: a `managed_by`
+    /// this engine has never heard of, and a `sandbox_id` naming a sandbox other
+    /// than the one the request asks for.
+    private static let mismatchedOwnerLabels = Arca_Engine_V1_OwnerLabels.with {
+        $0.managedBy = "another-tool"
+        $0.sandboxID = "other-e1f2a3b4c5d6"
     }
 
     /// The engine's own managers over a throwaway state root -- the production
