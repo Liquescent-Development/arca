@@ -2,7 +2,7 @@ import ContainerBridge
 import DockerAPI
 import Foundation
 import Logging
-import Testing
+import XCTest
 
 /// `docker network prune` reads `getNetworkAttachments` as its "skip networks
 /// with active containers" gate, and then deletes on the answer.
@@ -15,30 +15,41 @@ import Testing
 /// assertion lives here -- in the target that already has both `DockerAPI` and
 /// `ContainerBridge` -- rather than being quietly downgraded to the weaker one.
 ///
-/// Not `@Suite(.serialized)` and no daemon: every test below runs against a
+/// No shared state and no daemon: every test below builds its own fixture over a
 /// fresh state root under `NSTemporaryDirectory()` and starts no VM.
-@Suite("Network prune attachment gate")
-struct NetworkPruneGateTests {
+///
+/// XCTest and not swift-testing, unlike the rest of `ArcaTests`. Gas Can's
+/// release gate -- `scripts/build-arca-engine.sh` -- is the only thing that runs
+/// these tests, and it invokes SwiftPM with `--disable-swift-testing`, so a
+/// `@Test` here is a test nothing executes. That flag is not incidental to the
+/// gate: in release configuration SwiftPM launches the swift-testing runner
+/// through an executable target, and Arca's `Arca` executable is an
+/// ArgumentParser command that rejects the runner's options.
+///
+/// The `MEASURED` blocks on the tests below were recorded before that
+/// conversion, so the failure output they quote is swift-testing's (`Test run
+/// with N tests in 1 suite failed ...`). The mutations and the tests that
+/// caught them are unchanged; only the runner printing the result is.
+final class NetworkPruneGateTests: XCTestCase {
     /// The control. Without it the survival test below proves nothing: a prune
     /// that never deletes anything -- because the network was default, or
     /// filtered out, or `deleteNetwork` refused it -- would pass the survival
     /// assertion just as well as a working gate.
-    @Test("An unused network is pruned, so the survival assertion has teeth")
-    func unusedNetworkIsPruned() async throws {
+    func testAnUnusedNetworkIsPrunedSoTheSurvivalAssertionHasTeeth() async throws {
         let fixture = try await PruneFixture()
         let networkID = try await fixture.createPrunableNetwork()
 
         let result = await fixture.handlers.handlePruneNetworks()
 
         guard case .success(let response) = result else {
-            Issue.record("prune failed on a network with no attachments: \(result)")
+            XCTFail("prune failed on a network with no attachments: \(result)")
             return
         }
-        #expect(response.networksDeleted == ["probe-prune"])
+        XCTAssertEqual(response.networksDeleted, ["probe-prune"])
 
         let remaining = try await fixture.networkManager.listNetworks()
-        #expect(
-            !remaining.contains { $0.id == networkID },
+        XCTAssertFalse(
+            remaining.contains(where: { $0.id == networkID }),
             "the pruned network must be gone from the store"
         )
     }
@@ -65,8 +76,7 @@ struct NetworkPruneGateTests {
     /// the thing under test is `handlePruneNetworks`' use of the answer, so the
     /// answer is an input; there the thing under test was the derivation that
     /// produces it, which a stub would have replaced.
-    @Test("A network with an attached container is not pruned")
-    func attachedNetworkIsNotPruned() async throws {
+    func testANetworkWithAnAttachedContainerIsNotPruned() async throws {
         let fixture = try await PruneFixture()
         let networkID = try await fixture.createPrunableNetwork()
         await fixture.networkManager.setNetworkAttachmentSource(
@@ -76,17 +86,17 @@ struct NetworkPruneGateTests {
         let result = await fixture.handlers.handlePruneNetworks()
 
         guard case .success(let response) = result else {
-            Issue.record("prune failed on a healthy attachment read: \(result)")
+            XCTFail("prune failed on a healthy attachment read: \(result)")
             return
         }
-        #expect(
+        XCTAssertTrue(
             response.networksDeleted.isEmpty,
             "prune deleted probe-prune despite a container being attached to it: \(result)"
         )
 
         let remaining = try await fixture.networkManager.listNetworks()
-        #expect(
-            remaining.contains { $0.id == networkID },
+        XCTAssertTrue(
+            remaining.contains(where: { $0.id == networkID }),
             "the in-use network must still exist after the prune"
         )
     }
@@ -127,8 +137,7 @@ struct NetworkPruneGateTests {
     /// 0.013 seconds with 1 issue`, this test alone. Nothing in
     /// `ArcaEngineTests` can see that mutation; this suite is the only thing
     /// standing between it and a released deletion.
-    @Test("An in-use network survives a partial store failure during prune")
-    func inUseNetworkSurvivesAttachmentReadFailure() async throws {
+    func testAnInUseNetworkSurvivesAPartialStoreFailureDuringPrune() async throws {
         let fixture = try await PruneFixture()
         let networkID = try await fixture.createPrunableNetwork()
         await fixture.networkManager.setNetworkAttachmentSource(FailingAttachmentSource())
@@ -136,7 +145,7 @@ struct NetworkPruneGateTests {
         let result = await fixture.handlers.handlePruneNetworks()
 
         guard case .failure = result else {
-            Issue.record(
+            XCTFail(
                 "prune deleted probe-prune despite being unable to read its attachments: \(result)"
             )
             return
@@ -149,8 +158,8 @@ struct NetworkPruneGateTests {
         // StateStore and never consults the attachment source, so the source
         // the test broke cannot answer this.
         let remaining = try await fixture.networkManager.listNetworks()
-        #expect(
-            remaining.contains { $0.id == networkID },
+        XCTAssertTrue(
+            remaining.contains(where: { $0.id == networkID }),
             "the in-use network must still exist after a failed attachment read"
         )
     }
