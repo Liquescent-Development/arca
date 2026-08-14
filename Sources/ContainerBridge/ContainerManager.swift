@@ -1140,10 +1140,17 @@ public actor ContainerManager {
         )
 
         // Create container directory path (needed for both unpacking and temp rootfs)
-        // Use default Apple containerization store path
-        let appleStorePath = NSString(string: "~/Library/Application Support/com.apple.containerization").expandingTildeInPath
-        let containerRoot = URL(fileURLWithPath: appleStorePath).appendingPathComponent("containers")
-        let containerPath = containerRoot.appendingPathComponent(dockerID)
+        //
+        // Derived from `manager`'s own store rather than spelt out, because the
+        // directory `manager.create(_:image:rootfs:)` writes into is not ours to
+        // choose: it opens `containerRoot/<id>/bootlog.log`
+        // (containerization/Sources/Containerization/ContainerManager.swift:317),
+        // `containerRoot` is `imageStore.path/"containers"` (ibid.:35-37), and
+        // `imageStore` is `ImageStore(path: root)` for whatever `root:`
+        // `initialize()` passed (ibid.:139-140). Naming Apple's shared store here
+        // agreed with that only while `root:` happened to be Apple's shared
+        // store, and disagreed for every other state root.
+        let containerPath = containerDirectory(in: manager, dockerID: dockerID)
 
         // Ensure container directory exists (base manager expects this)
         try FileManager.default.createDirectory(at: containerPath, withIntermediateDirectories: true)
@@ -4180,16 +4187,39 @@ public actor ContainerManager {
 
     // MARK: - Filesystem Operations
 
+    /// The directory Containerization keeps container `dockerID`'s files in.
+    ///
+    /// One derivation for the two places that need it -- `createNativeContainer`,
+    /// which must create this directory before `manager.create(_:image:rootfs:)`
+    /// opens `bootlog.log` inside it, and `getRootfsPath` below. They disagreed
+    /// until now, the create path naming Apple's shared store outright while
+    /// this one followed the manager.
+    ///
+    /// It takes the manager instead of reading `nativeManager` so that neither
+    /// caller can pass a root: the store is read off the same value the create
+    /// call is made against, which is the only store Containerization will look
+    /// in. It stays `private` deliberately: `createNativeContainer` guards on
+    /// `nativeManager`, which `initialize()` sets only after building a kernel
+    /// and a VM, so no test in this repository can reach the call site -- and a
+    /// derivation a test *could* call would let a green suite stand for a call
+    /// site nothing executes. The call-site proof is Gas Can's live `Create`
+    /// test, not anything in this repository.
+    private func containerDirectory(
+        in manager: Containerization.ContainerManager,
+        dockerID: String
+    ) -> URL {
+        manager.imageStore.path
+            .appendingPathComponent("containers")
+            .appendingPathComponent(dockerID)
+    }
+
     /// Get the path to a container's rootfs.ext4 file
     /// This follows Apple's Containerization framework convention: {imageStore.path}/containers/{id}/rootfs.ext4
     private func getRootfsPath(dockerID: String) -> URL? {
         guard let manager = nativeManager else {
             return nil
         }
-        // Apple's ContainerManager stores containers at: imageStore.path/containers/{id}/rootfs.ext4
-        return manager.imageStore.path
-            .appendingPathComponent("containers")
-            .appendingPathComponent(dockerID)
+        return containerDirectory(in: manager, dockerID: dockerID)
             .appendingPathComponent("rootfs.ext4")
     }
 

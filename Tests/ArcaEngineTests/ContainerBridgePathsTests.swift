@@ -207,4 +207,112 @@ final class ContainerBridgePathsTests: XCTestCase {
 
         XCTAssertEqual(manager.storeRoot, storePath)
     }
+
+    // MARK: - Source-text guards on the create path
+    //
+    // READ THIS BEFORE TRUSTING THE TWO TESTS BELOW.
+    //
+    // They read `Sources/ContainerBridge/ContainerManager.swift` as text. They
+    // execute none of it, and they prove nothing about what
+    // `createNativeContainer` does at runtime.
+    //
+    // They are text because the runtime is out of reach, not because text was
+    // preferred. `createNativeContainer` opens with
+    // `guard var manager = nativeManager`, and `nativeManager` is assigned only
+    // by `initialize()`, which builds a `Kernel` and a
+    // `Containerization.VmnetNetwork` -- so the call site needs a kernel image
+    // and a VM, and this target has neither. Extracting the derivation into
+    // something a test could call instead would prove the derivation and still
+    // not prove the call site used it, which is the shape this project has
+    // shipped repeatedly: a well-formed test over a function, and nothing
+    // asserting that the caller called it.
+    //
+    // The honest call-site instrument is Gas Can's live `Create` test, which is
+    // Task 13's and does not exist yet. These two are a tripwire under the
+    // revert, not a substitute for it.
+
+    /// This file must never name Apple's shared containerization store.
+    ///
+    /// `createNativeContainer` used to build the container directory under a
+    /// hardcoded `~/Library/Application Support/com.apple.containerization`
+    /// while `getRootfsPath` derived the same directory from
+    /// `manager.imageStore.path`. For ArcaDaemon the two agreed, because
+    /// `ArcaDaemon.swift:178` passes `imageStoreRoot: ImageStore.default.path`
+    /// and that *is* Apple's store. For an engine given any other state root
+    /// they did not: Containerization opens
+    /// `imageStore.path/containers/<id>/bootlog.log`
+    /// (containerization/Sources/Containerization/ContainerManager.swift:317,
+    /// :35-37, :139-140), so the bridge created a directory Containerization
+    /// never looked in.
+    ///
+    /// WHAT THIS PROVES: the literal is gone from this file.
+    ///
+    /// WHAT IT DOES NOT PROVE, and what can satisfy it while the bug is back:
+    /// a file that hardcodes a *different* wrong root (`~/.arca/containers`,
+    /// say); a file where `containerDirectory(in:dockerID:)` is correct but
+    /// `createNativeContainer` no longer calls it; any change at all to the
+    /// runtime behaviour of the create path. It also forbids the string in
+    /// comments, deliberately -- a comment asserting the wrong store is how the
+    /// old derivation stayed plausible for as long as it did.
+    func testTheContainerBridgeCreatePathNeverNamesApplesSharedStore() throws {
+        let source = try Self.containerManagerSource()
+
+        XCTAssertFalse(
+            source.contains("com.apple.containerization"),
+            "Sources/ContainerBridge/ContainerManager.swift must not name Apple's "
+                + "shared containerization store: the store a container's directory "
+                + "goes in is whichever root initialize() handed Containerization, "
+                + "and naming Apple's agrees with that only for ArcaDaemon"
+        )
+    }
+
+    /// `<store>/containers/<id>` must be derived in one place in this file.
+    ///
+    /// Two spellings drifting apart is the defect itself, not a stylistic
+    /// concern: the create path and `getRootfsPath` each derived this directory
+    /// and only one of them was moved when `ContainerManager` gained an image
+    /// store root.
+    ///
+    /// Exactly one, not at most one: `at most` passes vacuously over a file
+    /// where the derivation was respelt (`appending(path:)`) and duplicated
+    /// again in the new spelling.
+    ///
+    /// WHAT THIS PROVES: the token `appendingPathComponent("containers")` occurs
+    /// once in this file.
+    ///
+    /// WHAT IT DOES NOT PROVE: that the one occurrence is rooted at the
+    /// manager's store, that either caller reaches it, or anything about
+    /// runtime. A single occurrence rooted at a hardcoded path satisfies it --
+    /// that is what the test above is for, and neither test covers the other's
+    /// gap at runtime.
+    func testTheContainersDirectoryIsDerivedInExactlyOnePlace() throws {
+        let source = try Self.containerManagerSource()
+
+        XCTAssertEqual(
+            source.components(separatedBy: #".appendingPathComponent("containers")"#).count - 1,
+            1,
+            "the <store>/containers/<id> join must be derived once, in "
+                + "containerDirectory(in:dockerID:), and reached by every caller "
+                + "that needs it"
+        )
+    }
+
+    /// The ContainerBridge source both tests above read.
+    ///
+    /// Located from `#filePath` rather than from the test bundle, because the
+    /// bundle holds no sources. A missing or unreadable file fails the test and
+    /// is never skipped: a guard that quietly passes when it cannot find what it
+    /// guards is worse than no guard, and these two are already the weaker half
+    /// of this task's evidence.
+    private static func containerManagerSource(
+        testFile: StaticString = #filePath
+    ) throws -> String {
+        let repoRoot = URL(fileURLWithPath: "\(testFile)")
+            .deletingLastPathComponent()  // ArcaEngineTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // repo root
+        let source = repoRoot
+            .appendingPathComponent("Sources/ContainerBridge/ContainerManager.swift")
+        return try String(contentsOf: source, encoding: .utf8)
+    }
 }
