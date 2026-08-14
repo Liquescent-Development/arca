@@ -67,6 +67,46 @@ final class ContainerBridgePathsTests: XCTestCase {
         )
     }
 
+    /// `ContainerLogManager` derived `~/Library/Application Support/
+    /// com.apple.arca/logs` for itself and took no root at all, so every
+    /// engine -- whatever state root it was given -- wrote its containers'
+    /// stdout and stderr into ArcaDaemon's one shared directory, and deleted
+    /// out of it on remove.
+    ///
+    /// Read through `service.containerManager.logManager`, the same object the
+    /// create path, the reload path and `removeLogs` use, so this is the
+    /// engine's real wiring and not a restatement of `EnginePaths`.
+    func testTheEngineContainerLogsAreUnderItsStateRootAndNotTheSharedOne() {
+        let root = temporaryRoot()
+        let service = SandboxEngineService.forTesting(
+            stateRoot: root, kernelPath: Self.externalKernel
+        )
+
+        let logDir = service.containerManager.logManager.containerLogDir(dockerID: "c0ffee")
+        XCTAssertTrue(
+            logDir.path.hasPrefix(root.path + "/"),
+            "the engine's container logs must live under the state root it was "
+                + "given, got \(logDir.path)"
+        )
+        XCTAssertFalse(
+            logDir.path.contains("com.apple.arca"),
+            "the engine's container logs must not resolve into ArcaDaemon's "
+                + "shared log store, got \(logDir.path)"
+        )
+        // Under the state root is not enough. The log root is a sibling of the
+        // image store, not a child of it: the engine must not write its own
+        // files into the directory Containerization owns, and passing
+        // `imageStoreRoot` where `logsRoot` belongs satisfies the containment
+        // check above on its own.
+        XCTAssertFalse(
+            logDir.path.hasPrefix(
+                service.containerManager.containerizationRoot().path + "/"
+            ),
+            "the engine's container logs must not be written inside the image "
+                + "store it hands Containerization, got \(logDir.path)"
+        )
+    }
+
     /// Nothing the engine derives escapes the state root. The two tests above
     /// cover the image store and the layer cache through the wiring; this
     /// covers the rest of `EnginePaths` -- the state database, the volumes
@@ -135,6 +175,7 @@ final class ContainerBridgePathsTests: XCTestCase {
             ("layerCache", paths.layerCache),
             ("stateDatabase", paths.stateDatabase),
             ("volumesRoot", paths.volumesRoot),
+            ("logsRoot", paths.logsRoot),
             ("socket", paths.socket),
         ]
     }
@@ -152,11 +193,13 @@ final class ContainerBridgePathsTests: XCTestCase {
         )
         let imageStoreRoot = root.appendingPathComponent("images")
         let layerCachePath = root.appendingPathComponent("layers")
+        let logRoot = root.appendingPathComponent("logs")
         let manager = ContainerManager(
             imageManager: try ImageManager(logger: logger, imageStorePath: imageStoreRoot),
             kernelPath: root.appendingPathComponent("vmlinux").path,
             imageStoreRoot: imageStoreRoot,
             layerCachePath: layerCachePath,
+            logRoot: logRoot,
             stateStore: stateStore,
             logger: logger
         )
@@ -167,6 +210,66 @@ final class ContainerBridgePathsTests: XCTestCase {
         // reported "Executed 2 tests, with 0 failures".
         XCTAssertEqual(manager.containerizationRoot(), imageStoreRoot)
         XCTAssertEqual(manager.layerCachePath, layerCachePath)
+
+        // The log root through `logManager.containerLogDir(dockerID:)` -- the
+        // resolution the create path (`createLogWriters`), the reload path and
+        // `removeLogs` all go through -- rather than through a stored property
+        // on either type. This is the call-site assertion for the log root:
+        // `ContainerManager` takes a root and builds the `ContainerLogManager`
+        // itself, so a manager that ignored `logRoot:` and rebuilt Application
+        // Support here would fail this line. Handing a ready-made
+        // `ContainerLogManager` in would have made this true by construction.
+        XCTAssertEqual(
+            manager.logManager.containerLogDir(dockerID: "c0ffee"),
+            logRoot.appendingPathComponent("c0ffee")
+        )
+    }
+
+    /// A `ContainerLogManager` writes and deletes under the root it was given,
+    /// and nowhere else.
+    ///
+    /// The assertion above reads the resolved path; this one drives the two
+    /// operations that use it, because the defect had both halves. Container
+    /// output went into `~/Library/Application Support/com.apple.arca/logs`
+    /// whatever root the engine owned, and `removeContainer` -- via
+    /// `ContainerManager.swift`'s `removeLogs` call -- deleted out of that same
+    /// shared directory, so a throwaway engine removing a sandbox deleted under
+    /// the operator's real log store.
+    ///
+    /// WHAT THIS PROVES: `createLogWriters` creates the container's log files
+    /// under the supplied root, and `removeLogs` removes that directory. Both
+    /// against a temporary root, so a regression to the shared derivation both
+    /// leaves this root empty and fails to delete from it.
+    ///
+    /// WHAT IT DOES NOT PROVE: that `createContainer` or `startContainer` reach
+    /// `createLogWriters` at all. Both guard on `nativeManager`, which only
+    /// `initialize()` sets and which needs a kernel and a VM, so those call
+    /// sites are unreachable from this target. The test above covers the root
+    /// `ContainerManager` hands down; what remains unproven here is the hop
+    /// from the hot paths into these two methods, and that is Gas Can's live
+    /// tier to settle.
+    func testALogManagerWritesAndDeletesOnlyUnderTheRootItWasGiven() throws {
+        let logRoot = temporaryRoot().appendingPathComponent("logs")
+        let manager = ContainerLogManager(
+            logRoot: logRoot, logger: Logger(label: "paths-tests")
+        )
+        let containerDir = logRoot.appendingPathComponent("c0ffee")
+
+        _ = try manager.createLogWriters(dockerID: "c0ffee")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: containerDir.appendingPathComponent("stdout.log").path
+            ),
+            "createLogWriters must create the container's log files under the "
+                + "root it was given, nothing appeared at \(containerDir.path)"
+        )
+
+        try manager.removeLogs(dockerID: "c0ffee")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: containerDir.path),
+            "removeLogs must delete the container's directory under the root it "
+                + "was given, \(containerDir.path) survived"
+        )
     }
 
     /// `initfs.ext4` is not a path the engine picks, it is a path

@@ -182,11 +182,29 @@ public actor ContainerManager {
         }
     }
 
+    /// - Parameter logRoot: Where this manager's containers write stdout and
+    ///   stderr, and the only directory `removeContainer` deletes logs from.
+    ///
+    ///   A root and not a ready-made `ContainerLogManager`, on purpose. The
+    ///   ownership already runs this way -- `logManager` is this actor's
+    ///   `nonisolated let` and every consumer reaches it through here
+    ///   (`ArcaDaemon/Server.swift:29` takes `containerManager.logManager`) --
+    ///   so handing the manager in would move one construction to each caller
+    ///   and give the derivation two spellings free to drift, which is exactly
+    ///   what change 1 of the milestone's design had to unpick for the image
+    ///   store. It is also the weaker seam: a caller that passes a
+    ///   `ContainerLogManager` makes "the log manager uses the caller's root"
+    ///   true by construction, so a test asserting it would pass with this
+    ///   actor ignoring the argument entirely. Taking the root leaves the
+    ///   pass-through falsifiable, and
+    ///   `ContainerBridgePathsTests.testAContainerManagerUsesTheRootsItWasGiven`
+    ///   falsifies it.
     public init(
         imageManager: ImageManager,
         kernelPath: String,
         imageStoreRoot: URL,
         layerCachePath: URL,
+        logRoot: URL,
         stateStore: StateStore,
         logger: Logger
     ) {
@@ -196,7 +214,7 @@ public actor ContainerManager {
         self.layerCachePath = layerCachePath
         self.stateStore = stateStore
         self.logger = logger
-        self.logManager = ContainerLogManager(logger: logger)
+        self.logManager = ContainerLogManager(logRoot: logRoot, logger: logger)
     }
 
     /// The root `initialize()` hands to `Containerization.ContainerManager`,

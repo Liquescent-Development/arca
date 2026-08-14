@@ -488,6 +488,7 @@ final class ListFilterTests: XCTestCase {
             kernelPath: unbootedKernel.path,
             imageStoreRoot: paths.imageStoreRoot,
             layerCachePath: paths.layerCache,
+            logRoot: paths.logsRoot,
             stateStore: stateStore,
             logger: logger
         )

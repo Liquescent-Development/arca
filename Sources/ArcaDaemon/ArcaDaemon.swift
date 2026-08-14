@@ -167,6 +167,26 @@ public final class ArcaDaemon: @unchecked Sendable {
         let eventManager = EventManager(logger: logger)
         self.eventManager = eventManager
 
+        // The log root this daemon has always used, now stated here instead of
+        // derived inside ContainerLogManager -- where every ContainerManager
+        // got it, whatever state root it was built for.
+        //
+        // `url(for:in:appropriateFor:create:)` and not `urls(for:in:).first!`:
+        // the force-unwrap the comment below warns about was still live in
+        // ContainerLogManager, and this is the throwing spelling of the same
+        // lookup. Same directory as before -- Application Support in the user
+        // domain, then `com.apple.arca/logs` -- so nothing this daemon reads or
+        // writes moves.
+        let applicationSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        )
+        let daemonLogRoot = applicationSupport
+            .appendingPathComponent("com.apple.arca")
+            .appendingPathComponent("logs")
+
         // Initialize ContainerManager with kernel path from config
         let containerManager = ContainerManager(
             imageManager: imageManager,
@@ -179,6 +199,7 @@ public final class ArcaDaemon: @unchecked Sendable {
             layerCachePath: URL(
                 fileURLWithPath: NSString(string: "~/.arca/layers").expandingTildeInPath
             ),
+            logRoot: daemonLogRoot,
             stateStore: stateStore,
             logger: logger
         )

@@ -64,6 +64,7 @@ public struct EngineManagers: Sendable {
             kernelPath: kernelPath.path,
             imageStoreRoot: paths.imageStoreRoot,
             layerCachePath: paths.layerCache,
+            logRoot: paths.logsRoot,
             stateStore: stateStore,
             logger: logger
         )

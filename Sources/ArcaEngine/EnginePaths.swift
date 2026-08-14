@@ -60,6 +60,23 @@ public struct EnginePaths: Sendable, Equatable {
     /// Base directory for named volumes.
     public let volumesRoot: URL
 
+    /// Base directory for container stdout/stderr logs, one subdirectory per
+    /// container.
+    ///
+    /// Under the state root rather than `~/Library/Application Support/
+    /// com.apple.arca/logs`, which is ArcaDaemon's tree and which every
+    /// `ContainerLogManager` derived for itself regardless of the root its
+    /// `ContainerManager` was given. That mattered in both directions: a
+    /// container's output landed in a directory the engine does not own, and
+    /// `removeContainer` deleted out of that same directory, so a throwaway
+    /// engine removing a sandbox deleted under the operator's real log store.
+    ///
+    /// A sibling of the other roots rather than a child of one: logs are
+    /// neither content-addressed store data nor volume data, and putting them
+    /// under `images/` would write engine-owned files into the directory
+    /// Containerization owns.
+    public let logsRoot: URL
+
     /// The socket recorded in `ArcaConfig`. Note that the socket the process
     /// actually serves on comes from `--socket-path`; this is the configured
     /// value the managers are handed.
@@ -73,6 +90,7 @@ public struct EnginePaths: Sendable, Equatable {
         self.layerCache = stateRoot.appendingPathComponent("layers")
         self.stateDatabase = stateRoot.appendingPathComponent("state.db")
         self.volumesRoot = stateRoot.appendingPathComponent("volumes")
+        self.logsRoot = stateRoot.appendingPathComponent("logs")
         self.socket = stateRoot.appendingPathComponent("arca.sock")
     }
 }

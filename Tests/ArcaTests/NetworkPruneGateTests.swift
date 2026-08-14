@@ -190,6 +190,7 @@ private struct PruneFixture {
             kernelPath: stateRoot.appendingPathComponent("vmlinux").path,
             imageStoreRoot: stateRoot.appendingPathComponent("images"),
             layerCachePath: stateRoot.appendingPathComponent("layers"),
+            logRoot: stateRoot.appendingPathComponent("logs"),
             stateStore: stateStore,
             logger: logger
         )
