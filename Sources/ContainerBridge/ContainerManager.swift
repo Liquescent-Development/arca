@@ -192,13 +192,19 @@ public actor ContainerManager {
     ///   so handing the manager in would move one construction to each caller
     ///   and give the derivation two spellings free to drift, which is exactly
     ///   what change 1 of the milestone's design had to unpick for the image
-    ///   store. It is also the weaker seam: a caller that passes a
-    ///   `ContainerLogManager` makes "the log manager uses the caller's root"
-    ///   true by construction, so a test asserting it would pass with this
-    ///   actor ignoring the argument entirely. Taking the root leaves the
-    ///   pass-through falsifiable, and
-    ///   `ContainerBridgePathsTests.testAContainerManagerUsesTheRootsItWasGiven`
-    ///   falsifies it.
+    ///   store. **That is the whole of the argument, and it is enough.**
+    ///
+    ///   CORRECTED: an earlier version of this comment also called the
+    ///   alternative "the weaker seam", claiming a caller-supplied
+    ///   `ContainerLogManager` would make the pass-through true by construction
+    ///   and so unfalsifiable. **That is false, and 13b's reviewer measured it
+    ///   false** by building the counterfactual init and a test against it: an
+    ///   init that ignored a `logManager:` argument failed its test just as this
+    ///   one fails `testAContainerManagerUsesTheRootsItWasGiven` under the same
+    ///   mutation. What makes either seam falsifiable is that the assertion
+    ///   reads back through `manager.logManager` -- the parameter's type has
+    ///   nothing to do with it. A design argument that sounds like a
+    ///   falsifiability argument is worth less than the one it displaced.
     public init(
         imageManager: ImageManager,
         kernelPath: String,
