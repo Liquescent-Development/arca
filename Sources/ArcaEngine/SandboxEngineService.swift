@@ -79,14 +79,51 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// is true before its code exists induces a consumer to send a request the
     /// engine cannot honour.
     ///
-    /// **Every flag is still false, and `Create` landing does not change that.**
-    /// `Create` now honours a project mount, named volumes, loopback publishing
-    /// and resource limits, so three of these flags look ready to flip -- but
-    /// `loopback_publish` in particular is exactly the claim this build cannot
-    /// support: `setPortMapManager` is wired, and gates 2 and 3 between "a
-    /// container with bindings starts" and "a port is published" are provable
-    /// only from the live tier. Flipping the flags is its own task, done against
-    /// the evidence for each, and no flag moves here as a side effect.
+    /// **Three flags are true, and each one names a live test that drove the
+    /// capability from outside this engine's own store.** `Inspect` reports what
+    /// the store holds, deliberately, so it can corroborate none of them; every
+    /// flag below that is true was earned by an observation of the guest or of
+    /// the host, and every flag that is false is false because no such
+    /// observation exists or because one was made and failed.
+    ///
+    /// - `projectMount`: the host writes a file into the project root, the
+    ///   guest's own `Cmd` serves it back over a published port, and the host
+    ///   then reads a file the guest wrote into the same directory. Earned by
+    ///   `mounts::the_project_root_is_readable_in_the_guest_and_writable_back_to_the_host`
+    ///   in gascan's `gascan-arca` live tier. SEEN TO FAIL, and isolated: with
+    ///   `binds` here started empty instead of carrying the project mount, it
+    ///   was the **only** live test that failed, after 180s with
+    ///   `connected and read nothing`. `CreateTranslationTests
+    ///   .testTheProjectMountAndTheVolumesBecomeBinds` also caught that
+    ///   mutation, which is the difference between the two: the unit test sees
+    ///   the argument, the live test sees the filesystem.
+    /// - `loopbackPublish`: a TCP connection from the test process reads bytes
+    ///   the guest produced. Earned by
+    ///   `ports::a_published_port_is_reachable_from_the_test_process`.
+    /// - `resourceLimits`: the guest's own `/sys/fs/cgroup/cpu.max` and
+    ///   `memory.max` are exactly what the request asked for. Earned by
+    ///   `limits::the_requested_cpu_and_memory_limits_are_the_guests_own_cgroup_limits`.
+    ///   SEEN TO FAIL, and isolated: with `nanoCpus` and `memory` in
+    ///   `sandboxContainerSpec` forced to nil, it was the **only** live test
+    ///   that failed, and the guest reported `400000 100000` and `4294967296`
+    ///   -- four CPUs and ContainerBridge's 4GiB default, in place of the one
+    ///   CPU and 1GiB that were asked for.
+    ///
+    /// **`namedVolumes` stays false, and it is not an oversight.** `Create`
+    /// makes the volumes, `volumeDriver` formats each as an EXT4 image at its
+    /// requested capacity, and `parseVolumeMounts` resolves each one and builds
+    /// a `Mount.block` for it -- and the guest mounts none of them. MEASURED
+    /// from the live tier: three volumes of 256MiB, 512MiB and 1GiB arrive in
+    /// the guest as three block devices of exactly 262144, 524288 and 1048576
+    /// 1K-blocks, while `/proc/mounts` names none of the three targets, with no
+    /// warning and no error anywhere in the log. The mount points were ruled out
+    /// as the cause: the same run with an image carrying all three directories
+    /// behaves identically. `the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them`
+    /// is the instrument that holds this flag down, and it fails the day the
+    /// mount starts working.
+    ///
+    /// `tty` and `signals` are milestone 3's, with `Exec`. `offline` stays
+    /// `.unverified` until milestone 4 proves it.
     func capabilities(request: Arca_Engine_V1_CapabilitiesRequest) async -> Arca_Engine_V1_CapabilitiesResponse {
         guard let version = engineVersion(from: ArcaVersion.version) else {
             return Arca_Engine_V1_CapabilitiesResponse.with {
@@ -100,12 +137,12 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
             response.capabilities = Arca_Engine_V1_Capabilities.with { capabilities in
                 capabilities.engineVersion = version
                 capabilities.contractMinor = 0
-                capabilities.projectMount = false
+                capabilities.projectMount = true
                 capabilities.namedVolumes = false
                 capabilities.tty = false
                 capabilities.signals = false
-                capabilities.loopbackPublish = false
-                capabilities.resourceLimits = false
+                capabilities.loopbackPublish = true
+                capabilities.resourceLimits = true
                 capabilities.offline = .unverified
             }
         }
