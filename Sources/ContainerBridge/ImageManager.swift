@@ -557,15 +557,17 @@ public actor ImageManager {
     /// below, which compares names and cannot match a digest, so every create
     /// following a successful `PrepareImage` failed to resolve its own image.
     ///
-    /// **The change is additive, and the arms below are deliberately left
-    /// reachable for this input.** An exact digest reference is neither
-    /// `isShortID` -- the `@`, the `:` and the repository letters fail
+    /// **The change is additive, and after the ordering fix below it is additive
+    /// by construction rather than by measurement.** An exact digest reference is
+    /// neither `isShortID` -- the `@`, the `:` and the repository letters fail
     /// `^[a-f0-9]{12,64}$` -- nor `isLongID`, whose `hasPrefix("sha256:")` fails
-    /// on the repository prefix. So `matchesReference` still runs for it, which
-    /// is what keeps a store row whose reference literally *is*
-    /// `repository@sha256:<hex>` resolving by exact string match exactly as it
-    /// did before. Nothing that resolved before resolves differently; a form
-    /// that threw can now succeed.
+    /// on the repository prefix. So `matchesReference` still runs for it, and it
+    /// runs *first*: every name arm is tried against every row before the digest
+    /// arm is tried at all. A store row whose reference literally is
+    /// `repository@sha256:<hex>` therefore still resolves by exact string match,
+    /// and no store can be built in which this arm takes a resolution away from
+    /// an arm that existed before it. Nothing that resolved before resolves
+    /// differently; a form that threw can now succeed.
     ///
     /// This does change Arca's Docker surface: `docker run|rmi|inspect
     /// repo@sha256:...` now works where it previously reported "No such image".
@@ -588,6 +590,28 @@ public actor ImageManager {
         // because the stored reference might not match our normalized version
         let images = try await imageStore.list()
 
+        // **One pass per arm, not one pass per row, and the difference is
+        // correctness rather than style.** `imageStore.list()` order is the
+        // store's own and is neither insertion nor sorted order -- MEASURED in
+        // Task 11's re-review, which saw `getImage` and `deleteImage` resolve the
+        // same string to different rows inside one process, and a legitimate
+        // `docker rmi repo@sha256:x` throw on 2 of 5 runs.
+        //
+        // The cause was arm precedence being decided by row order: with the arms
+        // interleaved inside one loop, whichever ROW came first decided which
+        // ARM answered. Two rows can both match one input -- a row literally
+        // named `repo@sha256:x` matches by name, and the row holding that
+        // content matches by digest -- so the answer depended on the store's
+        // enumeration.
+        //
+        // Ordering the arms fixes it at the root and buys three things: the
+        // result is a function of the store's contents rather than its order;
+        // NAME matching always beats CONTENT matching, so the exact-digest arm
+        // can never take a resolution away from an arm that existed before it --
+        // the additive claim now holds by construction rather than by having
+        // failed to find a counterexample; and `deleteImage` can trust that a
+        // digest reference naming a real row resolves to THAT row, which is what
+        // makes its guard deterministic.
         for image in images {
             let dockerID = generateDockerID(from: image.digest)
 
@@ -611,32 +635,9 @@ public actor ImageManager {
                 return image
             }
 
-            // Match an exact digest reference: both halves, never one.
-            //
-            // The repository is compared as well as the digest, and it is
-            // compared exactly -- no registry normalization -- which is the same
-            // direction the engine's PrepareImage chose. Matching on the digest
-            // alone would resolve `anything-at-all@sha256:<hex>` to this image,
-            // which is a container created from content under a name its caller
-            // never asked for. A false "not found" is visible and recoverable; a
-            // false match is neither.
-            //
-            // Both sides go through ImageIdentity.repository(of:), the one
-            // split, so that the stored `workspace:latest` and the requested
-            // `workspace@sha256:...` meet on `workspace` by the same rule the
-            // engine uses when it decides it holds the content at all.
-            if let exactDigest,
-               image.digest == exactDigest.digest,
-               ImageIdentity.repository(of: image.reference) == exactDigest.repository {
-                logger.debug("Matched image by exact digest reference", metadata: [
-                    "input": "\(nameOrId)",
-                    "reference": "\(image.reference)",
-                    "digest": "\(image.digest)"
-                ])
-                return image
-            }
-
-            // Match by reference (tag) - need to check multiple variations
+            // Match by reference (tag) - need to check multiple variations.
+            // Ahead of the digest arm below: a row the caller NAMED is a more
+            // specific answer than a row that merely holds the content.
             if !isShortID && !isLongID {
                 // Try to match the stored reference against the input in various ways
                 if matchesReference(stored: image.reference, input: nameOrId) {
@@ -647,6 +648,41 @@ public actor ImageManager {
                     ])
                     return image
                 }
+            }
+        }
+
+        // Match an exact digest reference: both halves, never one.
+        //
+        // The repository is compared as well as the digest, and it is compared
+        // exactly -- no registry normalization -- which is the same direction the
+        // engine's PrepareImage chose. Matching on the digest alone would resolve
+        // `anything-at-all@sha256:<hex>` to this image, which is a container
+        // created from content under a name its caller never asked for. A false
+        // "not found" is visible and recoverable; a false match is neither.
+        //
+        // Both sides go through ImageIdentity.repository(of:), the one split, so
+        // that the stored `workspace:latest` and the requested
+        // `workspace@sha256:...` meet on `workspace` by the same rule the engine
+        // uses when it decides it holds the content at all.
+        //
+        // Sorted by reference before choosing, so that a store holding the same
+        // content under two names in the same repository answers the same way
+        // twice. Nothing here depends on `list()`'s order.
+        if let exactDigest {
+            let candidates = images
+                .filter {
+                    $0.digest == exactDigest.digest
+                        && ImageIdentity.repository(of: $0.reference) == exactDigest.repository
+                }
+                .sorted { $0.reference < $1.reference }
+            if let image = candidates.first {
+                logger.debug("Matched image by exact digest reference", metadata: [
+                    "input": "\(nameOrId)",
+                    "reference": "\(image.reference)",
+                    "digest": "\(image.digest)",
+                    "candidates": "\(candidates.count)"
+                ])
+                return image
             }
         }
 

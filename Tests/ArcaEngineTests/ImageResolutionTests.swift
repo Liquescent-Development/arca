@@ -261,6 +261,93 @@ final class ImageResolutionTests: XCTestCase {
         XCTAssertNotNil(untouched, "and must not take the other reference with it")
     }
 
+    /// A legitimate `rmi` by digest reference succeeds every time, not most
+    /// times.
+    ///
+    /// **This pins a nondeterminism the round-2 fix introduced and the re-review
+    /// caught.** With both a tag row and a row literally named
+    /// `repository@sha256:<hex>` in the store, two arms can answer one input: the
+    /// name arm matches the literal row, the digest arm matches the content. The
+    /// arms used to be interleaved inside one loop over `imageStore.list()`,
+    /// whose order is the store's own, so whichever ROW came first decided which
+    /// ARM answered -- and `deleteImage`'s guard, which compares the resolved
+    /// row's reference against the input, then refused a legitimate delete
+    /// whenever the tag row happened to come first. MEASURED by the re-review
+    /// over five runs: two threw, three succeeded, and in one run `getImage` and
+    /// `deleteImage` resolved the same string to different rows inside one
+    /// process.
+    ///
+    /// The loop is now one pass per arm rather than one pass per row, so a name
+    /// match always beats a content match and the answer is a function of what
+    /// the store holds rather than of how it enumerates.
+    ///
+    /// **Twenty independent stores, because one green run is exactly what the
+    /// broken version produced three times out of five.** Each iteration builds a
+    /// fresh store and so gets its own enumeration order.
+    func testDeletingALiterallyNamedDigestRowSucceedsOnEveryRun() async throws {
+        for iteration in 1...20 {
+            let store = try await preparedStore()
+            let named = "workspace@sha256:\(store.hex)"
+            // The store now holds `workspace:latest` AND a row literally named
+            // by the digest reference. Both can answer; only one is right.
+            try await store.manager.tagImage(source: "workspace:latest", target: named)
+
+            let resolved = try await store.manager.getImage(nameOrId: named)
+            XCTAssertEqual(
+                resolved.reference, named,
+                "run \(iteration): the row the caller named must win over the row that "
+                    + "merely holds the same content"
+            )
+
+            _ = try await store.manager.deleteImage(nameOrId: named)
+
+            // Asserted on the store's ROWS, not on whether the reference still
+            // resolves. It still does, and correctly: the surviving
+            // `workspace:latest` holds the same content under the same
+            // repository, so `workspace@sha256:<hex>` remains a true statement
+            // about what the store has. The question this test asks is which row
+            // was removed.
+            let rows = try await store.manager.listImages()
+                .flatMap(\.repoTags).sorted()
+            XCTAssertEqual(
+                rows, ["workspace:latest"],
+                "run \(iteration): the named row must be the one deleted, and the tag must "
+                    + "survive its sibling's deletion"
+            )
+        }
+    }
+
+    /// Resolution is decided by what the store holds, not by how it enumerates.
+    ///
+    /// The companion to the test above, on the read side and without the delete:
+    /// one unchanged store, asked the same question repeatedly, must answer
+    /// identically. This is **Minor 6** from the round-1 review -- recorded there
+    /// as an unpinned assumption -- closed by the same ordering change rather
+    /// than by a separate guard, and pinned here.
+    ///
+    /// The third row exists to give a tie-break something to trip on: it holds
+    /// the same content under a digest-form name that sorts before the one being
+    /// asked for.
+    func testResolutionIsAFunctionOfStoreContentsAndNotEnumerationOrder() async throws {
+        let store = try await preparedStore()
+        let named = "workspace@sha256:\(store.hex)"
+        try await store.manager.tagImage(source: "workspace:latest", target: named)
+        try await store.manager.tagImage(
+            source: "workspace:latest",
+            target: "workspace@sha256:\(String(repeating: "0", count: 64))"
+        )
+
+        var answers: Set<String> = []
+        for _ in 1...25 {
+            answers.insert(try await store.manager.getImage(nameOrId: named).reference)
+        }
+        XCTAssertEqual(
+            answers, [named],
+            "twenty-five reads of one unchanged store must give exactly one answer, and it "
+                + "must be the row the caller named"
+        )
+    }
+
     // MARK: - The parser the arm is built on
 
     /// `ImageIdentity.exactDigest` recognises the form and nothing near it.
