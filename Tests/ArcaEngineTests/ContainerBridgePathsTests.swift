@@ -227,11 +227,16 @@ final class ContainerBridgePathsTests: XCTestCase {
     // shipped repeatedly: a well-formed test over a function, and nothing
     // asserting that the caller called it.
     //
-    // The honest call-site instrument is Gas Can's live `Create` test, which is
-    // Task 13's and does not exist yet. These two are a tripwire under the
-    // revert, not a substitute for it.
+    // The honest call-site instrument is Gas Can's live `Create` test. It is
+    // Task 13's to land, and the behaviour it proves has already been MEASURED
+    // by the controller against this commit: a real engine on a real socket
+    // creates a container, the directory appears under the engine's OWN
+    // `<state-root>/images/containers/`, and Apple's shared store is unchanged
+    // across the run. These two tests are a tripwire under the revert, not a
+    // substitute for that.
 
-    /// This file must never name Apple's shared containerization store.
+    /// This file must carry no literal path to Apple's shared containerization
+    /// store.
     ///
     /// `createNativeContainer` used to build the container directory under a
     /// hardcoded `~/Library/Application Support/com.apple.containerization`
@@ -245,16 +250,40 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// :35-37, :139-140), so the bridge created a directory Containerization
     /// never looked in.
     ///
-    /// WHAT THIS PROVES: the literal is gone from this file.
+    /// WHAT THIS PROVES: the literal is gone from this file. Nothing more. The
+    /// name says *carries no literal* rather than *never reaches*, and the
+    /// difference is the whole of what follows.
     ///
-    /// WHAT IT DOES NOT PROVE, and what can satisfy it while the bug is back:
-    /// a file that hardcodes a *different* wrong root (`~/.arca/containers`,
-    /// say); a file where `containerDirectory(in:dockerID:)` is correct but
-    /// `createNativeContainer` no longer calls it; any change at all to the
-    /// runtime behaviour of the create path. It also forbids the string in
-    /// comments, deliberately -- a comment asserting the wrong store is how the
-    /// old derivation stayed plausible for as long as it did.
-    func testTheContainerBridgeCreatePathNeverNamesApplesSharedStore() throws {
+    /// WHAT IT DOES NOT PROVE, and what can satisfy it while the bug is back.
+    /// The first two were MEASURED against this suite rather than reasoned
+    /// about, and each left `Executed 149 tests, with 0 failures`:
+    ///
+    /// - **Apple's store reached by name instead of by literal.** Replace
+    ///   `manager.imageStore.path` in `containerDirectory(in:dockerID:)` with
+    ///   `ImageStore.default.path` and the original defect is back exactly,
+    ///   because `ImageStore.defaultRoot()` returns that same directory. This is
+    ///   the likeliest regression shape rather than a contrived one: that
+    ///   spelling is already in the tree twice, at `ImageManager.swift:23` and
+    ///   `ArcaDaemon.swift:178`.
+    /// - **The literal split across a concatenation or an intermediate
+    ///   constant.** `"com.apple." + "containerization"` re-inlined at the
+    ///   create site defeats `contains` while restoring the behaviour.
+    /// - A file hardcoding a *different* wrong root (`~/.arca/containers`, say);
+    ///   a file where `containerDirectory(in:dockerID:)` is correct but
+    ///   `createNativeContainer` no longer calls it; any change at all to the
+    ///   runtime behaviour of the create path.
+    ///
+    /// **THE INSTRUMENT THAT CATCHES ALL OF THESE IS GAS CAN'S LIVE `Create`
+    /// TEST, AND IT LIVES IN THE OTHER REPOSITORY.** Under the first mutation
+    /// above, MEASURED: it fails with `NSPOSIXErrorDomain Code=2`, finds the
+    /// engine's own `<state-root>/images/containers/` empty, and catches Apple's
+    /// shared store growing by one directory (253 -> 254). These two tests are a
+    /// tripwire for the textual defect and not coverage of the behavioural one.
+    ///
+    /// It also forbids the string in comments, deliberately -- a comment
+    /// asserting the wrong store is how the old derivation stayed plausible for
+    /// as long as it did.
+    func testTheContainerBridgeCreatePathCarriesNoLiteralPathToApplesSharedStore() throws {
         let source = try Self.containerManagerSource()
 
         XCTAssertFalse(
@@ -269,9 +298,11 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// `<store>/containers/<id>` must be derived in one place in this file.
     ///
     /// Two spellings drifting apart is the defect itself, not a stylistic
-    /// concern: the create path and `getRootfsPath` each derived this directory
-    /// and only one of them was moved when `ContainerManager` gained an image
-    /// store root.
+    /// concern: the create path and the since-deleted `getRootfsPath` each
+    /// derived this directory and only one of them was moved when
+    /// `ContainerManager` gained an image-store root. **Only the create path's
+    /// copy ever executed** -- `getRootfsPath` had no callers, which is why the
+    /// drift survived unnoticed and why it is gone rather than corrected.
     ///
     /// Exactly one, not at most one: `at most` passes vacuously over a file
     /// where the derivation was respelt (`appending(path:)`) and duplicated
@@ -281,10 +312,18 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// once in this file.
     ///
     /// WHAT IT DOES NOT PROVE: that the one occurrence is rooted at the
-    /// manager's store, that either caller reaches it, or anything about
-    /// runtime. A single occurrence rooted at a hardcoded path satisfies it --
-    /// that is what the test above is for, and neither test covers the other's
-    /// gap at runtime.
+    /// manager's store, that any caller reaches it, or anything about runtime. A
+    /// single occurrence rooted at a hardcoded path satisfies it -- that is what
+    /// the test above is for, and neither test covers the other's gap at
+    /// runtime.
+    ///
+    /// It counts over the whole file, comments included, so a doc comment that
+    /// *quotes* this token fails the suite. That is why the comment on
+    /// `containerDirectory(in:dockerID:)` describes the join instead of spelling
+    /// it, and a future reader who does not know that will be puzzled by a red
+    /// suite after writing prose. Left as-is rather than narrowed to code: a
+    /// counter that skipped comments would stop forbidding the wrong store in a
+    /// comment, which is the other half of what these two tests are for.
     func testTheContainersDirectoryIsDerivedInExactlyOnePlace() throws {
         let source = try Self.containerManagerSource()
 

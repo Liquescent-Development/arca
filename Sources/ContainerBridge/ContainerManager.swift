@@ -4189,21 +4189,33 @@ public actor ContainerManager {
 
     /// The directory Containerization keeps container `dockerID`'s files in.
     ///
-    /// One derivation for the two places that need it -- `createNativeContainer`,
-    /// which must create this directory before `manager.create(_:image:rootfs:)`
-    /// opens `bootlog.log` inside it, and `getRootfsPath` below. They disagreed
-    /// until now, the create path naming Apple's shared store outright while
-    /// this one followed the manager.
+    /// **One live caller, `createNativeContainer`**, which must create this
+    /// directory before `manager.create(_:image:rootfs:)` opens `bootlog.log`
+    /// inside it. It is a function rather than an expression because the
+    /// derivation drifted once already: the create path named Apple's shared
+    /// store outright while `getRootfsPath` followed the manager, and only one
+    /// of them moved when `ContainerManager` gained an image-store root. That
+    /// `getRootfsPath` has now been deleted -- it had no callers, so only the
+    /// create path's copy of the drift ever executed.
     ///
-    /// It takes the manager instead of reading `nativeManager` so that neither
+    /// It takes the manager instead of reading `nativeManager` so that no
     /// caller can pass a root: the store is read off the same value the create
     /// call is made against, which is the only store Containerization will look
     /// in. It stays `private` deliberately: `createNativeContainer` guards on
     /// `nativeManager`, which `initialize()` sets only after building a kernel
     /// and a VM, so no test in this repository can reach the call site -- and a
     /// derivation a test *could* call would let a green suite stand for a call
-    /// site nothing executes. The call-site proof is Gas Can's live `Create`
-    /// test, not anything in this repository.
+    /// site nothing executes.
+    ///
+    /// **The call-site proof is Gas Can's live `Create` test, and it is not
+    /// optional.** MEASURED 2026-08-13: replacing `manager.imageStore.path`
+    /// below with `ImageStore.default.path` restores the original defect
+    /// exactly, and `swift test --filter ArcaEngineTests` still reports
+    /// `Executed 149 tests, with 0 failures` -- both guards in
+    /// `ContainerBridgePathsTests` stay green. The same mutation drives the live
+    /// tier's `Create` to `NSPOSIXErrorDomain Code=2`, leaves the engine's own
+    /// `<state-root>/images/containers/` empty, and adds a directory to Apple's
+    /// shared store (253 -> 254). **Nothing in this repository can see that.**
     private func containerDirectory(
         in manager: Containerization.ContainerManager,
         dockerID: String
@@ -4211,16 +4223,6 @@ public actor ContainerManager {
         manager.imageStore.path
             .appendingPathComponent("containers")
             .appendingPathComponent(dockerID)
-    }
-
-    /// Get the path to a container's rootfs.ext4 file
-    /// This follows Apple's Containerization framework convention: {imageStore.path}/containers/{id}/rootfs.ext4
-    private func getRootfsPath(dockerID: String) -> URL? {
-        guard let manager = nativeManager else {
-            return nil
-        }
-        return containerDirectory(in: manager, dockerID: dockerID)
-            .appendingPathComponent("rootfs.ext4")
     }
 
     /// Get filesystem changes for a container using OverlayFS upperdir enumeration
