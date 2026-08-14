@@ -281,9 +281,15 @@ final class ImageResolutionTests: XCTestCase {
     /// match always beats a content match and the answer is a function of what
     /// the store holds rather than of how it enumerates.
     ///
-    /// **Twenty independent stores, because one green run is exactly what the
-    /// broken version produced three times out of five.** Each iteration builds a
-    /// fresh store and so gets its own enumeration order.
+    /// **Twenty stores, and they are independent only because `preparedStore()`
+    /// gives each one its own content.** A fresh store is not by itself a fresh
+    /// enumeration order -- see that fixture's comment. MEASURED against the
+    /// interleaved resolver this test exists to catch (`de8c880`'s
+    /// `ImageManager.swift`, restored whole), 20 runs each: with every store
+    /// holding identical content this test caught it **5 times in 20**; with the
+    /// content varied per store, **19 times in 20**. The re-review's "39 of 40"
+    /// for that mutation was the whole suite going RED, which it did on the
+    /// strength of the three other tests here, not this one.
     func testDeletingALiterallyNamedDigestRowSucceedsOnEveryRun() async throws {
         for iteration in 1...20 {
             let store = try await preparedStore()
@@ -351,18 +357,35 @@ final class ImageResolutionTests: XCTestCase {
     /// something must choose -- and if that something is `imageStore.list()`'s
     /// order, the resolver is nondeterministic again.
     ///
-    /// Pinned to `workspace:alpha`, the lexicographically smaller reference. The
+    /// Pinned to the `alpha` row, the lexicographically smaller reference. The
     /// direction is arbitrary; that it is *fixed* is not. Both mutations the
-    /// re-review ran against the first version of this fix -- reversing the sort
-    /// and deleting it -- survived all 137 tests, which is what a tie-break with
-    /// no test looks like. This is **Minor 6** from round 1, finally pinned.
+    /// re-review ran against the first version of this fix -- reversing the
+    /// tie-break and deleting it -- survived all 131 tests, which is what a
+    /// tie-break with no test looks like. This is **Minor 6** from round 1,
+    /// finally pinned.
     ///
-    /// Twenty independent stores, because the failure is per-process.
+    /// Twenty stores, with the tag names salted per iteration for the reason
+    /// `testTheShortAndLongIdArmsAlsoAnswerTheSameWayEveryTime` records: twenty
+    /// stores holding the same names enumerate alike inside one process, so
+    /// without the salt the loop is worth far fewer than twenty samples.
+    /// MEASURED on the tree this ships as, three mutations, each applied to a
+    /// clean tree:
+    ///
+    /// - this arm reverted to `images.first(where:)`: RED **15 of 15**, 6 to 14
+    ///   of the twenty iterations failing per run.
+    /// - the tie-break deleted (`candidates.first`): RED **10 of 10**.
+    /// - the tie-break reversed: RED **5 of 5**, and it cannot depend on
+    ///   enumeration at all -- it answers the `zulu` row from any order.
     func testTheDigestPassPicksTheSameCandidateEveryTime() async throws {
         for iteration in 1...20 {
             let store = try await preparedStore()
-            try await store.manager.tagImage(source: "workspace:latest", target: "workspace:alpha")
-            try await store.manager.tagImage(source: "workspace:latest", target: "workspace:zulu")
+            let salt = String(format: "%02d", iteration)
+            try await store.manager.tagImage(
+                source: "workspace:latest", target: "workspace:alpha\(salt)"
+            )
+            try await store.manager.tagImage(
+                source: "workspace:latest", target: "workspace:zulu\(salt)"
+            )
             // Leaves exactly two rows, both holding this content under
             // `workspace`, and neither named by the digest reference below.
             _ = try await store.manager.deleteImage(nameOrId: "workspace:latest")
@@ -371,7 +394,7 @@ final class ImageResolutionTests: XCTestCase {
                 nameOrId: "workspace@sha256:\(store.hex)"
             )
             XCTAssertEqual(
-                resolved.reference, "workspace:alpha",
+                resolved.reference, "workspace:alpha\(salt)",
                 "run \(iteration): with two equally-valid candidates the digest pass must "
                     + "choose by a fixed rule, not by the store's enumeration order"
             )
@@ -388,30 +411,57 @@ final class ImageResolutionTests: XCTestCase {
     ///
     /// So "resolution is a function of what the store holds, not how it
     /// enumerates" was false for half the arms while being written in three
-    /// places. Every arm now collects, sorts and takes the first, and this says
-    /// so rather than the comment saying it.
+    /// places. Every arm now collects and takes the minimum, and this says so
+    /// rather than the comment saying it.
+    ///
+    /// **Twenty stores, and the tag names are salted per iteration, because the
+    /// salt is what makes the twenty samples independent.** The first version of
+    /// this test read one store 25 times, and the re-review measured it catching
+    /// a revert of the short-ID arm in 10 runs of 15. Twenty *unsalted* stores
+    /// did not help -- MEASURED at 9 of 15, and every one of those runs failed
+    /// either all 100 assertions or none of them, so twenty stores carrying the
+    /// same three names are one sample and not twenty. Salting the names
+    /// resamples the store's enumeration per iteration, and on the tree this
+    /// ships as:
+    ///
+    /// - short-ID arm reverted to `images.first(where:)`: RED **15 of 15**,
+    ///   failing 40 to 100 of the 100 short-ID assertions per run.
+    /// - long-ID arm reverted the same way: RED **15 of 15**, 30 to 96 per run.
+    ///
+    /// Not proven deterministic, and this comment will not say it is. What is
+    /// measured is 30 of 30 runs RED off a per-iteration miss rate near half,
+    /// which is the difference between one chance to catch a later edit and
+    /// twenty.
     func testTheShortAndLongIdArmsAlsoAnswerTheSameWayEveryTime() async throws {
-        let store = try await preparedStore()
-        try await store.manager.tagImage(source: "workspace:latest", target: "workspace:alpha")
-        try await store.manager.tagImage(source: "workspace:latest", target: "workspace:zulu")
+        for iteration in 1...20 {
+            let store = try await preparedStore()
+            let salt = String(format: "%02d", iteration)
+            try await store.manager.tagImage(
+                source: "workspace:latest", target: "workspace:alpha\(salt)"
+            )
+            try await store.manager.tagImage(
+                source: "workspace:latest", target: "workspace:zulu\(salt)"
+            )
+            // `alpha…` sorts before `latest`, which sorts before `zulu…`, so the
+            // rule's answer is known without recomputing the rule.
+            let expected = "workspace:alpha\(salt)"
 
-        var shortIdAnswers: Set<String> = []
-        var longIdAnswers: Set<String> = []
-        for _ in 1...25 {
-            shortIdAnswers.insert(
-                try await store.manager.getImage(nameOrId: String(store.hex.prefix(12))).reference
-            )
-            longIdAnswers.insert(
-                try await store.manager.getImage(nameOrId: "sha256:\(store.hex)").reference
-            )
+            for read in 1...5 {
+                let shortId = try await store.manager
+                    .getImage(nameOrId: String(store.hex.prefix(12))).reference
+                XCTAssertEqual(
+                    shortId, expected,
+                    "store \(iteration), read \(read): a short ID matching three rows must "
+                        + "resolve to one of them by a fixed rule"
+                )
+                let longId = try await store.manager
+                    .getImage(nameOrId: "sha256:\(store.hex)").reference
+                XCTAssertEqual(
+                    longId, expected,
+                    "store \(iteration), read \(read): and so must a long ID"
+                )
+            }
         }
-        XCTAssertEqual(
-            shortIdAnswers, ["workspace:alpha"],
-            "a short ID matching three rows must resolve to one of them by a fixed rule"
-        )
-        XCTAssertEqual(
-            longIdAnswers, ["workspace:alpha"], "and so must a long ID"
-        )
     }
 
     // MARK: - The parser the arm is built on
@@ -476,15 +526,32 @@ final class ImageResolutionTests: XCTestCase {
         let hex: String
     }
 
+    /// Every store gets its own content, and that is load-bearing for the loop
+    /// tests above.
+    ///
+    /// A store's enumeration order is fixed for the life of a *process* given a
+    /// fixed set of references: MEASURED, by reverting the short-ID arm to
+    /// `images.first(where:)` against twenty stores that all carried the same
+    /// three names -- every run failed either all 100 assertions or none of
+    /// them, and the revert still escaped 6 runs in 15. Twenty such stores are
+    /// one sample and not twenty.
+    ///
+    /// A unique payload gives a unique digest, and so a unique spelling for
+    /// every reference that carries one. That is what makes
+    /// `testDeletingALiterallyNamedDigestRowSucceedsOnEveryRun`'s twenty stores
+    /// twenty samples -- its rows are named `workspace@sha256:<hex>` -- and it
+    /// took that test from 5 catches in 20 to 19 in 20. The two loop tests whose
+    /// rows are plain tags salt the tag names themselves, for the same reason.
     private func preparedStore() async throws -> PreparedStore {
+        let identity = UUID().uuidString
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("arca-image-resolution-tests-\(UUID().uuidString)")
+            .appendingPathComponent("arca-image-resolution-tests-\(identity)")
         let stateRoot = root.appendingPathComponent("state")
         _ = try await loadWorkspaceImages(
             fromOCILayout: try OCILayoutFixture.write(
                 at: root.appendingPathComponent("workspace"),
                 reference: "workspace:latest",
-                payload: "pushed by the consumer, not by startup"
+                payload: "pushed by the consumer, not by startup, \(identity)"
             ),
             stateRoot: stateRoot,
             logger: logger

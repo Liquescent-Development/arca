@@ -613,7 +613,7 @@ public actor ImageManager {
         // digest reference naming a real row resolves to THAT row, which is what
         // makes its guard deterministic.
         //
-        // **Every arm collects, sorts and takes the first**, including the two ID
+        // **Every arm collects and takes the minimum**, including the two ID
         // arms, and that uniformity is load-bearing rather than tidy. A first
         // version of this fix ordered the arms but left the ID arms returning
         // whichever row the loop reached first -- and both can match more than
@@ -634,7 +634,7 @@ public actor ImageManager {
 
         // Match short ID (first 12+ chars)
         if isShortID,
-           let image = firstByReference(images.filter {
+           let image = minimumByReference(images.filter {
                generateDockerID(from: $0.digest)
                    .replacingOccurrences(of: "sha256:", with: "").hasPrefix(nameOrId)
            }) {
@@ -648,7 +648,7 @@ public actor ImageManager {
 
         // Match long ID (full digest)
         if isLongID,
-           let image = firstByReference(images.filter {
+           let image = minimumByReference(images.filter {
                generateDockerID(from: $0.digest) == nameOrId
            }) {
             logger.debug("Matched image by long ID", metadata: [
@@ -663,7 +663,7 @@ public actor ImageManager {
         // Ahead of the digest arm below: a row the caller NAMED is a more
         // specific answer than a row that merely holds the content.
         if !isShortID, !isLongID,
-           let image = firstByReference(images.filter {
+           let image = minimumByReference(images.filter {
                matchesReference(stored: $0.reference, input: nameOrId)
            }) {
             logger.debug("Matched image by reference", metadata: [
@@ -688,7 +688,7 @@ public actor ImageManager {
         // `workspace@sha256:...` meet on `workspace` by the same rule the engine
         // uses when it decides it holds the content at all.
         if let exactDigest,
-           let image = firstByReference(images.filter {
+           let image = minimumByReference(images.filter {
                $0.digest == exactDigest.digest
                    && ImageIdentity.repository(of: $0.reference) == exactDigest.repository
            }) {
@@ -720,10 +720,23 @@ public actor ImageManager {
     /// edit can reverse or delete without anything noticing -- which is exactly
     /// what happened to the first version of this: both mutations survived the
     /// whole suite.
-    private func firstByReference(
+    ///
+    /// The candidate count is logged on every match, because it is the only
+    /// signal in the logs that a resolution was ambiguous and this rule -- not
+    /// the caller's input -- decided which row the user got. The old
+    /// exact-digest arm logged it; funnelling it through here gives every arm
+    /// what only that one arm used to have.
+    private func minimumByReference(
         _ candidates: [Containerization.Image]
     ) -> Containerization.Image? {
-        candidates.min { $0.reference < $1.reference }
+        guard let chosen = candidates.min(by: { $0.reference < $1.reference }) else {
+            return nil
+        }
+        logger.debug("Chose among matching rows by reference", metadata: [
+            "candidates": "\(candidates.count)",
+            "reference": "\(chosen.reference)"
+        ])
+        return chosen
     }
 
     /// Check if a stored image reference matches an input reference
