@@ -166,16 +166,24 @@ public struct EngineManagers: Sendable {
     /// removed at a time, `swift test --filter ArcaEngineTests`, reported by
     /// which tests fail rather than by how many:
     ///
-    /// - without `setVolumeManager`, the only failure is
+    /// - without `setVolumeManager`, two tests fail and no others:
     ///   `EngineManagerWiringTests.testRemovingAContainerDeletesItsAnonymousVolumeAndSparesTheNamedOne`,
-    ///   which finds `["anon-vol", "named-vol"]` both still present after
-    ///   `Remove` has reported success.
+    ///   which drives `ContainerManager.removeContainer` directly, and
+    ///   `LifecycleTests.testRemovingAContainerThroughTheRPCDeletesItsAnonymousVolumeAndSparesTheNamedOne`,
+    ///   which drives the `Remove` RPC. Both find `["anon-vol", "named-vol"]`
+    ///   still present after the removal has reported success. The second joined
+    ///   the list when Task 12 landed `Remove`; the first is kept beside it
+    ///   because they fail for the same reason at two different altitudes, and
+    ///   the lower one keeps measuring if the RPC is ever rewritten.
     /// - without `setNetworkManager`, the only failing test is
     ///   `EngineManagerWiringTests.testAnAttachedContainerReportsTheNetworkItIsOn`,
     ///   on all three of its assertions, its networks dictionary having come
     ///   back `[]`.
     /// - without `setPortMapManager`, nothing fails, for the reason given above.
-    ///   That is the finding, not an omission.
+    ///   That is the finding, not an omission. Re-measured after Task 12: still
+    ///   nothing, because the one VM-free path that reaches the gate
+    ///   (`removeContainer`'s database-only branch) is reached here only by
+    ///   containers with no port bindings, and unpublishing none is a no-op.
     public func wireCollaborators() async {
         await containerManager.setVolumeManager(volumeManager)
         await containerManager.setNetworkManager(networkManager)

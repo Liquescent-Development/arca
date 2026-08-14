@@ -10,9 +10,10 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, five of the eleven are implemented: `Capabilities`,
-/// `Inspect`, `ListResources`, `PrepareImage` and `Create`.** The other six
-/// answer `unsupported_capability` inside their response `oneof`.
+/// **In this build, eight of the eleven are implemented: `Capabilities`,
+/// `Inspect`, `ListResources`, `PrepareImage`, `Create`, `Start`, `Stop` and
+/// `Remove`.** The other three -- `CreateContainer`, `Exec` and `Logs` -- answer
+/// `unsupported_capability` inside their response `oneof`.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -645,8 +646,29 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     }
 
     /// See the note on the `create(request:)` overload above.
+    ///
+    /// **What this deliberately does NOT do, and it is the whole reason `Start`
+    /// is dangerous to write by looking at the daemon.** The daemon's other
+    /// caller of `startContainer` is `applyRestartPolicies()`
+    /// (`ContainerManager.swift:495`), which asks the store for every container
+    /// whose policy says restart and starts each one (`:513`);
+    /// `ArcaDaemon.swift:286` calls it, and `server.start()` is not until `:314`.
+    /// Imported here, that would boot VMs for sandboxes the consumer believes
+    /// stopped, at a moment before the socket exists, so the consumer could not
+    /// even observe it happening. This method starts exactly the one container the
+    /// request names and the engine runs no policy pass at all; `Create` leaves
+    /// the default `no` policy in place (`ContainerManager.swift:1916`) so there
+    /// is nothing for one to find.
+    ///
+    /// **The refusals run before `startContainer`, and the order is the point.**
+    /// `startContainer` resolves the name at `:2071`, *then* guards on
+    /// `nativeManager` at `:2080`. So the resolver's hex prefix match happens
+    /// first, and by the time anything would refuse, the container this method is
+    /// about is already the wrong one. See `containerNameRefusal`.
     func start(request: Arca_Engine_V1_StartRequest) async -> Arca_Engine_V1_AckResponse {
-        Arca_Engine_V1_AckResponse.with { $0.error = Self.notImplemented("Start") }
+        await lifecycleAck(verb: "start", sandboxId: request.sandboxID) { name in
+            try await self.containerManager.startContainer(id: name)
+        }
     }
 
     public func start(
@@ -657,8 +679,29 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     }
 
     /// See the note on the `create(request:)` overload above.
+    ///
+    /// No timeout is passed because the contract carries none: `StopRequest` is a
+    /// `sandbox_id` and nothing else (engine.proto:372-375), so
+    /// `stopContainer(id:timeout:)` takes its own default rather than a number
+    /// this engine would have invented.
+    ///
+    /// **`Stop` is idempotent below this seam and that is ContainerBridge's
+    /// behaviour, not this method's.** `stopContainer` returns without acting for
+    /// a container already `created`, `exited` or `dead`
+    /// (`ContainerManager.swift:2701-2707`), so a second `Stop` answers `Ack`.
+    /// That is the right answer for a reconciler -- "it is stopped" is what it
+    /// asked for -- but note what it does *not* change: the early return at
+    /// `:2706` never touches `info.state`, so a container that was created and
+    /// never started stays `created`, and `sandboxState(fromStatus:)` maps that
+    /// to `.creating` (`EngineTranslation.swift:129`). `Inspect` therefore
+    /// reports `SANDBOX_STATE_CREATING` after a successful `Stop`. Recorded here
+    /// because it is visible on the wire, and left alone because inventing an
+    /// `exited` state for a container that never ran would be a report of a
+    /// transition that did not happen.
     func stop(request: Arca_Engine_V1_StopRequest) async -> Arca_Engine_V1_AckResponse {
-        Arca_Engine_V1_AckResponse.with { $0.error = Self.notImplemented("Stop") }
+        await lifecycleAck(verb: "stop", sandboxId: request.sandboxID) { name in
+            try await self.containerManager.stopContainer(id: name)
+        }
     }
 
     public func stop(
@@ -668,9 +711,265 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         await stop(request: request)
     }
 
+    /// `Start` and `Stop`, which differ only in the verb and the call.
+    ///
+    /// One function rather than two, because the three gates in front of the call
+    /// are the same three and the failure this shape prevents is one of them being
+    /// added to `Start` and forgotten on `Stop`. See `lifecycleRefusal` for what
+    /// each gate refuses and why `Start` and `Stop` cannot compare owner labels
+    /// the way `Remove` does.
+    ///
+    /// The container is read through `getContainer` first, which resolves through
+    /// the same `resolveContainerID` the call below will -- so this is a
+    /// check-then-act and the two reads can in principle disagree. There is no
+    /// engine-side lock that would make it otherwise, and the narrower race is
+    /// much better than no gate: the same reasoning `create(request:)` records
+    /// for its network-name check.
+    private func lifecycleAck(
+        verb: String,
+        sandboxId: String,
+        _ act: (String) async throws -> Void
+    ) async -> Arca_Engine_V1_AckResponse {
+        let name = SandboxIdentity.containerName(forSandboxId: sandboxId)
+        if let refusal = containerNameRefusal(name) { return Self.ackFailed(refusal) }
+
+        let found = await engineErrorCatching(.commandIo, resource: name) {
+            try await self.containerManager.getContainer(id: name)
+        }
+        let container: Container?
+        switch found {
+        case .failure(let error): return Self.ackFailed(error)
+        case .success(let read): container = read
+        }
+        if let refusal = lifecycleRefusal(
+            verb: verb, sandboxId: name, storedLabels: container?.config.labels
+        ) {
+            return Self.ackFailed(refusal)
+        }
+
+        if case .failure(let error) = await Self.actCatching(resource: name, { try await act(name) }) {
+            return Self.ackFailed(error)
+        }
+        return Arca_Engine_V1_AckResponse.with { $0.ok = Arca_Engine_V1_Ack() }
+    }
+
     /// See the note on the `create(request:)` overload above.
+    ///
+    /// **Every named resource is authorised before any of them is deleted, and
+    /// the two passes cannot be merged.** `AckResponse` is `ok` or `error`
+    /// (engine.proto:76-82) -- there is no `CreateFailed.created` here, no field
+    /// in which a partial teardown can report what it already destroyed. So a
+    /// single pass that deleted a container and then refused its volume would
+    /// leave the consumer with an error, a sandbox that is gone, and no way to
+    /// learn which of the two happened. Refusing the whole call before touching
+    /// anything is the only arrangement in which an error means "nothing
+    /// changed".
+    ///
+    /// A delete that *fails* mid-pass still has that problem and it is not
+    /// solvable here: the resources before it are already gone and the error
+    /// names only the one that failed. That is the contract's shape rather than
+    /// this method's choice, and `ListResources` is what the consumer has to
+    /// reconcile with afterwards.
+    ///
+    /// **No `force`.** `removeContainer` refuses a running container without it
+    /// (`ContainerManager.swift:3011-3013`) and that refusal is the useful one: a
+    /// consumer removing a sandbox it believes stopped, over a sandbox that is
+    /// running, has a disagreement worth hearing about rather than a VM worth
+    /// killing. The sibling backend takes the same position -- `container delete
+    /// <name>` with no `--force` (`crates/gascan-apple/src/backend.rs:513-515`).
+    /// `Stop` is how a consumer means to stop something.
+    ///
+    /// **`removeVolumes` is not passed, and the reason is that it does nothing.**
+    /// `removeContainer(id:force:removeVolumes:)` spans
+    /// `ContainerManager.swift:2995-3202` and the identifier `removeVolumes`
+    /// occurs exactly once inside it: on the signature line. The body never reads
+    /// it, so passing `true` would name a control the code does not have -- the
+    /// shape of claim this milestone has shipped eight defects of. What the body
+    /// does unconditionally is call `cleanupVolumesForContainer` (`:3170`), which
+    /// deletes the container's *anonymous* volume mounts and spares its named
+    /// ones. That is the right behaviour for this contract either way: `Remove`
+    /// names exact resources (engine.proto:377-379), so every volume Gas Can
+    /// wants gone arrives as its own `ResourceIdentity` and is deleted by the
+    /// volume pass below, while an anonymous volume is one no `ResourceIdentity`
+    /// can ever name and would otherwise leak.
     func remove(request: Arca_Engine_V1_RemoveRequest) async -> Arca_Engine_V1_AckResponse {
-        Arca_Engine_V1_AckResponse.with { $0.error = Self.notImplemented("Remove") }
+        // An empty remove has an `Ack` that is true and useless -- "I deleted
+        // everything you named" over nothing. It is refused because the way one
+        // arrives is a caller that dropped its list, and that caller reads the
+        // `Ack` as a teardown that happened. The consumer refuses to build one
+        // itself (`crates/gascan-arca/src/translate.rs:255-256`), so this refuses
+        // nothing it sends.
+        guard !request.resources.isEmpty else {
+            return Self.ackFailed(engineError(
+                .invalidState,
+                message: "a remove names the resources to delete and this one names none"
+            ))
+        }
+        // The labels every resource below is checked against. A half-set owner
+        // cannot be compared -- it would match only resources labelled equally
+        // half-set -- so it is refused here rather than turned into an
+        // `ownership_mismatch` for every resource in the call, which would read
+        // as "these are not yours" when the truth is "you did not say who you
+        // are".
+        guard !request.owner.managedBy.isEmpty, !request.owner.sandboxID.isEmpty else {
+            return Self.ackFailed(engineError(
+                .invalidResourceIdentity,
+                message: "remove requires both owner labels to compare against; this request "
+                    + "carries managed_by '\(request.owner.managedBy)' and sandbox_id "
+                    + "'\(request.owner.sandboxID)'"
+            ))
+        }
+
+        var ordered: [(kind: RemovableKind, name: String)] = []
+        for identity in request.resources {
+            switch removableKind(identity) {
+            case .failure(let error): return Self.ackFailed(error)
+            case .success(let kind): ordered.append((kind: kind, name: identity.name))
+            }
+        }
+        // `enumerated` as the tiebreaker because `sorted(by:)` is not documented
+        // stable: without it, two volumes in one request could be deleted in
+        // either order, and a failure on the second would report a different
+        // resource run to run.
+        ordered = ordered.enumerated()
+            .sorted { ($0.element.kind.removalRank, $0.offset) < ($1.element.kind.removalRank, $1.offset) }
+            .map(\.element)
+
+        for resource in ordered {
+            let held: [String: String]?
+            switch await storedLabels(kind: resource.kind, name: resource.name) {
+            case .failure(let error): return Self.ackFailed(error)
+            case .success(let labels): held = labels
+            }
+            if let refusal = removalRefusal(
+                kind: resource.kind, name: resource.name, storedLabels: held, owner: request.owner
+            ) {
+                return Self.ackFailed(refusal)
+            }
+        }
+
+        for resource in ordered {
+            if let error = await delete(kind: resource.kind, name: resource.name) {
+                return Self.ackFailed(error)
+            }
+        }
+        return Arca_Engine_V1_AckResponse.with { $0.ok = Arca_Engine_V1_Ack() }
+    }
+
+    /// The labels the engine stores for one named resource, or nil when it holds
+    /// no such resource.
+    ///
+    /// Each kind's "absent" is expressed differently by its manager -- a nil
+    /// `Container`, a thrown `VolumeError.notFound`, a nil `NetworkMetadata` --
+    /// and collapsing the three into one optional here is what lets
+    /// `removalRefusal` be a pure function with one absent case. A manager
+    /// failure that is *not* absence stays a failure: a `command_io` that says
+    /// "I could not tell" rather than a `not_found` that says "it is not there",
+    /// because the consumer creates on the second and retries on the first.
+    private func storedLabels(
+        kind: RemovableKind,
+        name: String
+    ) async -> Result<[String: String]?, Arca_Engine_V1_EngineError> {
+        switch kind {
+        case .container:
+            return await engineErrorCatching(.commandIo, resource: name) {
+                try await self.containerManager.getContainer(id: name)?.config.labels
+            }
+        case .volume:
+            do {
+                return .success(try await volumeManager.inspectVolume(name: name).labels)
+            } catch VolumeError.notFound {
+                return .success(nil)
+            } catch {
+                return .failure(engineError(.commandIo, resource: name, message: "\(error)"))
+            }
+        case .network:
+            return .success(await networkManager.getNetworkByName(name: name)?.labels)
+        }
+    }
+
+    /// One authorised resource, deleted, or the failure that says why it was not.
+    ///
+    /// The network is looked up again rather than carried from the authorisation
+    /// pass because `deleteNetwork` takes an id and the contract names a network
+    /// by name (engine.proto:162-166). A network that vanished between the two
+    /// passes is `not_found` here rather than a crash on a stale id.
+    private func delete(kind: RemovableKind, name: String) async -> Arca_Engine_V1_EngineError? {
+        switch kind {
+        case .container:
+            let done = await Self.actCatching(resource: name) {
+                try await self.containerManager.removeContainer(id: name)
+            }
+            if case .failure(let error) = done { return error }
+        case .volume:
+            let done = await Self.actCatching(resource: name) {
+                try await self.volumeManager.deleteVolume(name: name)
+            }
+            if case .failure(let error) = done { return error }
+        case .network:
+            guard let network = await networkManager.getNetworkByName(name: name) else {
+                return engineError(
+                    .notFound,
+                    resource: name,
+                    message: "this engine holds no network named \(name)"
+                )
+            }
+            let done = await Self.actCatching(resource: name) {
+                try await self.networkManager.deleteNetwork(id: network.id)
+            }
+            if case .failure(let error) = done { return error }
+        }
+        return nil
+    }
+
+    /// `engineErrorCatching` with the distinctions the acting methods have to
+    /// preserve, the way `createCatching` carries `Create`'s.
+    ///
+    /// Three codes rather than one `command_failed`, because each tells a
+    /// reconciler to do something different:
+    ///
+    /// - **`not_found`.** Every method here checks the store before it acts, so a
+    ///   `containerNotFound` from the act itself means the container went away in
+    ///   between. `command_failed` would have the consumer retry against a
+    ///   sandbox that is gone; `not_found` has it create one.
+    /// - **`invalid_state`.** `containerRunning` is `removeContainer` refusing to
+    ///   destroy a running sandbox without `force`. Retrying is futile until
+    ///   something stops it, which is what `invalid_state` says and what
+    ///   `command_failed` does not.
+    /// - **`command_failed`** for everything else, including the
+    ///   `notInitialized` an unstarted engine raises: the engine tried and
+    ///   something broke.
+    private static func actCatching(
+        resource: String,
+        _ body: () async throws -> Void
+    ) async -> Result<Void, Arca_Engine_V1_EngineError> {
+        do {
+            return .success(try await body())
+        } catch {
+            let code: EngineErrorCode
+            switch error {
+            case ContainerManagerError.containerNotFound, VolumeError.notFound,
+                 NetworkManagerError.networkNotFound:
+                code = .notFound
+            case ContainerManagerError.containerRunning, VolumeError.inUse:
+                code = .invalidState
+            default:
+                code = .commandFailed
+            }
+            return .failure(engineError(code, resource: resource, message: "\(error)"))
+        }
+    }
+
+    /// The failure arm of an `AckResponse`, in one place.
+    ///
+    /// Every refusal in `Start`, `Stop` and `Remove` goes through it, for the
+    /// reason `createFailed` exists: spelling the wrapper out at a dozen early
+    /// returns is a dozen chances for one of them to leave the `oneof` unset, and
+    /// an `AckResponse` with no outcome reads as neither success nor failure.
+    private static func ackFailed(
+        _ error: Arca_Engine_V1_EngineError
+    ) -> Arca_Engine_V1_AckResponse {
+        Arca_Engine_V1_AckResponse.with { $0.error = error }
     }
 
     public func remove(
