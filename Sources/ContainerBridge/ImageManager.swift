@@ -612,43 +612,66 @@ public actor ImageManager {
         // failed to find a counterexample; and `deleteImage` can trust that a
         // digest reference naming a real row resolves to THAT row, which is what
         // makes its guard deterministic.
-        for image in images {
-            let dockerID = generateDockerID(from: image.digest)
+        //
+        // **Every arm collects, sorts and takes the first**, including the two ID
+        // arms, and that uniformity is load-bearing rather than tidy. A first
+        // version of this fix ordered the arms but left the ID arms returning
+        // whichever row the loop reached first -- and both can match more than
+        // one row, because two references to one content share a digest. Task
+        // 11's re-review measured five reads of one unchanged store, inside one
+        // process, giving two different answers for a short ID and for a long
+        // ID, on the supposedly-fixed build. Half a fix here is a boundary the
+        // next reader has to know about, and the comment explaining it is what
+        // they would have to find first.
+        //
+        // NOT fixed here, and pre-existing: `deleteImage` deletes by the
+        // resolved row's reference and its digest-reference guard cannot fire
+        // for an ID input, so `docker rmi <short-id>` over content carrying two
+        // names still untags one of them -- now deterministically rather than
+        // arbitrarily. Docker refuses that outright ("image is referenced in
+        // multiple repositories"). Reported rather than fixed: it is not this
+        // change's to make.
 
-            // Match short ID (first 12+ chars)
-            if isShortID && dockerID.replacingOccurrences(of: "sha256:", with: "").hasPrefix(nameOrId) {
-                logger.debug("Matched image by short ID", metadata: [
-                    "input": "\(nameOrId)",
-                    "reference": "\(image.reference)",
-                    "digest": "\(image.digest)"
-                ])
-                return image
-            }
+        // Match short ID (first 12+ chars)
+        if isShortID,
+           let image = firstByReference(images.filter {
+               generateDockerID(from: $0.digest)
+                   .replacingOccurrences(of: "sha256:", with: "").hasPrefix(nameOrId)
+           }) {
+            logger.debug("Matched image by short ID", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
+        }
 
-            // Match long ID (full digest)
-            if isLongID && dockerID == nameOrId {
-                logger.debug("Matched image by long ID", metadata: [
-                    "input": "\(nameOrId)",
-                    "reference": "\(image.reference)",
-                    "digest": "\(image.digest)"
-                ])
-                return image
-            }
+        // Match long ID (full digest)
+        if isLongID,
+           let image = firstByReference(images.filter {
+               generateDockerID(from: $0.digest) == nameOrId
+           }) {
+            logger.debug("Matched image by long ID", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
+        }
 
-            // Match by reference (tag) - need to check multiple variations.
-            // Ahead of the digest arm below: a row the caller NAMED is a more
-            // specific answer than a row that merely holds the content.
-            if !isShortID && !isLongID {
-                // Try to match the stored reference against the input in various ways
-                if matchesReference(stored: image.reference, input: nameOrId) {
-                    logger.debug("Matched image by reference", metadata: [
-                        "input": "\(nameOrId)",
-                        "reference": "\(image.reference)",
-                        "digest": "\(image.digest)"
-                    ])
-                    return image
-                }
-            }
+        // Match by reference (tag) - need to check multiple variations.
+        // Ahead of the digest arm below: a row the caller NAMED is a more
+        // specific answer than a row that merely holds the content.
+        if !isShortID, !isLongID,
+           let image = firstByReference(images.filter {
+               matchesReference(stored: $0.reference, input: nameOrId)
+           }) {
+            logger.debug("Matched image by reference", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
         }
 
         // Match an exact digest reference: both halves, never one.
@@ -664,31 +687,43 @@ public actor ImageManager {
         // that the stored `workspace:latest` and the requested
         // `workspace@sha256:...` meet on `workspace` by the same rule the engine
         // uses when it decides it holds the content at all.
-        //
-        // Sorted by reference before choosing, so that a store holding the same
-        // content under two names in the same repository answers the same way
-        // twice. Nothing here depends on `list()`'s order.
-        if let exactDigest {
-            let candidates = images
-                .filter {
-                    $0.digest == exactDigest.digest
-                        && ImageIdentity.repository(of: $0.reference) == exactDigest.repository
-                }
-                .sorted { $0.reference < $1.reference }
-            if let image = candidates.first {
-                logger.debug("Matched image by exact digest reference", metadata: [
-                    "input": "\(nameOrId)",
-                    "reference": "\(image.reference)",
-                    "digest": "\(image.digest)",
-                    "candidates": "\(candidates.count)"
-                ])
-                return image
-            }
+        if let exactDigest,
+           let image = firstByReference(images.filter {
+               $0.digest == exactDigest.digest
+                   && ImageIdentity.repository(of: $0.reference) == exactDigest.repository
+           }) {
+            logger.debug("Matched image by exact digest reference", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
         }
 
         // Not found
         logger.warning("Image not found", metadata: ["name_or_id": "\(nameOrId)"])
         throw ImageManagerError.imageNotFound(nameOrId)
+    }
+
+    /// The one candidate a set of equally-valid matches resolves to.
+    ///
+    /// Every arm of `resolveImage` funnels through this, so "which row wins" is
+    /// decided in one place by one rule rather than four times by
+    /// `imageStore.list()`'s enumeration. The reference is the tie-break because
+    /// it is the only field that distinguishes two rows on one content: they
+    /// share a digest by construction, which is precisely why the ambiguity
+    /// exists.
+    ///
+    /// Ascending, and the direction is arbitrary but must be *fixed*. A test
+    /// pins it (`ImageResolutionTests` requires the `:alpha` row over the
+    /// `:zulu` one), because a tie-break nothing asserts is a tie-break a later
+    /// edit can reverse or delete without anything noticing -- which is exactly
+    /// what happened to the first version of this: both mutations survived the
+    /// whole suite.
+    private func firstByReference(
+        _ candidates: [Containerization.Image]
+    ) -> Containerization.Image? {
+        candidates.min { $0.reference < $1.reference }
     }
 
     /// Check if a stored image reference matches an input reference

@@ -317,25 +317,20 @@ final class ImageResolutionTests: XCTestCase {
         }
     }
 
-    /// Resolution is decided by what the store holds, not by how it enumerates.
+    /// A row the caller named beats a row that merely holds the content, on
+    /// every read.
     ///
-    /// The companion to the test above, on the read side and without the delete:
-    /// one unchanged store, asked the same question repeatedly, must answer
-    /// identically. This is **Minor 6** from the round-1 review -- recorded there
-    /// as an unpinned assumption -- closed by the same ordering change rather
-    /// than by a separate guard, and pinned here.
-    ///
-    /// The third row exists to give a tie-break something to trip on: it holds
-    /// the same content under a digest-form name that sorts before the one being
-    /// asked for.
-    func testResolutionIsAFunctionOfStoreContentsAndNotEnumerationOrder() async throws {
+    /// **This tests arm PRECEDENCE and -- corrected -- it does not test the
+    /// tie-break.** Its first version claimed a third row "gives a tie-break
+    /// something to trip on"; the re-review showed the tie-break never runs
+    /// here, because the store holds a row named exactly what is being asked
+    /// for, so the name arm answers and the digest pass is never reached. The
+    /// tie-break has its own test below. This one goes RED under the interleaved
+    /// mutation, which is what it is for.
+    func testANamedRowBeatsAContentMatchOnEveryRead() async throws {
         let store = try await preparedStore()
         let named = "workspace@sha256:\(store.hex)"
         try await store.manager.tagImage(source: "workspace:latest", target: named)
-        try await store.manager.tagImage(
-            source: "workspace:latest",
-            target: "workspace@sha256:\(String(repeating: "0", count: 64))"
-        )
 
         var answers: Set<String> = []
         for _ in 1...25 {
@@ -345,6 +340,77 @@ final class ImageResolutionTests: XCTestCase {
             answers, [named],
             "twenty-five reads of one unchanged store must give exactly one answer, and it "
                 + "must be the row the caller named"
+        )
+    }
+
+    /// The digest pass's tie-break is fixed, not incidental.
+    ///
+    /// **The store is built so the digest pass is the only arm that can
+    /// answer**: no row is named `workspace@sha256:<hex>`, and two rows hold that
+    /// content under the same repository. Both are equally valid answers, so
+    /// something must choose -- and if that something is `imageStore.list()`'s
+    /// order, the resolver is nondeterministic again.
+    ///
+    /// Pinned to `workspace:alpha`, the lexicographically smaller reference. The
+    /// direction is arbitrary; that it is *fixed* is not. Both mutations the
+    /// re-review ran against the first version of this fix -- reversing the sort
+    /// and deleting it -- survived all 137 tests, which is what a tie-break with
+    /// no test looks like. This is **Minor 6** from round 1, finally pinned.
+    ///
+    /// Twenty independent stores, because the failure is per-process.
+    func testTheDigestPassPicksTheSameCandidateEveryTime() async throws {
+        for iteration in 1...20 {
+            let store = try await preparedStore()
+            try await store.manager.tagImage(source: "workspace:latest", target: "workspace:alpha")
+            try await store.manager.tagImage(source: "workspace:latest", target: "workspace:zulu")
+            // Leaves exactly two rows, both holding this content under
+            // `workspace`, and neither named by the digest reference below.
+            _ = try await store.manager.deleteImage(nameOrId: "workspace:latest")
+
+            let resolved = try await store.manager.getImage(
+                nameOrId: "workspace@sha256:\(store.hex)"
+            )
+            XCTAssertEqual(
+                resolved.reference, "workspace:alpha",
+                "run \(iteration): with two equally-valid candidates the digest pass must "
+                    + "choose by a fixed rule, not by the store's enumeration order"
+            )
+        }
+    }
+
+    /// The ID arms are order-independent too.
+    ///
+    /// **The re-review measured these still unstable after the first ordering
+    /// fix**: five reads of one unchanged store, inside one process, gave two
+    /// different answers for a short ID and for a long ID. Both arms can match
+    /// more than one row -- two references to one content share a digest -- and
+    /// both were still returning whichever row the loop reached first.
+    ///
+    /// So "resolution is a function of what the store holds, not how it
+    /// enumerates" was false for half the arms while being written in three
+    /// places. Every arm now collects, sorts and takes the first, and this says
+    /// so rather than the comment saying it.
+    func testTheShortAndLongIdArmsAlsoAnswerTheSameWayEveryTime() async throws {
+        let store = try await preparedStore()
+        try await store.manager.tagImage(source: "workspace:latest", target: "workspace:alpha")
+        try await store.manager.tagImage(source: "workspace:latest", target: "workspace:zulu")
+
+        var shortIdAnswers: Set<String> = []
+        var longIdAnswers: Set<String> = []
+        for _ in 1...25 {
+            shortIdAnswers.insert(
+                try await store.manager.getImage(nameOrId: String(store.hex.prefix(12))).reference
+            )
+            longIdAnswers.insert(
+                try await store.manager.getImage(nameOrId: "sha256:\(store.hex)").reference
+            )
+        }
+        XCTAssertEqual(
+            shortIdAnswers, ["workspace:alpha"],
+            "a short ID matching three rows must resolve to one of them by a fixed rule"
+        )
+        XCTAssertEqual(
+            longIdAnswers, ["workspace:alpha"], "and so must a long ID"
         )
     }
 
