@@ -453,11 +453,32 @@ public struct EngineServer: Sendable {
 /// overstated it.** It said "an engine that is never asked to quiesce never
 /// creates a promise at all", which was true only while nothing read the
 /// `drained` property this type published -- and reading it minted one, then
-/// killed the binary. The accurate statement is narrower: minting is reachable
-/// only through `beginGracefulShutdown` and `runUntilQuiesced`, both of which
-/// are explicit calls that mean a shutdown is happening, and the caller that
-/// makes either is the caller that completes it. There is no longer any way to
-/// arm this by reading.
+/// killed the binary. Minting is reachable only through `beginGracefulShutdown`
+/// and `runUntilQuiesced`, both explicit calls that mean a shutdown is
+/// happening. Nothing arms it by reading any more.
+///
+/// **The two are NOT symmetric about completing what they mint, and the revision
+/// that corrected the sentence above introduced a second wrong one.** It said
+/// "the caller that makes either is the caller that completes it", which is
+/// false for one of the two and contradicts this type's own first paragraph --
+/// the whole reason `Drain` exists is that either half may run first.
+///
+/// - `beginGracefulShutdown` **completes what it mints**, handing the promise to
+///   the server in the same expression.
+/// - `runUntilQuiesced` **completes nothing.** It mints only if nothing has yet,
+///   and waits. With no shutdown ever initiated it waits forever, on a promise
+///   whose only completer never comes.
+///
+/// **That second case is inert rather than a leak, and it is measured -- by the
+/// re-review against `7aeee3c`, not here.** A probe calling `runUntilQuiesced()`
+/// with the shutdown never initiated passes: the `get()` blocked on the promise
+/// retains it, so the future never deallocates and `EventLoopFuture.deinit`'s
+/// `debugOnly` check never runs, and shutting the group down with it still
+/// pending produced no diagnostic. What is left is a task that waits forever,
+/// which is precisely the case `ArcaEngineCommand`'s `onClose` guard exists for.
+/// The same review measured the other order -- `shutDown()` first, then
+/// `beginGracefulShutdown` -- and a closed server still completes the promise,
+/// so the escalation path cannot strand one either.
 final class Drain: Sendable {
     private let eventLoop: EventLoop
     private let made = NIOLockedValueBox<EventLoopPromise<Void>?>(nil)
