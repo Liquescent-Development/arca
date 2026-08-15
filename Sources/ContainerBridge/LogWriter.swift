@@ -116,17 +116,24 @@ public final class ContainerLogManager: @unchecked Sendable {
         public let combinedPath: URL
     }
 
-    public init(logger: Logger) {
+    /// - Parameter logRoot: The directory container log directories are created
+    ///   under, and the directory `removeLogs` deletes from. Supplied by the
+    ///   caller and never defaulted: this class both writes and deletes here,
+    ///   and until Task 13b it derived `~/Library/Application Support/
+    ///   com.apple.arca/logs` for itself, so every `ContainerManager` -- however
+    ///   its own state root was set -- wrote container stdout/stderr into one
+    ///   shared directory and removed containers' logs out of it. A throwaway
+    ///   engine deleting under the operator's real log store is the failure
+    ///   that shape allows.
+    ///
+    ///   A default would put that back the moment a caller omitted the
+    ///   argument, which is the rule the milestone's design states for every
+    ///   `ContainerBridge` change: none takes a default, because a default is
+    ///   how a caller silently keeps the old behaviour after the reason for it
+    ///   has gone.
+    public init(logRoot: URL, logger: Logger) {
         self.logger = logger
-
-        // Use ~/Library/Application Support/com.apple.arca/logs/
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
-        self.baseLogDir = appSupport
-            .appendingPathComponent("com.apple.arca")
-            .appendingPathComponent("logs")
+        self.baseLogDir = logRoot
     }
 
     /// Get log directory for a container

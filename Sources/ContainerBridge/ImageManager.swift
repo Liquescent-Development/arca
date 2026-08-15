@@ -27,6 +27,17 @@ public actor ImageManager {
         self.defaultPlatform = Platform.current
     }
 
+    /// Root of the `ImageStore` this manager loads into.
+    ///
+    /// Exists so that a caller which has to reason about a file *inside* the
+    /// store -- `initfs.ext4`, which Containerization builds at the store's own
+    /// path -- can ask the manager instead of re-deriving that path from the
+    /// same defaults and trusting the two to stay equal.
+    ///
+    /// `nonisolated` because it is fixed at construction: making callers await
+    /// a constant would be the reason they went on hand-deriving it.
+    nonisolated public var storeRoot: URL { imageStore.path }
+
     /// Initialize the image manager
     public func initialize() async throws {
         logger.info("Initializing ImageManager", metadata: [
@@ -424,6 +435,41 @@ public actor ImageManager {
         // Check if image is in use by containers (if not force)
         if !force {
             // TODO: Check with ContainerManager if image is in use
+
+            // **A digest reference must not delete a row it did not name.**
+            // This method deletes by the RESOLVED row's reference below, not by
+            // the string it was given, and `resolveImage` now resolves
+            // `repo@sha256:<hex>` by content. Without this guard,
+            // `docker rmi alpha@sha256:<digest>` against a store whose only row
+            // is `alpha:latest` untags `alpha:latest` and cleans up the content
+            // behind it -- removing a name the caller never typed. MEASURED in
+            // Task 11's review, before this guard existed:
+            // `deleteImage(alpha@digest)` returned
+            // `untagged: alpha:latest, deleted: sha256:f056fb09b4cd…`, and
+            // `alpha:latest` was gone afterwards. Before the resolver arm the
+            // same call threw `No such image`, so the widening turned an error
+            // into a destructive success.
+            //
+            // Docker's own behaviour is the model, and it is NOT "the digest
+            // form just works": `rmi` by digest removes the digest reference,
+            // and refuses to remove content carrying other references without
+            // `--force`. So a digest reference naming an actual stored row still
+            // deletes exactly that row -- the equality below holds for it -- and
+            // one that resolves to a differently-named row is refused, with the
+            // message saying what to do instead.
+            if let requested = ImageIdentity.exactDigest(of: nameOrId),
+               imageReference != nameOrId {
+                logger.warning("Refusing to delete a row the digest reference did not name", metadata: [
+                    "requested": "\(nameOrId)",
+                    "resolved": "\(imageReference)"
+                ])
+                throw ImageManagerError.deleteFailed(
+                    "\(nameOrId) resolves to \(imageReference), which is a different reference; "
+                        + "deleting it would remove a name that was not asked for. Delete "
+                        + "\(imageReference) by name, or repeat with force to remove the content "
+                        + "held under \(requested.repository)."
+                )
+            }
         }
 
         // Delete the image by reference
@@ -493,61 +539,204 @@ public actor ImageManager {
     /// - Short reference: nginx:alpine, nginx
     /// - Short ID: 4986bf8c1536 (12 chars)
     /// - Long ID: sha256:4986bf8c15... (full digest)
+    /// - Exact digest reference: nginx@sha256:4986bf8c15... (repository AND digest)
+    ///
+    /// **The exact-digest arm was added because nothing here could resolve the
+    /// only form the sandbox engine is able to use.**
+    /// `ContainerManager.createContainer` resolves an image with the same string
+    /// it records as `ContainerInfo.image` (`:1698` and `:1901`),
+    /// `startContainer` resolves that recorded string again when it rebuilds a
+    /// container from persisted state (`:2218`), and the engine's `Inspect`
+    /// requires the recorded string to be an exact digest reference or it
+    /// answers `invalid_output`. One field, three constraints, and only
+    /// `repository@sha256:<hex>` satisfies all three -- which is also exactly
+    /// what Gas Can sends for every create
+    /// (`crates/gascan-core/src/runtime.rs:677-686`).
+    ///
+    /// Before this arm existed, such a string fell through to `matchesReference`
+    /// below, which compares names and cannot match a digest, so every create
+    /// following a successful `PrepareImage` failed to resolve its own image.
+    ///
+    /// **The change is additive, and after the ordering fix below it is additive
+    /// by construction rather than by measurement.** An exact digest reference is
+    /// neither `isShortID` -- the `@`, the `:` and the repository letters fail
+    /// `^[a-f0-9]{12,64}$` -- nor `isLongID`, whose `hasPrefix("sha256:")` fails
+    /// on the repository prefix. So `matchesReference` still runs for it, and it
+    /// runs *first*: every name arm is tried against every row before the digest
+    /// arm is tried at all. A store row whose reference literally is
+    /// `repository@sha256:<hex>` therefore still resolves by exact string match,
+    /// and no store can be built in which this arm takes a resolution away from
+    /// an arm that existed before it. Nothing that resolved before resolves
+    /// differently; a form that threw can now succeed.
+    ///
+    /// This does change Arca's Docker surface: `docker run|rmi|inspect
+    /// repo@sha256:...` now works where it previously reported "No such image".
+    /// That is Docker's own semantics for the form, and the change is deliberate
+    /// rather than a side effect.
     private func resolveImage(nameOrId: String) async throws -> Containerization.Image {
         // Check if input is a Docker ID (short or long)
         let isShortID = nameOrId.range(of: "^[a-f0-9]{12,64}$", options: .regularExpression) != nil
         let isLongID = nameOrId.hasPrefix("sha256:")
+        let exactDigest = ImageIdentity.exactDigest(of: nameOrId)
 
         logger.debug("Resolving image", metadata: [
             "name_or_id": "\(nameOrId)",
             "is_short_id": "\(isShortID)",
-            "is_long_id": "\(isLongID)"
+            "is_long_id": "\(isLongID)",
+            "is_exact_digest": "\(exactDigest != nil)"
         ])
 
         // For both ID-based and tag-based lookups, we need to list all images
         // because the stored reference might not match our normalized version
         let images = try await imageStore.list()
 
-        for image in images {
-            let dockerID = generateDockerID(from: image.digest)
+        // **One pass per arm, not one pass per row, and the difference is
+        // correctness rather than style.** `imageStore.list()` order is the
+        // store's own and is neither insertion nor sorted order -- MEASURED in
+        // Task 11's re-review, which saw `getImage` and `deleteImage` resolve the
+        // same string to different rows inside one process, and a legitimate
+        // `docker rmi repo@sha256:x` throw on 2 of 5 runs.
+        //
+        // The cause was arm precedence being decided by row order: with the arms
+        // interleaved inside one loop, whichever ROW came first decided which
+        // ARM answered. Two rows can both match one input -- a row literally
+        // named `repo@sha256:x` matches by name, and the row holding that
+        // content matches by digest -- so the answer depended on the store's
+        // enumeration.
+        //
+        // Ordering the arms fixes it at the root and buys three things: the
+        // result is a function of the store's contents rather than its order;
+        // NAME matching always beats CONTENT matching, so the exact-digest arm
+        // can never take a resolution away from an arm that existed before it --
+        // the additive claim now holds by construction rather than by having
+        // failed to find a counterexample; and `deleteImage` can trust that a
+        // digest reference naming a real row resolves to THAT row, which is what
+        // makes its guard deterministic.
+        //
+        // **Every arm collects and takes the minimum**, including the two ID
+        // arms, and that uniformity is load-bearing rather than tidy. A first
+        // version of this fix ordered the arms but left the ID arms returning
+        // whichever row the loop reached first -- and both can match more than
+        // one row, because two references to one content share a digest. Task
+        // 11's re-review measured five reads of one unchanged store, inside one
+        // process, giving two different answers for a short ID and for a long
+        // ID, on the supposedly-fixed build. Half a fix here is a boundary the
+        // next reader has to know about, and the comment explaining it is what
+        // they would have to find first.
+        //
+        // NOT fixed here, and pre-existing: `deleteImage` deletes by the
+        // resolved row's reference and its digest-reference guard cannot fire
+        // for an ID input, so `docker rmi <short-id>` over content carrying two
+        // names still untags one of them -- now deterministically rather than
+        // arbitrarily. Docker refuses that outright ("image is referenced in
+        // multiple repositories"). Reported rather than fixed: it is not this
+        // change's to make.
 
-            // Match short ID (first 12+ chars)
-            if isShortID && dockerID.replacingOccurrences(of: "sha256:", with: "").hasPrefix(nameOrId) {
-                logger.debug("Matched image by short ID", metadata: [
-                    "input": "\(nameOrId)",
-                    "reference": "\(image.reference)",
-                    "digest": "\(image.digest)"
-                ])
-                return image
-            }
+        // Match short ID (first 12+ chars)
+        if isShortID,
+           let image = minimumByReference(images.filter {
+               generateDockerID(from: $0.digest)
+                   .replacingOccurrences(of: "sha256:", with: "").hasPrefix(nameOrId)
+           }) {
+            logger.debug("Matched image by short ID", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
+        }
 
-            // Match long ID (full digest)
-            if isLongID && dockerID == nameOrId {
-                logger.debug("Matched image by long ID", metadata: [
-                    "input": "\(nameOrId)",
-                    "reference": "\(image.reference)",
-                    "digest": "\(image.digest)"
-                ])
-                return image
-            }
+        // Match long ID (full digest)
+        if isLongID,
+           let image = minimumByReference(images.filter {
+               generateDockerID(from: $0.digest) == nameOrId
+           }) {
+            logger.debug("Matched image by long ID", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
+        }
 
-            // Match by reference (tag) - need to check multiple variations
-            if !isShortID && !isLongID {
-                // Try to match the stored reference against the input in various ways
-                if matchesReference(stored: image.reference, input: nameOrId) {
-                    logger.debug("Matched image by reference", metadata: [
-                        "input": "\(nameOrId)",
-                        "reference": "\(image.reference)",
-                        "digest": "\(image.digest)"
-                    ])
-                    return image
-                }
-            }
+        // Match by reference (tag) - need to check multiple variations.
+        // Ahead of the digest arm below: a row the caller NAMED is a more
+        // specific answer than a row that merely holds the content.
+        if !isShortID, !isLongID,
+           let image = minimumByReference(images.filter {
+               matchesReference(stored: $0.reference, input: nameOrId)
+           }) {
+            logger.debug("Matched image by reference", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
+        }
+
+        // Match an exact digest reference: both halves, never one.
+        //
+        // The repository is compared as well as the digest, and it is compared
+        // exactly -- no registry normalization -- which is the same direction the
+        // engine's PrepareImage chose. Matching on the digest alone would resolve
+        // `anything-at-all@sha256:<hex>` to this image, which is a container
+        // created from content under a name its caller never asked for. A false
+        // "not found" is visible and recoverable; a false match is neither.
+        //
+        // Both sides go through ImageIdentity.repository(of:), the one split, so
+        // that the stored `workspace:latest` and the requested
+        // `workspace@sha256:...` meet on `workspace` by the same rule the engine
+        // uses when it decides it holds the content at all.
+        if let exactDigest,
+           let image = minimumByReference(images.filter {
+               $0.digest == exactDigest.digest
+                   && ImageIdentity.repository(of: $0.reference) == exactDigest.repository
+           }) {
+            logger.debug("Matched image by exact digest reference", metadata: [
+                "input": "\(nameOrId)",
+                "reference": "\(image.reference)",
+                "digest": "\(image.digest)"
+            ])
+            return image
         }
 
         // Not found
         logger.warning("Image not found", metadata: ["name_or_id": "\(nameOrId)"])
         throw ImageManagerError.imageNotFound(nameOrId)
+    }
+
+    /// The one candidate a set of equally-valid matches resolves to.
+    ///
+    /// Every arm of `resolveImage` funnels through this, so "which row wins" is
+    /// decided in one place by one rule rather than four times by
+    /// `imageStore.list()`'s enumeration. The reference is the tie-break because
+    /// it is the only field that distinguishes two rows on one content: they
+    /// share a digest by construction, which is precisely why the ambiguity
+    /// exists.
+    ///
+    /// Ascending, and the direction is arbitrary but must be *fixed*. A test
+    /// pins it (`ImageResolutionTests` requires the `:alpha` row over the
+    /// `:zulu` one), because a tie-break nothing asserts is a tie-break a later
+    /// edit can reverse or delete without anything noticing -- which is exactly
+    /// what happened to the first version of this: both mutations survived the
+    /// whole suite.
+    ///
+    /// The candidate count is logged on every match, because it is the only
+    /// signal in the logs that a resolution was ambiguous and this rule -- not
+    /// the caller's input -- decided which row the user got. The old
+    /// exact-digest arm logged it; funnelling it through here gives every arm
+    /// what only that one arm used to have.
+    private func minimumByReference(
+        _ candidates: [Containerization.Image]
+    ) -> Containerization.Image? {
+        guard let chosen = candidates.min(by: { $0.reference < $1.reference }) else {
+            return nil
+        }
+        logger.debug("Chose among matching rows by reference", metadata: [
+            "candidates": "\(candidates.count)",
+            "reference": "\(chosen.reference)"
+        ])
+        return chosen
     }
 
     /// Check if a stored image reference matches an input reference
@@ -627,6 +816,117 @@ public actor ImageManager {
         return image
     }
 
+    /// Whether this store holds, in full, the content named by an exact digest.
+    ///
+    /// **The lookup is exact string equality against the digest each stored
+    /// image carries, and deliberately not `resolveImage(nameOrId:)`.** That
+    /// resolver has three arms, and two of them are wrong for a caller asking
+    /// "do you hold this content": the reference arm matches a *tag*
+    /// (`matchesReference` above, which also normalizes registries and falls
+    /// back to suffix matching), so it answers about a name that can be
+    /// remapped to different bytes at any time; and the short-ID arm matches a
+    /// 12-character prefix. A caller building a promise on the answer needs
+    /// neither. Passing `sha256:<hex>` to `resolveImage` would take its long-ID
+    /// arm, which is exact -- but only by coincidence of the input, and a later
+    /// caller passing something else would silently get the forgiving arms.
+    ///
+    /// The digest compared against is the store's own root descriptor digest,
+    /// which for an image imported from a single-manifest OCI layout is an
+    /// index Containerization *synthesizes* during the import
+    /// (`ImageStore+Import.swift:216-224`), not the manifest digest the layout
+    /// named. A caller holding the manifest digest for such an image gets
+    /// `.noImageForDigest` here. That is the safe direction -- a false "not
+    /// held" is recoverable and visible, a false "held" is neither -- but it is
+    /// a real limitation and not an accident.
+    ///
+    /// Three cases and not a `Bool`, for the reason `imageExists(nameOrId:)`
+    /// above is too cheap an answer to build a promise on: it collapses "no
+    /// such image", "the store has a row and cannot produce its bytes", and
+    /// "the read itself failed" into `false`. Those demand different reports.
+    ///
+    /// **Every row carrying the digest is reported, not the first one found.**
+    /// A store holds one row per *reference*, and `tagImage(source:target:)`
+    /// above adds a second reference to content that is already there, so two
+    /// rows can carry one digest. An earlier revision of this returned the
+    /// first match, and a caller that then tested that one reference against
+    /// the name it asked about got a `not_found` decided by `imageStore.list()`
+    /// ordering -- for content the store demonstrably held, naming the wrong
+    /// reference while it did so. The blob walk below is unaffected by that
+    /// multiplicity and is done once: the rows share a root descriptor and a
+    /// content store, so they reference identical blobs by construction.
+    ///
+    /// - Parameter digest: The content digest, in the `sha256:<hex>` form the
+    ///   store records. Anything else matches nothing.
+    /// - Throws: Whatever listing the store throws. A store that cannot be read
+    ///   is not a store that holds nothing.
+    package func heldImageContent(digest: String) async throws -> HeldImageContent {
+        let images = try await imageStore.list()
+        let matches = images.filter { $0.digest == digest }
+        guard let image = matches.first else {
+            logger.debug("No image holds this content digest", metadata: ["digest": "\(digest)"])
+            return .noImageForDigest
+        }
+        // Sorted for the reason the missing digests below are: `list()`'s order
+        // is the store's, and a caller putting these in a message would
+        // otherwise report one store two different ways across two runs.
+        let references = matches.map(\.reference).sorted()
+
+        // `referencedDigests()` reads the image's own index blob before it can
+        // name anything else, so a throw here is that blob being absent or
+        // undecodable -- which is this image's content missing, reported as
+        // such rather than as a read failure.
+        let referenced: [String]
+        do {
+            referenced = try await image.referencedDigests()
+        } catch {
+            logger.warning("Image index unreadable", metadata: [
+                "references": "\(references.joined(separator: ", "))",
+                "digest": "\(digest)",
+                "error": "\(error)"
+            ])
+            return .blobsMissing(references: references, digests: [image.digest])
+        }
+
+        // Every blob the image names, fetched from the content store. This is
+        // what separates a store that has a row from a store a container can
+        // actually be created from: `OverlayFSUnpacker.unpack` reads each layer
+        // by digest, and a layer that is not here fails there instead.
+        //
+        // A throw from `getContent` is the blob being absent: its other failure
+        // mode is a digest the image does not reference, and every digest here
+        // came from the image's own reference walk.
+        //
+        // Not exhaustive in one case, deliberately unrepaired: `referencedDigests`
+        // skips the children of a manifest it cannot decode. The manifest's own
+        // digest is still in the list, so such an image is still reported
+        // incomplete -- just without its layers enumerated beneath it.
+        var missing: [String] = []
+        for candidate in referenced {
+            do {
+                _ = try await image.getContent(digest: candidate)
+            } catch {
+                missing.append(generateDockerID(from: candidate))
+            }
+        }
+        guard missing.isEmpty else {
+            logger.warning("Image is missing content it references", metadata: [
+                "references": "\(references.joined(separator: ", "))",
+                "digest": "\(digest)",
+                "missing": "\(missing.joined(separator: ", "))"
+            ])
+            // Sorted because the walk's order follows the index, and a caller
+            // that puts these in a message would otherwise report the same
+            // damaged image two different ways.
+            return .blobsMissing(references: references, digests: missing.sorted())
+        }
+
+        logger.debug("Image content held in full", metadata: [
+            "references": "\(references.joined(separator: ", "))",
+            "digest": "\(digest)"
+        ])
+        return .held(references: references)
+    }
+
     /// Normalize image reference to Docker Hub format
     /// Docker convention:
     /// - "alpine" → "docker.io/library/alpine:latest"
@@ -704,6 +1004,35 @@ public actor ImageManager {
             labels: config.labels ?? [:]
         )
     }
+}
+
+// MARK: - Held content
+
+/// What an image store can say about content named by an exact digest.
+///
+/// The answer to `heldImageContent(digest:)`. Three cases rather than a `Bool`
+/// because they demand different reports from a caller: content that never
+/// arrived has to be sent, content whose blobs are gone has to be sent again,
+/// and content that is here in full needs nothing. `Equatable` so a test can
+/// state the whole answer rather than one field of it.
+///
+/// Both content-bearing cases carry `references` as a sorted list and not a
+/// single name, because a store holds one row per reference and a tag adds a
+/// row to content that is already there. A caller deciding anything about the
+/// *name* the content arrived under has to see all of them or it decides on
+/// whichever row the store happened to list first.
+package enum HeldImageContent: Sendable, Equatable {
+    /// The store holds this digest under every reference listed, and every blob
+    /// those rows name is present.
+    case held(references: [String])
+
+    /// No image in this store carries this digest.
+    case noImageForDigest
+
+    /// The digest is in the store under these references, but the content store
+    /// cannot produce these blobs, in `sha256:<hex>` form. Nothing can be
+    /// created from the image until they arrive.
+    case blobsMissing(references: [String], digests: [String])
 }
 
 // MARK: - Errors

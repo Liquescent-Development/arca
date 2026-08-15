@@ -15,6 +15,7 @@ endif
 # Binary names
 BINARY = Arca
 TEST_HELPER = ArcaTestHelper
+ENGINE = arca-engine
 
 # Installation directory
 INSTALL_DIR = /usr/local/bin
@@ -57,11 +58,22 @@ $(BUILD_DIR)/$(BINARY): gen-buildinfo $(SOURCES) Package.swift
 	@swift build $(SWIFT_BUILD_FLAGS)
 
 # Codesign the binaries with entitlements
-codesign: $(BUILD_DIR)/$(BINARY) $(BUILD_DIR)/$(TEST_HELPER)
+#
+# $(ENGINE) belongs here for the same reason $(BINARY) does, and was missing:
+# ContainerManager.initialize() constructs a Containerization.VmnetNetwork, and
+# vmnet refuses without com.apple.security.virtualization. MEASURED with the
+# signature as the only variable -- stripped of entitlements the engine exits 1
+# on "failed to create vmnet network with status vmnet_return_t(rawValue: 1002)"
+# and creates no socket. 1002 is VMNET_MEM_FAILURE in vmnet.h, which sends
+# whoever debugs it looking for a memory fault; re-signed with $(ENTITLEMENTS)
+# the same binary initialises all three managers and serves on its socket.
+codesign: $(BUILD_DIR)/$(BINARY) $(BUILD_DIR)/$(TEST_HELPER) $(BUILD_DIR)/$(ENGINE)
 	@echo "Code signing $(BINARY) with entitlements (identity: $(CODESIGN_IDENTITY))..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" --options runtime --timestamp --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(BINARY)
 	@echo "Code signing $(TEST_HELPER) with entitlements..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" --options runtime --timestamp --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(TEST_HELPER)
+	@echo "Code signing $(ENGINE) with entitlements..."
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" --options runtime --timestamp --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(ENGINE)
 	@echo "✓ Code signing complete"
 
 # Debug build (default)
@@ -253,10 +265,29 @@ test: codesign
 	@rm -f ~/.arca/state.db
 	@echo "Building tests..."
 	@swift build --build-tests
+# The three re-sign lines below are defence in depth. They fix nothing this
+# target does: MEASURED, `make test` links Arca, ArcaTestHelper and arca-engine
+# in the `codesign:` prerequisite's `swift build`, and the `swift build
+# --build-tests` above then links `ArcaPackageTests` alone -- so the executables
+# are never relinked here and never lose the signature they were just given.
+# Deleting the $(ENGINE) line changed nothing: from all three binaries stripped,
+# the same run still ended with all three carrying the entitlement, and
+# `Executed 63 tests, with 0 failures`.
+#
+# What they do defend is a direct `swift build --build-tests` with no plain
+# `swift build` before it, which a developer does run. MEASURED from all three
+# signed: CHANGING a ContainerBridge source -- `make gen-buildinfo` rewrites one
+# -- and running that alone links all three executables and leaves every one of
+# them with no entitlements at all. A bare `touch` does not do it; SwiftPM keys
+# on content, and that build emitted the module without relinking anything.
+# An unsigned $(ENGINE) is the expensive one to meet -- it fails on
+# vmnet_return_t(rawValue: 1002), which reads as a memory fault and is not one.
 	@echo "Re-signing Arca binary (swift build --build-tests may have rebuilt it)..."
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/Arca
 	@echo "Signing ArcaTestHelper binary..."
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/ArcaTestHelper
+	@echo "Signing $(ENGINE) binary..."
+	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BUILD_DIR)/$(ENGINE)
 	@echo "Signing test binaries..."
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) .build/debug/ArcaPackageTests.xctest/Contents/MacOS/ArcaPackageTests 2>/dev/null || true
 	@echo "✓ All binaries signed"

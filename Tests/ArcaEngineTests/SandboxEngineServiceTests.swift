@@ -4,107 +4,53 @@ import XCTest
 @testable import ArcaEngine
 
 final class SandboxEngineServiceTests: XCTestCase {
-    /// An unimplemented method must still ANSWER. Returning a gRPC status
-    /// instead would be a transport fault by the contract's reading, and the
-    /// consumer would report an unreachable engine rather than an unsupported
-    /// operation.
+    /// The one unary method this build does not implement must still ANSWER.
     ///
-    /// Calls the context-free `start(request:)` overload rather than the
-    /// protocol-conforming `start(request:context:)`: grpc-swift's
-    /// `GRPCAsyncServerCallContext` has no public initialiser, so a test
-    /// target cannot construct one. See SandboxEngineService.swift.
-    func testUnimplementedMethodsAnswerWithUnsupportedCapabilityNamingTheRpc() async throws {
+    /// Returning a gRPC status instead would be a transport fault by the
+    /// contract's reading (engine.proto:52-58), and the consumer would report an
+    /// unreachable engine rather than an unsupported operation. The code and the
+    /// RPC name are what a consumer reads, so they are what this asserts; an
+    /// earlier version asserted only `XCTAssertNotNil(outcome)`, which is true
+    /// whenever *any* arm is set and so would have passed had the method answered
+    /// `ok`.
+    ///
+    /// Calls the context-free `createContainer(request:)` overload rather than
+    /// the protocol-conforming one: grpc-swift's `GRPCAsyncServerCallContext` has
+    /// no public initialiser, so a test target cannot construct one. See
+    /// SandboxEngineService.swift.
+    ///
+    /// **`CreateContainer` is the last unary method on this list, and it is the
+    /// one worth watching.** `Inspect` left it when Task 7 implemented it,
+    /// `ListResources` when Task 8 did, `PrepareImage` when Task 10 did, `Create`
+    /// when Task 11 did, and `Start`, `Stop` and `Remove` when Task 12 did. None
+    /// is an omission: an implemented method belongs to the tests that assert
+    /// what it reports (`InspectTests`, `ListResourcesTests`,
+    /// `PrepareImageTests`, `CreateTests`, `LifecycleTests`), and leaving it here
+    /// would have this test fail for the correct behaviour. `CreateContainer`
+    /// shares `CreateRequest` with `Create` and is a create in every respect
+    /// except that its resources already exist, so it is the method most likely
+    /// to be quietly satisfied by a change aimed at its neighbour. It is not
+    /// implemented, and this is what says so.
+    ///
+    /// `Exec` and `Logs` are the other two unimplemented methods and are not
+    /// here: both send their error inside a stream frame, and
+    /// `GRPCAsyncResponseStreamWriter` has no initialiser a test target can
+    /// reach. gascan's live tier drives both against a real engine over a real
+    /// socket.
+    func testCreateContainerAnswersUnsupportedCapabilityNamingTheRpc() async throws {
         let service = SandboxEngineService.forTesting()
-        let response = await service.start(
-            request: Arca_Engine_V1_StartRequest.with { $0.sandboxID = "web-a1b2c3d4e5f6" }
+        let outcome = await service.createContainer(
+            request: Arca_Engine_V1_CreateContainerRequest()
+        ).outcome
+
+        guard case .failed(let failed) = outcome else {
+            return XCTFail("an unimplemented method must answer with an error outcome, got "
+                + String(describing: outcome))
+        }
+        XCTAssertEqual(failed.error.code, "unsupported_capability")
+        XCTAssertTrue(
+            failed.error.message.contains("CreateContainer"),
+            "must name the RPC: \(failed.error.message)"
         )
-        guard case .error(let error) = response.outcome else {
-            return XCTFail("an unimplemented method must answer with an error outcome")
-        }
-        XCTAssertEqual(error.code, "unsupported_capability")
-        XCTAssertTrue(error.message.contains("Start"), "must name the RPC: \(error.message)")
     }
-
-    /// Every unimplemented response carries an `unsupported_capability` error
-    /// naming its RPC.
-    ///
-    /// This replaces a version that asserted only `XCTAssertNotNil(outcome)`.
-    /// An outcome is non-nil whenever *any* arm is set, so that test passed if
-    /// every one of these methods had answered `ok` -- the precise inversion of
-    /// what its name claimed. The code and the RPC name are what a consumer
-    /// reads, so they are what this asserts.
-    ///
-    /// The eight unary methods only. `Exec` and `Logs` send their error inside
-    /// a stream frame, and `GRPCAsyncResponseStreamWriter` has no initialiser a
-    /// test target can reach; gascan's live tier drives both against a real
-    /// engine over a real socket.
-    func testEveryUnimplementedUnaryMethodAnswersUnsupportedCapability() async throws {
-        let service = SandboxEngineService.forTesting()
-
-        let answers: [(rpc: String, error: Arca_Engine_V1_EngineError?)] = [
-            ("Inspect", engineError(await service.inspect(request: .init()).outcome)),
-            ("ListResources", engineError(await service.listResources(request: .init()).outcome)),
-            ("Create", engineError(await service.create(request: .init()).outcome)),
-            ("CreateContainer", engineError(await service.createContainer(request: .init()).outcome)),
-            ("PrepareImage", engineError(await service.prepareImage(request: .init()).outcome)),
-            ("Start", engineError(await service.start(request: .init()).outcome)),
-            ("Stop", engineError(await service.stop(request: .init()).outcome)),
-            ("Remove", engineError(await service.remove(request: .init()).outcome)),
-        ]
-
-        XCTAssertEqual(answers.count, 8, "the ten-method contract has eight unary methods left")
-        for (rpc, error) in answers {
-            guard let error else {
-                XCTFail("\(rpc) must answer with an error outcome, and did not")
-                continue
-            }
-            XCTAssertEqual(error.code, "unsupported_capability", "\(rpc) answered \(error.code)")
-            XCTAssertTrue(
-                error.message.contains(rpc),
-                "\(rpc)'s message must name the RPC: \(error.message)"
-            )
-        }
-    }
-}
-
-// Reads the `EngineError` out of whichever arm a response type puts it in, so
-// the table above can be one list rather than eight near-copies. `nil` means
-// the response did not answer with an error, which for an unimplemented method
-// is itself the failure -- hence optional rather than a trap.
-
-private func engineError(
-    _ outcome: Arca_Engine_V1_InspectResponse.OneOf_Outcome?
-) -> Arca_Engine_V1_EngineError? {
-    if case .error(let error) = outcome { return error }
-    return nil
-}
-
-private func engineError(
-    _ outcome: Arca_Engine_V1_ListResourcesResponse.OneOf_Outcome?
-) -> Arca_Engine_V1_EngineError? {
-    if case .error(let error) = outcome { return error }
-    return nil
-}
-
-private func engineError(
-    _ outcome: Arca_Engine_V1_AckResponse.OneOf_Outcome?
-) -> Arca_Engine_V1_EngineError? {
-    if case .error(let error) = outcome { return error }
-    return nil
-}
-
-private func engineError(
-    _ outcome: Arca_Engine_V1_PrepareImageResponse.OneOf_Outcome?
-) -> Arca_Engine_V1_EngineError? {
-    if case .error(let error) = outcome { return error }
-    return nil
-}
-
-/// Create is the one shape that nests: its failure arm is a `CreateFailed`,
-/// which carries the error alongside the resources a partial create made.
-private func engineError(
-    _ outcome: Arca_Engine_V1_CreateResponse.OneOf_Outcome?
-) -> Arca_Engine_V1_EngineError? {
-    if case .failed(let failed) = outcome { return failed.error }
-    return nil
 }

@@ -64,6 +64,21 @@ public actor ContainerManager {
     // State persistence
     private let stateStore: StateStore
 
+    /// Root of the Containerization ImageStore this manager uses. Held as a
+    /// `let` and not derived, because `initfs.ext4` lives inside it: sharing
+    /// this root is what makes two products fight over one initfs.
+    ///
+    /// `nonisolated` for the same reason `logManager` is: an actor's `let` is
+    /// isolated across module boundaries, so a consumer outside ContainerBridge
+    /// cannot read it without `await` unless it is stated here. It is immutable
+    /// and `URL` is `Sendable`, so nothing is given up by saying so.
+    nonisolated public let imageStoreRoot: URL
+
+    /// Directory holding the OverlayFS layer cache. Was hardcoded to
+    /// ~/.arca/layers, which meant every consumer wrote into Arca's tree
+    /// regardless of the state root it was given.
+    nonisolated public let layerCachePath: URL
+
     // Layer unpacker for OverlayFS
     private var overlayUnpacker: OverlayFSUnpacker?
 
@@ -167,17 +182,59 @@ public actor ContainerManager {
         }
     }
 
+    /// - Parameter logRoot: Where this manager's containers write stdout and
+    ///   stderr, and the only directory `removeContainer` deletes logs from.
+    ///
+    ///   A root and not a ready-made `ContainerLogManager`, on purpose. The
+    ///   ownership already runs this way -- `logManager` is this actor's
+    ///   `nonisolated let` and every consumer reaches it through here
+    ///   (`ArcaDaemon/Server.swift:29` takes `containerManager.logManager`) --
+    ///   so handing the manager in would move one construction to each caller
+    ///   and give the derivation two spellings free to drift, which is exactly
+    ///   what change 1 of the milestone's design had to unpick for the image
+    ///   store. **That is the whole of the argument, and it is enough.**
+    ///
+    ///   CORRECTED: an earlier version of this comment also called the
+    ///   alternative "the weaker seam", claiming a caller-supplied
+    ///   `ContainerLogManager` would make the pass-through true by construction
+    ///   and so unfalsifiable. **That is false, and 13b's reviewer measured it
+    ///   false** by building the counterfactual init and a test against it: an
+    ///   init that ignored a `logManager:` argument failed its test just as this
+    ///   one fails `testAContainerManagerUsesTheRootsItWasGiven` under the same
+    ///   mutation. What makes either seam falsifiable is that the assertion
+    ///   reads back through `manager.logManager` -- the parameter's type has
+    ///   nothing to do with it. A design argument that sounds like a
+    ///   falsifiability argument is worth less than the one it displaced.
     public init(
         imageManager: ImageManager,
         kernelPath: String,
+        imageStoreRoot: URL,
+        layerCachePath: URL,
+        logRoot: URL,
         stateStore: StateStore,
         logger: Logger
     ) {
         self.imageManager = imageManager
         self.kernelPath = kernelPath
+        self.imageStoreRoot = imageStoreRoot
+        self.layerCachePath = layerCachePath
         self.stateStore = stateStore
         self.logger = logger
-        self.logManager = ContainerLogManager(logger: logger)
+        self.logManager = ContainerLogManager(logRoot: logRoot, logger: logger)
+    }
+
+    /// The root `initialize()` hands to `Containerization.ContainerManager`,
+    /// and so the directory `initfs.ext4` is built in.
+    ///
+    /// It exists as a method rather than as a use of `imageStoreRoot` at the
+    /// call site so that a test can assert on the value `initialize()` actually
+    /// selects. MEASURED: with `initialize()` passing no `root:` at all --
+    /// falling back to `ImageStore.default` -- a test asserting on the stored
+    /// property alone still reported `Executed 2 tests, with 0 failures`
+    /// (`swift test --filter ContainerBridgePathsTests`). Asserting on this
+    /// method instead puts the selection itself under test.
+    nonisolated public func containerizationRoot() -> URL {
+        imageStoreRoot
     }
 
     /// Set the NetworkManager (called after NetworkManager is initialized)
@@ -240,13 +297,13 @@ public actor ContainerManager {
         nativeManager = try await Containerization.ContainerManager(
             kernel: kernel,
             initfsReference: "arca-vminit:latest",  // Custom vminit loaded and tagged by ArcaDaemon
+            root: containerizationRoot(),
             network: try Containerization.VmnetNetwork()
         )
 
         // Initialize OverlayFS unpacker for parallel layer caching
-        let layerCachePath = NSString(string: "~/.arca/layers").expandingTildeInPath
         overlayUnpacker = OverlayFSUnpacker(
-            layerCachePath: URL(fileURLWithPath: layerCachePath),
+            layerCachePath: layerCachePath,
             stateStore: stateStore,
             logger: logger
         )
@@ -258,7 +315,29 @@ public actor ContainerManager {
     }
 
     /// Load persisted containers from StateStore and reconcile with actual state
-    private func loadPersistedState() async throws {
+    ///
+    /// Reachable outside `initialize()` because it is the only VM-free way in
+    /// which `containers` is populated: `initialize()` needs a kernel file and a
+    /// `VmnetNetwork` before it reaches this call, and `createContainer` boots a
+    /// VM. A test that cannot reach this restore loop can only assert on
+    /// `internalContainersRequested(in:)`, the helper -- and a test of the helper
+    /// alone does not notice `listContainers` ignoring `includeInternal`
+    /// (MEASURED: with the `includeInternal` guard reverted to the old
+    /// filter-derived `showInternal`, `swift test --filter ArcaEngineTests`
+    /// still reported `Executed 35 tests, with 0 failures`).
+    ///
+    /// `package` and NOT `public`, because this must not become callable from
+    /// outside the package: it is not idempotent. A second call takes the
+    /// crash-recovery branch below for every container whose stored status is
+    /// `running`, recording it as exited with code 137 in memory *and* writing
+    /// that back through `stateStore.updateContainerStatus`. Called on a live
+    /// daemon it would orphan every running VM -- the engine would stop
+    /// believing it holds a container that is still running, which is the leak
+    /// class this work exists to close.
+    ///
+    /// Nothing here touches a VM: it reads the StateStore, decodes the stored
+    /// config, and registers log paths that already exist on disk.
+    package func loadPersistedState() async throws {
         logger.info("Loading persisted container state...")
 
         // Load all containers from database
@@ -519,16 +598,24 @@ public actor ContainerManager {
 
     // MARK: - Container Lifecycle
 
+    /// Docker's rule for asking to see internal containers: a `label` filter
+    /// mentioning `com.arca.internal`. Named and lifted out because the engine
+    /// does not use it -- the engine asks with `includeInternal:` directly --
+    /// and a rule that exists in two places diverges.
+    public static func internalContainersRequested(in filters: [String: [String]]) -> Bool {
+        filters["label"]?.contains { $0.contains("com.arca.internal") } ?? false
+    }
+
     /// List all containers
-    public func listContainers(all: Bool = false, filters: [String: [String]] = [:]) async throws -> [ContainerSummary] {
+    public func listContainers(
+        all: Bool = false,
+        filters: [String: [String]] = [:],
+        includeInternal: Bool
+    ) async throws -> [ContainerSummary] {
         logger.debug("Listing containers", metadata: [
             "all": "\(all)",
             "filters": "\(filters)"
         ])
-
-        // Check if user wants to see internal containers
-        // By default, internal containers (com.arca.internal=true) are hidden
-        let showInternal = filters["label"]?.contains(where: { $0.contains("com.arca.internal") }) ?? false
 
         // Extract label filters for matching
         let labelFilters = filters["label"] ?? []
@@ -553,7 +640,7 @@ public actor ContainerManager {
             }
 
             // Filter out internal containers unless explicitly requested
-            if !showInternal && info.labels["com.arca.internal"] == "true" {
+            if !includeInternal && info.labels["com.arca.internal"] == "true" {
                 return nil
             }
 
@@ -878,7 +965,19 @@ public actor ContainerManager {
 
     /// Convert Docker portBindings to PortMapping array for container list API
     /// Format: {"80/tcp": [PortBinding(hostIp: "0.0.0.0", hostPort: "8080")]} -> [PortMapping(...)]
-    private func convertPortBindingsToMappings(_ portBindings: [String: [PortBinding]]) -> [PortMapping] {
+    ///
+    /// `package` rather than `private` because `ArcaEngine`'s `Inspect` reports a
+    /// sandbox's ports and `Container` has no `ports` field to read them from
+    /// (`Types.swift:68-80`) -- only `hostConfig.portBindings` (`:218`), which is this
+    /// function's input. A second parser over the same `"80/tcp"` strings in
+    /// `ArcaEngine` would be a second place for the format to be read
+    /// differently, and this one is already the parser the restore path (`:420`)
+    /// and the create path (`:1911`) agree on.
+    ///
+    /// `package`, not `public`, following `loadPersistedState()` (`:316`): the
+    /// only caller outside this file is inside this SwiftPM package, so nothing
+    /// outside it needs the wider surface.
+    package func convertPortBindingsToMappings(_ portBindings: [String: [PortBinding]]) -> [PortMapping] {
         var mappings: [PortMapping] = []
 
         for (portProto, bindings) in portBindings {
@@ -1065,10 +1164,17 @@ public actor ContainerManager {
         )
 
         // Create container directory path (needed for both unpacking and temp rootfs)
-        // Use default Apple containerization store path
-        let appleStorePath = NSString(string: "~/Library/Application Support/com.apple.containerization").expandingTildeInPath
-        let containerRoot = URL(fileURLWithPath: appleStorePath).appendingPathComponent("containers")
-        let containerPath = containerRoot.appendingPathComponent(dockerID)
+        //
+        // Derived from `manager`'s own store rather than spelt out, because the
+        // directory `manager.create(_:image:rootfs:)` writes into is not ours to
+        // choose: it opens `containerRoot/<id>/bootlog.log`
+        // (containerization/Sources/Containerization/ContainerManager.swift:317),
+        // `containerRoot` is `imageStore.path/"containers"` (ibid.:35-37), and
+        // `imageStore` is `ImageStore(path: root)` for whatever `root:`
+        // `initialize()` passed (ibid.:139-140). Naming Apple's shared store here
+        // agreed with that only while `root:` happened to be Apple's shared
+        // store, and disagreed for every other state root.
+        let containerPath = containerDirectory(in: manager, dockerID: dockerID)
 
         // Ensure container directory exists (base manager expects this)
         try FileManager.default.createDirectory(at: containerPath, withIntermediateDirectories: true)
@@ -2295,7 +2401,7 @@ public actor ContainerManager {
 
                 do {
                     // Resolve network name/ID to actual network ID
-                    if let resolvedNetworkID = await networkManager.resolveNetworkID(targetNetwork) {
+                    if let resolvedNetworkID = try await networkManager.resolveNetworkID(targetNetwork) {
                         let containerName = info.name ?? String(dockerID.prefix(12))
                         let attachment = try await networkManager.attachContainerToNetwork(
                             containerID: dockerID,
@@ -2425,8 +2531,10 @@ public actor ContainerManager {
                 return
             }
 
-            // Get WireGuard client for this container
-            if let wireguardClient = await networkManager.getWireGuardClient(containerID: dockerID) {
+            // Get WireGuard client for this container. `try`, not `try?`: the
+            // container has port bindings, and a failure to read which networks
+            // it is on would otherwise publish none of them silently.
+            if let wireguardClient = try await networkManager.getWireGuardClient(containerID: dockerID) {
                 // Ensure we disconnect when done
                 defer {
                     Task {
@@ -4103,17 +4211,42 @@ public actor ContainerManager {
 
     // MARK: - Filesystem Operations
 
-    /// Get the path to a container's rootfs.ext4 file
-    /// This follows Apple's Containerization framework convention: {imageStore.path}/containers/{id}/rootfs.ext4
-    private func getRootfsPath(dockerID: String) -> URL? {
-        guard let manager = nativeManager else {
-            return nil
-        }
-        // Apple's ContainerManager stores containers at: imageStore.path/containers/{id}/rootfs.ext4
-        return manager.imageStore.path
+    /// The directory Containerization keeps container `dockerID`'s files in.
+    ///
+    /// **One live caller, `createNativeContainer`**, which must create this
+    /// directory before `manager.create(_:image:rootfs:)` opens `bootlog.log`
+    /// inside it. It is a function rather than an expression because the
+    /// derivation drifted once already: the create path named Apple's shared
+    /// store outright while `getRootfsPath` followed the manager, and only one
+    /// of them moved when `ContainerManager` gained an image-store root. That
+    /// `getRootfsPath` has now been deleted -- it had no callers, so only the
+    /// create path's copy of the drift ever executed.
+    ///
+    /// It takes the manager instead of reading `nativeManager` so that no
+    /// caller can pass a root: the store is read off the same value the create
+    /// call is made against, which is the only store Containerization will look
+    /// in. It stays `private` deliberately: `createNativeContainer` guards on
+    /// `nativeManager`, which `initialize()` sets only after building a kernel
+    /// and a VM, so no test in this repository can reach the call site -- and a
+    /// derivation a test *could* call would let a green suite stand for a call
+    /// site nothing executes.
+    ///
+    /// **The call-site proof is Gas Can's live `Create` test, and it is not
+    /// optional.** MEASURED 2026-08-13: replacing `manager.imageStore.path`
+    /// below with `ImageStore.default.path` restores the original defect
+    /// exactly, and `swift test --filter ArcaEngineTests` still reports
+    /// `Executed 149 tests, with 0 failures` -- both guards in
+    /// `ContainerBridgePathsTests` stay green. The same mutation drives the live
+    /// tier's `Create` to `NSPOSIXErrorDomain Code=2`, leaves the engine's own
+    /// `<state-root>/images/containers/` empty, and adds a directory to Apple's
+    /// shared store (253 -> 254). **Nothing in this repository can see that.**
+    private func containerDirectory(
+        in manager: Containerization.ContainerManager,
+        dockerID: String
+    ) -> URL {
+        manager.imageStore.path
             .appendingPathComponent("containers")
             .appendingPathComponent(dockerID)
-            .appendingPathComponent("rootfs.ext4")
     }
 
     /// Get filesystem changes for a container using OverlayFS upperdir enumeration

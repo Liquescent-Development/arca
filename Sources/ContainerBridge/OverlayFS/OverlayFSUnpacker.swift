@@ -8,7 +8,9 @@ import ContainerizationOCI
 /// Arca-specific OverlayFS unpacker with layer caching and database integration
 ///
 /// This wrapper extends Apple's Containerization framework with:
-/// - Layer caching at ~/.arca/layers/{digest}/layer.ext4
+/// - Layer caching at {layerCachePath}/{digest}/layer.ext4 -- the path is this
+///   type's own init parameter, and it is `<state-root>/layers` under
+///   `arca-engine`, `~/.arca/layers` only under `ArcaDaemon`
 /// - Database integration for cache tracking
 /// - Parallel layer unpacking for performance
 ///

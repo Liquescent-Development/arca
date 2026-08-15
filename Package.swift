@@ -59,6 +59,13 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
+                // ArcaDaemon.swift imports Containerization directly, for
+                // ImageStore.default.path. Declared rather than left to reach
+                // the module transitively through ContainerBridge: a transitive
+                // import compiles until ContainerBridge stops depending on
+                // Containerization, and then the breakage lands on whoever
+                // edited ContainerBridge rather than here.
+                .product(name: "Containerization", package: "containerization"),
                 "DockerAPI",
                 "ContainerBridge",
             ]

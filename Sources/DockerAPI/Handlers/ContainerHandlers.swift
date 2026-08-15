@@ -69,7 +69,11 @@ public struct ContainerHandlers: Sendable {
 
         do {
             // Get containers from ContainerManager
-            var containers = try await containerManager.listContainers(all: all, filters: filters)
+            var containers = try await containerManager.listContainers(
+                all: all,
+                filters: filters,
+                includeInternal: ContainerManager.internalContainersRequested(in: filters)
+            )
 
             // Apply limit if specified
             if let limit = limit, limit > 0 {
@@ -1564,7 +1568,7 @@ public struct ContainerHandlers: Sendable {
 
         // Get all containers (including stopped ones)
         do {
-            let containers = try await containerManager.listContainers(all: true)
+            let containers = try await containerManager.listContainers(all: true, includeInternal: false)
 
             // Filter for stopped containers (not running)
             for container in containers {

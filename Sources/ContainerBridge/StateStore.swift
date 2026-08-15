@@ -704,8 +704,9 @@ public actor StateStore {
         ])
     }
 
-    /// Load all networks from database
-    public func loadAllNetworks() throws -> [(
+    /// One network as it is stored. Named so that the callers which map it to
+    /// `NetworkMetadata` can say what they take without restating eleven fields.
+    public typealias PersistedNetwork = (
         id: String,
         name: String,
         driver: String,
@@ -717,7 +718,10 @@ public actor StateStore {
         optionsJSON: String?,
         labelsJSON: String?,
         isDefault: Bool
-    )] {
+    )
+
+    /// Load all networks from database
+    public func loadAllNetworks() throws -> [PersistedNetwork] {
         var result: [(
             id: String, name: String, driver: String, scope: String,
             createdAt: Date, subnet: String, gateway: String,

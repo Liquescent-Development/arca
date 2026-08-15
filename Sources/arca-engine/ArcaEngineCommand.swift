@@ -3,13 +3,66 @@ import ArgumentParser
 import ContainerBridge
 import Foundation
 import Logging
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 
+/// The entry point, and nothing else.
+///
+/// It carries no options of its own, and that is forced rather than tidy.
+/// ArgumentParser parses every command in the chain, so a parent holding
+/// REQUIRED options makes them required of its subcommands too: with
+/// `--socket-path` and its three siblings declared here, `arca-engine image
+/// load --state-root R --oci-layout L` exited with `Error: Missing expected
+/// argument '--socket-path <socket-path>'` -- MEASURED against the built binary
+/// before this split. An image load cannot be made to name a socket it will
+/// never bind.
+///
+/// `serve` is the `defaultSubcommand`, so the invocation Gas Can already
+/// ships -- `arca-engine --socket-path ... --state-root ... --kernel-path ...
+/// --vminit-layout ...`, with no subcommand named -- still reaches
+/// `ServeCommand.run()` unchanged. That is not assumed: every test in
+/// `EngineCommandRefusalTests` spawns exactly that form.
+///
+/// `usage` and `discussion` are spelt out because the split cost them. A root
+/// holding no options of its own generates `USAGE: arca-engine <subcommand>`
+/// and an OPTIONS list holding nothing but `-h`, which is what `--help`
+/// printed until this was written: the four options the engine cannot start
+/// without were reachable only by knowing to type `arca-engine serve --help`
+/// first. Milestone 4 writes a launchd plist against this binary, and whoever
+/// writes it -- or debugs a start that failed -- reads `--help`.
+/// `ImageLoadTests.testHelpDocumentsTheOptionsTheEngineCannotStartWithout` is
+/// what stops this regressing a second time; it regressed silently the first
+/// time because nothing in the suite read help output at all.
 @main
 struct ArcaEngineCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "arca-engine",
+        abstract: "Serves the arca.engine.v1 sandbox-engine contract over a Unix socket.",
+        usage: """
+            arca-engine --socket-path <socket-path> --state-root <state-root> \
+            --kernel-path <kernel-path> --vminit-layout <vminit-layout> [--log-level <log-level>]
+            arca-engine image load --state-root <state-root> --oci-layout <oci-layout>
+            """,
+        discussion: """
+            Named with no subcommand -- the first form under USAGE -- arca-engine serves \
+            the contract over the socket given. All four of those options are required and \
+            none is defaulted, because a default is how a process silently ends up pointed \
+            at another product's state; 'arca-engine serve --help' describes what each \
+            takes. 'arca-engine image load --help' covers loading an image into this \
+            engine's own store without serving anything.
+            """,
+        subcommands: [ServeCommand.self, ImageCommand.self],
+        defaultSubcommand: ServeCommand.self
+    )
+}
+
+/// Serves the contract until it is told to stop. The engine's whole reason for
+/// existing, and now one subcommand among others only because a sibling needed
+/// a parent that demanded nothing.
+struct ServeCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "serve",
         abstract: "Serves the arca.engine.v1 sandbox-engine contract over a Unix socket."
     )
 
@@ -19,12 +72,32 @@ struct ArcaEngineCommand: AsyncParsableCommand {
     @Option(name: .customLong("state-root"), help: "Directory holding engine state.")
     var stateRoot: String
 
+    // Read-only inputs, separate from --state-root and from each other. None of
+    // the three is defaulted and none falls back to ~/.arca: a default is how a
+    // process silently ends up pointed at another product's state.
+    @Option(name: .customLong("kernel-path"), help: "Path of the Linux kernel image to boot sandboxes with.")
+    var kernelPath: String
+
+    @Option(name: .customLong("vminit-layout"), help: "Directory holding the arca-vminit OCI layout.")
+    var vminitLayout: String
+
     @Option(name: .customLong("log-level"), help: "trace, debug, info, notice, warning, error.")
     var logLevel: String = "info"
 
     func run() async throws {
-        var logger = Logger(label: "arca-engine")
-        logger.logLevel = Logger.Level(rawValue: logLevel) ?? .info
+        let logger = engineLogger(logLevel: logLevel)
+
+        // First, and before anything is created or constructed: a bad input
+        // must cost a clear error naming which option and which path, not a
+        // half-initialised engine that answers unsupported_capability for
+        // everything that matters. This runs ahead of the socket directory too,
+        // so a refusal leaves nothing behind on disk.
+        let inputs = EngineInputs(
+            stateRoot: URL(fileURLWithPath: stateRoot),
+            kernelPath: URL(fileURLWithPath: kernelPath),
+            vminitLayout: URL(fileURLWithPath: vminitLayout)
+        )
+        try validateEngineInputs(inputs)
 
         // The socket's mode is set to 0600 immediately after bind (EngineServer),
         // but bind returns an already-listening server, so there is a brief
@@ -33,83 +106,82 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         // path to connect if the directory itself is 0700.
         try createSocketParentDirectory(for: socketPath)
 
-        let root = URL(fileURLWithPath: stateRoot)
-
-        // initialize() is deliberately never called on any manager here, and
-        // the reason it cannot be is worth stating in full, because it decides
-        // which RPCs this build may implement.
+        // Every manager below is rooted in the state root this engine owns, and
+        // that ownership is the design: a state root shared with a live
+        // ArcaDaemon is the hazard EngineInputs records, and an image store
+        // shared with it is the one EnginePaths records.
         //
-        // ContainerManager.initialize() requires the kernel file to exist on
-        // disk, an "arca-vminit:latest" image already loaded by ArcaDaemon, and
-        // a live Containerization.VmnetNetwork (ContainerManager.swift:219-244).
-        // Requiring all three would make this engine refuse to start anywhere a
-        // kernel or vminit image is absent, which defeats the point of this
-        // milestone -- a Rust client dialling a real, running engine.
-        //
-        // Its second half is not merely unavailable, it is unsafe here.
-        // loadPersistedState() marks every container whose persisted status is
-        // "running" as exited with code 137 and writes that back to the
-        // StateStore (ContainerManager.swift:316-338). Against a --state-root
-        // that a live ArcaDaemon is also using -- ~/.arca being the natural
-        // choice -- this engine would declare the daemon's running containers
-        // dead. NetworkManager.initialize() is likewise a mutation: it ends in
-        // createDefaultNetworks(), which creates "bridge", "host" (vmnet
-        // driver) and "none" (NetworkManager.swift:87-88).
-        //
-        // The consequence is total, not restart-scoped, and not confined to
-        // containers. The only two writers of ContainerManager.containers are
-        // initialize()'s restore loop and createContainer, which this build
-        // answers unsupported_capability; VolumeManager.volumes is loaded only
-        // from initialize(); NetworkManager.listNetworks() reads two backends
-        // that initialize() is the sole populator of. All three are empty for
-        // the life of the process, under every input.
-        //
-        // So Inspect and ListResources answer unsupported_capability rather
-        // than "absent" and "nothing here" -- see the notes on each in
-        // SandboxEngineService. A later milestone gives ContainerBridge a
-        // read-only load path that neither starts a VM nor writes, calls it
-        // here behind a --kernel-path option, and restores both methods.
-        //
-        // The managers are still constructed and handed to the service: the
-        // dependency edge they create is a property gascan's release gate
-        // measures. See the note on SandboxEngineService's stored properties.
-        let stateStore = try StateStore(
-            path: root.appendingPathComponent("state.db").path,
+        // One factory, which the tests call too. Neither the paths nor which
+        // path reaches which constructor argument is spelt out here a second
+        // time: a hand-copy of these lines in TestSupport is what let the suite
+        // stay green while the engine's real image-store root changed. See
+        // EngineManagers.
+        let managers = try EngineManagers(
+            stateRoot: inputs.stateRoot,
+            kernelPath: inputs.kernelPath,
+            logLevel: logLevel,
             logger: logger
-        )
-        let imageManager = try ImageManager(
-            logger: logger,
-            imageStorePath: root.appendingPathComponent("images")
-        )
-        let containerManager = ContainerManager(
-            imageManager: imageManager,
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            stateStore: stateStore,
-            logger: logger
-        )
-        let config = ArcaConfig(
-            kernelPath: root.appendingPathComponent("vmlinux").path,
-            socketPath: root.appendingPathComponent("arca.sock").path,
-            logLevel: logLevel
         )
 
-        let service = SandboxEngineService(
-            containerManager: containerManager,
-            volumeManager: VolumeManager(
-                volumesBasePath: root.appendingPathComponent("volumes").path,
-                stateStore: stateStore,
-                logger: logger
-            ),
-            networkManager: NetworkManager(
-                config: config,
-                stateStore: stateStore,
-                containerManager: containerManager,
-                logger: logger
-            ),
-            imageManager: imageManager,
-            execManager: ExecManager(containerManager: containerManager, logger: logger),
+        // Before any manager that resolves an init image. This is the second of
+        // initialize()'s three preconditions, and the engine now satisfies it
+        // itself rather than inheriting an image ArcaDaemon happened to load
+        // into the shared store.
+        _ = try await loadVminit(
+            from: inputs.vminitLayout,
+            into: managers.imageManager,
+            stateRoot: inputs.stateRoot,
             logger: logger
         )
+
+        // Order matters, and it is NOT ArcaDaemon's -- an earlier revision of
+        // this comment claimed parity and there is none. The daemon runs
+        // imageManager, containerManager, networkManager, volumeManager
+        // (ArcaDaemon.swift:74, 208, 232, 258). This runs volume, container,
+        // network, for three reasons of its own:
+        //
+        //   - the vminit image must be in the store before
+        //     ContainerManager.initialize() resolves an initfs from it, which
+        //     the loadVminit above has just done;
+        //   - VolumeManager is first because it is the only one of the three
+        //     that touches nothing but the filesystem and the StateStore. The
+        //     cheap VM-free step ahead of the one that claims a host resource
+        //     means a bad state root is refused before any vmnet network is
+        //     created -- and it is the seam EngineCommandRefusalTests drives,
+        //     since no test may reach the vmnet step;
+        //   - NetworkManager is last of the three because it resolves
+        //     containers through a ContainerManager.
+        //
+        // Running this at all is what a private state root bought. The restore
+        // loop inside ContainerManager.initialize() marks every container the
+        // StateStore records as `running` exited 137 and writes that back; over
+        // a root shared with a live ArcaDaemon that write orphaned the daemon's
+        // running VMs. Over this engine's own root the containers it rewrites
+        // are the ones that died with the previous instance of this engine,
+        // which is what crash recovery is for -- CrashRecoveryTests drives that
+        // loop directly, which `restored=0` against a fresh root never could.
+        //
+        // A failure here propagates out of run() and the process exits
+        // non-zero. Nothing below binds a socket, so a client never reaches an
+        // engine that cannot act -- pinned by
+        // EngineCommandRefusalTests.testAManagerThatCannotInitializeRefusesBeforeBindingTheSocket,
+        // which drives this binary because these three calls are unreachable
+        // from a unit test: ContainerManager.initialize() constructs a real
+        // Containerization.VmnetNetwork.
+        try await managers.volumeManager.initialize()
+        try await managers.containerManager.initialize()
+        try await managers.networkManager.initialize()
+
+        // After all three, as ArcaDaemon does. Without this the engine holds a
+        // ContainerManager that cannot create a container with anonymous
+        // volumes, silently leaks them on Remove, reports a networked container
+        // as attached to nothing, and publishes none of a sandbox's ports while
+        // reporting the create as a success. See
+        // EngineManagers.wireCollaborators, which also records why the last of
+        // those four is the one no test in this repository can prove.
+        await managers.wireCollaborators()
+
+        let service = managers.makeService()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
         try await serve(service: service, group: group, logger: logger)
@@ -138,6 +210,11 @@ struct ArcaEngineCommand: AsyncParsableCommand {
     /// swapping the async `shutdownGracefully()` for a blocking
     /// `syncShutdownGracefully()` on a Dispatch thread were each measured and
     /// each still crashed.
+    ///
+    /// **That fix was necessary and it was not sufficient, because it released
+    /// the wrong objects.** Scoping the server here says nothing about the
+    /// connections the server ACCEPTED, and those are what `quiesced` below is
+    /// about.
     private func serve(
         service: SandboxEngineService,
         group: MultiThreadedEventLoopGroup,
@@ -150,15 +227,171 @@ struct ArcaEngineCommand: AsyncParsableCommand {
         )
         logger.info("engine listening", metadata: ["socket": "\(socketPath)"])
 
+        // **What this waits for is every ACCEPTED connection to have gone, and
+        // that is a different event from the listening socket closing.** It
+        // used to wait for `engine.onClose`, which is the LISTENING channel's
+        // `closeFuture`, and `ServerQuiescingHelper` closes that immediately --
+        // before the connections it has just asked to quiesce have finished
+        // doing so. So `run()` shut the event-loop group down underneath live
+        // channels: each one's `closeFuture` callback then tried to schedule
+        // `ChannelCollector.channelRemoved` on a loop that had gone, which NIO
+        // reports as `Cannot schedule tasks on an EventLoop that has already
+        // shut down`; the collector therefore never reached
+        // `shutdownCompleted()`, and deallocated still holding the promise it
+        // makes at `QuiescingHelper.swift:141` -- `Fatal error: leaking
+        // promise`, `Trace/BPT trap: 5`, exit 133.
+        //
+        // MEASURED with Gas Can's `shutdown.rs`, which stops 32 engines per
+        // figure because at this rate a single clean shutdown is worth nothing.
+        // Two binaries built from this file, run interleaved rather than
+        // A-then-B: awaiting `onClose`, **6 crashes in 192**; awaiting
+        // `quiesced`, **0 in 192**. The container case, 32 engines each:
+        // **12/32 (38%)** against `onClose`.
+        //
+        // **The defect never needed a container.** `docs/status/START-HERE.md`
+        // recorded it as happening "once containers have been created", and
+        // that was a correlate: an engine that never created one still crashed
+        // 1 time in 96. A container widens the window -- more accepted traffic,
+        // more to tear down -- it does not change the bug.
+        //
+        // **Handing `initiateGracefulShutdown` a promise rather than `nil` is a
+        // consequence of the wait and NOT the fix**, and that was measured
+        // rather than argued. A third binary that passes `quiesced` in and
+        // still awaits `onClose` -- the promise made, never waited on -- runs at
+        // **22/32 (69%)**, WORSE than the original. The crash does not go
+        // quiet, it changes address: the leaked promise stops being the
+        // collector's at `QuiescingHelper.swift:141` and becomes this
+        // function's own, which the trace names as `ArcaEngineCommand.swift`.
+        // The `Cannot schedule tasks` line is unchanged throughout, and that is
+        // the tell -- the group is still going down under live channels, and
+        // only the bookkeeping moved.
+        //
+        // **A PREVIOUS VERSION OF THIS COMMENT SAID "NOTHING IN THIS
+        // REPOSITORY CAN PROVE ANY OF IT". THAT WAS FALSE AND A REVIEWER
+        // DISPROVED IT BY WRITING THE TEST.** The argument given was that a
+        // raw socket cannot be observed to have been accepted, so the fixture
+        // would decide the assertion by a race. The race is real but it is
+        // SETUP, not assertion, and it fails safe: an unaccepted connection
+        // lets the close drain immediately, so the pending assertion goes red
+        // rather than falsely green. Measured 20 runs, 20 passes, on a
+        // single-threaded loop with `EngineServer.start` and
+        // `SandboxEngineService.forTesting()`, which `EngineServerTests`
+        // already uses.
+        //
+        // The accurate statement is narrower. **The PREMISE is provable here
+        // and is not yet pinned**: that the listener closes while an accepted
+        // connection is still open, so `onClose` completes and `quiesced` does
+        // not. **The CALL SITE is not**, and privacy is not what stops it --
+        // `EngineProcess.swift` already spawns this binary to prove call sites.
+        // `run()` reaches `networkManager.initialize()`, which constructs a real
+        // `VmnetNetwork`, so a test of THIS function needs an entitlement and a
+        // host vmnet. Moving the wait into `ArcaEngine` would remove even that,
+        // and is recorded as the follow-up it is.
+        //
+        // Until then the mutation that matters here -- changing the line below
+        // back to `engine.onClose` -- leaves `swift test` at 157 passing, and
+        // Gas Can's live tier is the only thing that catches it. Every rate
+        // above is that tier's output.
+        let quiesced = group.next().makePromise(of: Void.self)
+
         // Held for the whole run: a DispatchSourceSignal stops delivering the
         // moment it is deallocated, so a source that is not kept alive is a
         // handler that silently never fires. Cancelling them here also drops
         // the last references these closures hold to the engine.
-        let signals = Self.installShutdownHandler(logger: logger, for: engine)
+        let asked = ShutdownRequests()
+        let signals = Self.installShutdownHandler(
+            logger: logger,
+            for: engine,
+            quiesced: quiesced,
+            asked: asked
+        )
         defer { signals.forEach { $0.cancel() } }
 
-        try await engine.onClose.get()
+        // **The only thing that completes `quiesced` is the first signal, so a
+        // listening socket that closes for any OTHER reason would leave this
+        // function waiting on a promise nothing will ever fulfil.** That is a
+        // regression this change introduced and it is worse than what it
+        // replaced: awaiting `onClose` at least ended the process, whereas
+        // waiting forever holds the `flock` on the lockfile, which is precisely
+        // what makes `EngineServer.start` refuse the path to a successor. An
+        // engine that cannot serve and cannot be replaced is the worst of the
+        // three outcomes.
+        //
+        // The distinction is "did anything ask for this", not "did the listener
+        // close" -- the graceful path closes the listener itself, by design,
+        // and `asked` is recorded before that close is initiated, so a shutdown
+        // that was asked for always finds this true.
+        //
+        // **Reachability is unmeasured.** Within this function only the two
+        // handlers close the listener, and `EngineServer.start` configures no
+        // idle timeout; the case needs an unrecoverable failure in the server
+        // channel itself. Recorded as a guard whose trigger nothing drives.
+        engine.onClose.whenComplete { _ in
+            guard !asked.anyRecorded else { return }
+            logger.error(
+                """
+                the listening socket closed with no shutdown requested; the engine can no \
+                longer serve and nothing will complete its drain
+                """,
+                metadata: ["socket": "\(socketPath)"]
+            )
+            Self.releaseAndExit(engine, logger: logger, status: EXIT_FAILURE)
+        }
+
+        try await quiesced.futureResult.get()
         try await engine.shutDown()
+    }
+
+    /// How long a graceful shutdown waits for accepted connections to drain
+    /// before stopping anyway.
+    ///
+    /// Ten seconds is chosen against the two clocks that already bound this
+    /// process from outside, so that the engine is the one that decides: Gas
+    /// Can's live tier gives a stopping engine 30s before it calls the
+    /// supervisor stuck (`LiveEngine::stop`), and launchd's `ExitTimeOut`
+    /// defaults to 20s before it escalates to SIGKILL. A drain that has not
+    /// finished in ten has met something that will not finish, and being
+    /// SIGKILLed instead would run none of the cleanup below.
+    ///
+    /// **Nothing measures this number**, and it is a policy rather than a
+    /// finding: an ordinary drain here completes in milliseconds.
+    private static let shutdownGrace = TimeAmount.seconds(10)
+
+    /// Gives up the socket path and ends the process with `status`.
+    ///
+    /// Every caller is past the point where returning is possible, and each has
+    /// to leave the path exactly as `shutDown()` would.
+    ///
+    /// **`status` is a parameter because the callers do not mean the same
+    /// thing, and collapsing them onto `EXIT_SUCCESS` made a failure
+    /// unobservable.** An operator's second signal ASKED for the remaining
+    /// connections to be abandoned, so abandoning them is success. A drain that
+    /// ran out of grace abandoned them because it could not finish, and so did
+    /// a listener that closed underneath the engine; neither is.
+    ///
+    /// The consumer that matters reads exactly this byte: Gas Can's
+    /// `shutdown.rs` counts `!status.success()`, so while every path exited 0
+    /// its `0/96` could not distinguish 96 completed drains from 96 that gave
+    /// up at ten seconds -- in the instrument that measured this fix. One byte
+    /// carries that distinction, and it is cheaper and harder to lose than a
+    /// second assertion somewhere else would be.
+    private static func releaseAndExit(
+        _ engine: EngineServer,
+        logger: Logger,
+        status: Int32
+    ) -> Never {
+        do {
+            try engine.releaseSocketPath()
+        } catch {
+            // Reported rather than dropped: whoever starts the next engine on
+            // this path has to reason about what is left there, and this is the
+            // only moment anything knows.
+            logger.error("could not release the socket path", metadata: ["error": "\(error)"])
+        }
+        // Qualified: bare `exit` inside a `ParsableCommand` resolves to
+        // ArgumentParser's own `exit(withError:)` instance method, and the
+        // compiler rejects it here rather than quietly calling something else.
+        Foundation.exit(status)
     }
 
     /// Turns SIGTERM and SIGINT into a graceful close, and a repeat of either
@@ -178,24 +411,90 @@ struct ArcaEngineCommand: AsyncParsableCommand {
     /// RPCs, and a client holding a stream open can hold the engine open with
     /// it. Without a second signal that forces the issue, "handles SIGTERM"
     /// would be true and "can be stopped" would not.
+    ///
+    /// **That paragraph was written before the code did any of it, and it is
+    /// true for the first time now.** Until `serve()` started waiting on
+    /// `quiesced`, one signal ended the process whatever a client was doing:
+    /// the wait was on the LISTENING channel's close, which
+    /// `ServerQuiescingHelper` performs synchronously, so nothing ever waited
+    /// for an in-flight RPC and the second signal had nothing left to force.
+    /// The wait is real now, so the escalation has to be.
     private static func installShutdownHandler(
         logger: Logger,
-        for engine: EngineServer
+        for engine: EngineServer,
+        quiesced: EventLoopPromise<Void>,
+        asked: ShutdownRequests
     ) -> [DispatchSourceSignal] {
         // One serial queue shared by both sources, so the two handlers can
-        // never run concurrently and `asked` needs no lock of its own.
+        // never run concurrently. `asked` is the caller's because `serve()`
+        // reads it too, from the listening channel's close; it carries its own
+        // lock for that reason.
         let queue = DispatchQueue(label: "arca-engine.shutdown")
-        let asked = ShutdownRequests()
         return [SIGTERM, SIGINT].map { number in
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
             source.setEventHandler {
                 if asked.recordAndReportFirst() {
                     logger.info("shutting down gracefully", metadata: ["signal": "\(number)"])
-                    engine.server.initiateGracefulShutdown(promise: nil)
+                    engine.server.initiateGracefulShutdown(promise: quiesced)
+
+                    // **The drain is bounded, and it has to be, because
+                    // quiescing cannot close every connection it asks to
+                    // close.** `ServerQuiescingHelper` sends each accepted
+                    // channel a `ChannelShouldQuiesceEvent`; grpc-swift turns
+                    // that into a GOAWAY and closes the connection once its
+                    // streams finish -- but only for a connection whose
+                    // protocol it has finished negotiating. One that has been
+                    // accepted and has sent nothing yet is in no protocol at
+                    // all, nothing closes it, and the drain waits on it for as
+                    // long as the peer cares to hold the socket.
+                    //
+                    // MEASURED, and it is not theoretical. A raw socket
+                    // connected to the engine and left silent held the first
+                    // SIGTERM open past 5s, **5 times out of 5**. It also
+                    // reached the live tier by accident: with the drain
+                    // unbounded,
+                    // `shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open`
+                    // hung past its 30s bound once in roughly 200 engines --
+                    // a tonic channel whose HTTP/2 preface had not been
+                    // exchanged when the signal landed is exactly that state.
+                    //
+                    // So "handles SIGTERM" must not depend on a peer being
+                    // well behaved. The escalation below is the operator's
+                    // lever and this is the one that needs no operator.
+                    let forced = quiesced.futureResult.eventLoop.scheduleTask(in: shutdownGrace) {
+                        logger.error(
+                            "connections did not drain within the grace period; closing anyway",
+                            metadata: ["grace": "\(shutdownGrace)"]
+                        )
+                        // Non-zero: this is the drain failing, not an operator
+                        // choosing to abandon it. See `releaseAndExit`.
+                        releaseAndExit(engine, logger: logger, status: EXIT_FAILURE)
+                    }
+                    // Same event loop as the promise, so a drain that finishes
+                    // first and this cancellation are ordered against each
+                    // other rather than racing.
+                    quiesced.futureResult.whenComplete { _ in forced.cancel() }
                 } else {
                     logger.notice("closing immediately", metadata: ["signal": "\(number)"])
                     engine.server.close(promise: nil)
+
+                    // **Ending the process here rather than letting `serve()`
+                    // return, because what is being escalated past is the wait
+                    // for accepted connections to close.** Closing the
+                    // listening channel does not close them -- NIO's accepted
+                    // channels outlive their listener -- so returning would
+                    // leave `quiesced` pending for exactly as long as the
+                    // client holds its connection, and completing `quiesced`
+                    // instead would shut the event-loop group down with those
+                    // channels still registered, which is the crash the
+                    // graceful path exists to avoid. Nothing after this needs
+                    // the group.
+                    //
+                    // Zero, unlike the grace-period path above: abandoning the
+                    // remaining connections is what the second signal asked
+                    // for, so doing it is this process succeeding.
+                    releaseAndExit(engine, logger: logger, status: EXIT_SUCCESS)
                 }
             }
             source.resume()
@@ -218,17 +517,3 @@ struct ArcaEngineCommand: AsyncParsableCommand {
     }
 }
 
-/// Counts shutdown signals.
-///
-/// `@unchecked Sendable` because every access happens on the one serial queue
-/// `installShutdownHandler` gives both of its signal sources; it carries no
-/// synchronisation of its own and must not be used anywhere else.
-private final class ShutdownRequests: @unchecked Sendable {
-    private var seen = 0
-
-    /// Records a request and answers whether it was the first.
-    func recordAndReportFirst() -> Bool {
-        seen += 1
-        return seen == 1
-    }
-}

@@ -947,36 +947,12 @@ public actor WireGuardNetworkBackend {
         )
     }
 
-    /// Get container attachments for a network
-    public func getNetworkAttachments(networkID: String) async throws -> [String: NetworkAttachment] {
-        let attachments = try await stateStore.loadAttachmentsForNetwork(networkID: networkID)
-        var result: [String: NetworkAttachment] = [:]
-
-        for attachment in attachments {
-            result[attachment.containerID] = NetworkAttachment(
-                networkID: networkID,
-                ip: attachment.ipAddress,
-                mac: attachment.macAddress,
-                aliases: attachment.aliases
-            )
-        }
-
-        return result
-    }
-
-    /// Get networks for a container
-    public func getContainerNetworks(containerID: String) async throws -> [NetworkMetadata] {
-        let networkIDs = try await stateStore.getContainerNetworks(containerID: containerID)
-        var networks: [NetworkMetadata] = []
-
-        for networkID in networkIDs {
-            if let network = try await loadNetwork(id: networkID) {
-                networks.append(network)
-            }
-        }
-
-        return networks
-    }
+    // Attachment reads are not here: `StoredNetworkAttachments` in
+    // NetworkManager.swift owns them. They read `network_attachments` and no
+    // in-memory backend state, so routing them through a backend that only
+    // `NetworkManager.initialize()` can install cost the ability to test them
+    // and bought nothing. Do not add a second copy here: two answers to "who
+    // is attached" is what `docker network prune` would then delete on.
 
     /// Clean up in-memory network state for a stopped/exited container
     /// Called when container stops to ensure state is clean for restart
@@ -1142,3 +1118,8 @@ public actor WireGuardNetworkBackend {
         return block.contains(address)
     }
 }
+
+/// The bridge-network source `NetworkManager.listNetworks()` reads in
+/// production. The conformance is empty: `listNetworks()` above already has the
+/// signature the protocol asks for.
+extension WireGuardNetworkBackend: NetworkLister {}

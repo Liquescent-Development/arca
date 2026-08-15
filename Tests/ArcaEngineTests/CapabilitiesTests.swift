@@ -18,9 +18,25 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertNil(engineVersion(from: "0.2.x"))
     }
 
-    /// This build implements no create and no exec, so it claims nothing. A
-    /// capability that is true before its code exists is how a consumer is
-    /// induced to send a request the engine cannot honour.
+    /// **This asserts the false flags as hard as the true ones, and that is the
+    /// point.** A capability that is true before its code exists is how a
+    /// consumer is induced to send a request the engine cannot honour, so the
+    /// `XCTAssertFalse`s below are not leftovers from an emptier build: `tty`
+    /// and `signals` are false because `Exec` is not implemented, and `offline`
+    /// is `.unverified` because nothing has proven isolation. See the note on
+    /// `capabilities(request:)` for what earned each of the four that are true.
+    ///
+    /// `namedVolumes` was one of the falses until vminitd stopped identifying
+    /// its OverlayFS block devices by counting `/dev/vd` letters -- which
+    /// swallowed the volume devices -- and started reading a role out of each
+    /// image's ext4 volume label. This assertion flipping is a deliberate part
+    /// of that change; it failing on its own would mean the flag moved without
+    /// one.
+    ///
+    /// **This test cannot corroborate any of them.** It reads the same literals
+    /// the source holds; what makes those literals honest is gascan's live
+    /// tier, named in that note, and nothing here. It is a lock against a flag
+    /// moving unnoticed, not evidence that a flag is right.
     ///
     /// Calls the context-free `capabilities(request:)` overload rather than
     /// the protocol-conforming `capabilities(request:context:)`: grpc-swift's
@@ -33,12 +49,12 @@ final class CapabilitiesTests: XCTestCase {
         guard case .capabilities(let capabilities) = response.outcome else {
             return XCTFail("Capabilities must answer with capabilities")
         }
-        XCTAssertFalse(capabilities.projectMount)
-        XCTAssertFalse(capabilities.namedVolumes)
+        XCTAssertTrue(capabilities.projectMount)
+        XCTAssertTrue(capabilities.namedVolumes)
         XCTAssertFalse(capabilities.tty)
         XCTAssertFalse(capabilities.signals)
-        XCTAssertFalse(capabilities.loopbackPublish)
-        XCTAssertFalse(capabilities.resourceLimits)
+        XCTAssertTrue(capabilities.loopbackPublish)
+        XCTAssertTrue(capabilities.resourceLimits)
         XCTAssertEqual(capabilities.offline, .unverified)
         XCTAssertEqual(capabilities.contractMinor, 0)
         XCTAssertEqual(capabilities.engineVersion.minor, 2)

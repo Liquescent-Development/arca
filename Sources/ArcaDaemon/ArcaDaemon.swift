@@ -3,6 +3,7 @@ import Logging
 import NIOHTTP1
 import DockerAPI
 import ContainerBridge
+import Containerization
 
 /// The main Arca daemon that implements the Docker Engine API server
 public final class ArcaDaemon: @unchecked Sendable {
@@ -93,8 +94,15 @@ public final class ArcaDaemon: @unchecked Sendable {
 
             // Delete the existing initfs.ext4 file to force regeneration from our custom vminit
             // Without this, the old initfs.ext4 (which may be from a different vminit) gets reused
-            let initfsPath = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/com.apple.containerization/initfs.ext4")
+            //
+            // Bound to the store this daemon actually loads into, rather than
+            // spelled out from the home directory a second time: Containerization
+            // builds initfs.ext4 at the image store's own path, so the two are the
+            // same file only for as long as the two spellings agree. Unchanged in
+            // effect -- the ImageManager above is constructed with no path, so its
+            // store is ImageStore.default, rooted at Application Support's
+            // com.apple.containerization (ImageStore.swift:55-64).
+            let initfsPath = imageManager.storeRoot.appendingPathComponent("initfs.ext4")
             if FileManager.default.fileExists(atPath: initfsPath.path) {
                 logger.debug("Deleting existing initfs.ext4 to force regeneration")
                 do {
@@ -159,10 +167,39 @@ public final class ArcaDaemon: @unchecked Sendable {
         let eventManager = EventManager(logger: logger)
         self.eventManager = eventManager
 
+        // The log root this daemon has always used, now stated here instead of
+        // derived inside ContainerLogManager -- where every ContainerManager
+        // got it, whatever state root it was built for.
+        //
+        // `url(for:in:appropriateFor:create:)` and not `urls(for:in:).first!`:
+        // the force-unwrap the comment below warns about was still live in
+        // ContainerLogManager, and this is the throwing spelling of the same
+        // lookup. Same directory as before -- Application Support in the user
+        // domain, then `com.apple.arca/logs` -- so nothing this daemon reads or
+        // writes moves.
+        let applicationSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        )
+        let daemonLogRoot = applicationSupport
+            .appendingPathComponent("com.apple.arca")
+            .appendingPathComponent("logs")
+
         // Initialize ContainerManager with kernel path from config
         let containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: config.kernelPath,
+            // ImageStore.default.path rather than a re-derivation of Apple's
+            // path: re-deriving it would silently diverge the day Apple changes
+            // it, and a hand-rolled `urls(for:in:)[0]` traps on an empty array
+            // where ImageStore.defaultRoot() throws.
+            imageStoreRoot: ImageStore.default.path,
+            layerCachePath: URL(
+                fileURLWithPath: NSString(string: "~/.arca/layers").expandingTildeInPath
+            ),
+            logRoot: daemonLogRoot,
             stateStore: stateStore,
             logger: logger
         )

@@ -25,8 +25,14 @@ public struct NetworkHandlers: Sendable {
     }
 
     /// Get error description from Swift errors
+    ///
+    /// `String(describing:)`, not `localizedDescription`: a Swift `enum … :
+    /// Error` carries no localized description, so Foundation renders it as
+    /// "The operation couldn't be completed. (… error N.)". That would reach
+    /// gascan and the CLI as `failed to list networks: <content-free string>`,
+    /// discarding the very signal `listNetworks()` now throws in order to carry.
     private func errorDescription(_ error: Error) -> String {
-        return error.localizedDescription
+        return String(describing: error)
     }
 
     /// Handle GET /networks
@@ -39,19 +45,36 @@ public struct NetworkHandlers: Sendable {
             "filters": "\(filters)"
         ])
 
-        // networkManager.listNetworks() doesn't throw - it returns an array directly
-        // No failure case for listing (empty array on no networks)
-        let allNetworks = await networkManager.listNetworks()
+        let allNetworks: [NetworkMetadata]
+        do {
+            allNetworks = try await networkManager.listNetworks()
+        } catch {
+            logger.error("Failed to list networks", metadata: ["error": "\(error)"])
+            return .failure(NetworkError.listFailed(errorDescription(error)))
+        }
 
         // Apply sync filters first
         var filteredMetadata = applyFilters(allNetworks, filters: filters)
 
         // Apply dangling filter (async - requires checking attachments)
+        //
+        // `dangling` *is* the attachment read: a failure that read as `[:]`
+        // would report every network as dangling, which is the answer that
+        // sends a user to delete networks that are in use.
         if let danglingValues = filters["dangling"], !danglingValues.isEmpty {
             if let dangling = parseBool(danglingValues[0]) {
                 var danglingFiltered: [NetworkMetadata] = []
                 for network in filteredMetadata {
-                    let attachments = await networkManager.getNetworkAttachments(networkID: network.id)
+                    let attachments: [String: NetworkAttachment]
+                    do {
+                        attachments = try await networkManager.getNetworkAttachments(networkID: network.id)
+                    } catch {
+                        logger.error("Failed to read network attachments", metadata: [
+                            "id": "\(network.id)",
+                            "error": "\(error)"
+                        ])
+                        return .failure(NetworkError.listFailed(errorDescription(error)))
+                    }
                     let isDangling = attachments.isEmpty
                     if dangling == isDangling {
                         danglingFiltered.append(network)
@@ -63,8 +86,13 @@ public struct NetworkHandlers: Sendable {
 
         // Convert to Docker API format
         var networks: [Network] = []
-        for metadata in filteredMetadata {
-            networks.append(await convertToDockerNetwork(metadata))
+        do {
+            for metadata in filteredMetadata {
+                networks.append(try await convertToDockerNetwork(metadata))
+            }
+        } catch {
+            logger.error("Failed to read network attachments", metadata: ["error": "\(error)"])
+            return .failure(NetworkError.listFailed(errorDescription(error)))
         }
 
         logger.info("Listed networks", metadata: ["count": "\(networks.count)"])
@@ -99,14 +127,32 @@ public struct NetworkHandlers: Sendable {
         }
 
         // Try resolving as name or ID
-        let resolvedID = await networkManager.resolveNetworkID(id) ?? id
+        let resolvedID: String
+        do {
+            resolvedID = try await networkManager.resolveNetworkID(id) ?? id
+        } catch {
+            logger.error("Failed to resolve network", metadata: [
+                "id": "\(id)",
+                "error": "\(error)"
+            ])
+            return .failure(NetworkError.inspectFailed(errorDescription(error)))
+        }
 
-        // networkManager methods don't throw - they return optionals
+        // networkManager.getNetwork does not throw - it returns an optional
         // Failure case handled via guard statement
         guard let metadata = await networkManager.getNetwork(id: resolvedID) else {
             return .failure(NetworkError.notFound(id))
         }
-        let network = await convertToDockerNetwork(metadata)
+        let network: Network
+        do {
+            network = try await convertToDockerNetwork(metadata)
+        } catch {
+            logger.error("Failed to read network attachments", metadata: [
+                "id": "\(resolvedID)",
+                "error": "\(error)"
+            ])
+            return .failure(NetworkError.inspectFailed(errorDescription(error)))
+        }
 
         logger.info("Inspected network", metadata: [
             "id": "\(network.id)",
@@ -201,7 +247,7 @@ public struct NetworkHandlers: Sendable {
 
         do {
             // Resolve network name or ID to full network ID
-            guard let resolvedID = await networkManager.resolveNetworkID(id) else {
+            guard let resolvedID = try await networkManager.resolveNetworkID(id) else {
                 return .failure(NetworkError.notFound(id))
             }
 
@@ -265,7 +311,7 @@ public struct NetworkHandlers: Sendable {
             }
 
             // Resolve network name or ID to full network ID
-            guard let resolvedNetworkID = await networkManager.resolveNetworkID(networkID) else {
+            guard let resolvedNetworkID = try await networkManager.resolveNetworkID(networkID) else {
                 return .failure(NetworkError.notFound("network \(networkID) not found"))
             }
 
@@ -446,7 +492,7 @@ public struct NetworkHandlers: Sendable {
     }
 
     /// Convert NetworkMetadata to Docker API Network format
-    private func convertToDockerNetwork(_ metadata: NetworkMetadata) async -> Network {
+    private func convertToDockerNetwork(_ metadata: NetworkMetadata) async throws -> Network {
         // Format created timestamp as ISO8601
         let iso8601Formatter = ISO8601DateFormatter()
         let createdString = iso8601Formatter.string(from: metadata.created)
@@ -459,7 +505,7 @@ public struct NetworkHandlers: Sendable {
         let ipam = IPAM(driver: "default", config: [ipamConfig])
 
         // Get container attachments for this network
-        let attachments = await networkManager.getNetworkAttachments(networkID: metadata.id)
+        let attachments = try await networkManager.getNetworkAttachments(networkID: metadata.id)
         var containers: [String: NetworkContainer] = [:]
 
         for (containerID, attachment) in attachments {
@@ -518,7 +564,13 @@ public struct NetworkHandlers: Sendable {
         }
 
         // Get all networks from NetworkManager
-        let allNetworks = await networkManager.listNetworks()
+        let allNetworks: [NetworkMetadata]
+        do {
+            allNetworks = try await networkManager.listNetworks()
+        } catch {
+            logger.error("Failed to list networks for prune", metadata: ["error": "\(error)"])
+            return .failure(NetworkError.pruneFailed(errorDescription(error)))
+        }
 
         var deletedNetworkNames: [String] = []
 
@@ -528,8 +580,26 @@ public struct NetworkHandlers: Sendable {
                 continue
             }
 
-            // Skip networks with active containers
-            let attachments = await networkManager.getNetworkAttachments(networkID: network.id)
+            // Skip networks with active containers.
+            //
+            // A failure here abandons the whole prune rather than treating the
+            // network as unused: `[:]` and "could not tell" are the same value,
+            // and the difference between them is whether the next few lines
+            // delete a network somebody's containers are on. Networks already
+            // deleted in this pass stay deleted -- each was read successfully
+            // and was genuinely unused -- but the error is what the caller
+            // gets, and their names are not reported. Docker's own prune
+            // reports an error the same way.
+            let attachments: [String: NetworkAttachment]
+            do {
+                attachments = try await networkManager.getNetworkAttachments(networkID: network.id)
+            } catch {
+                logger.error("Failed to read network attachments for prune", metadata: [
+                    "id": "\(network.id)",
+                    "error": "\(error)"
+                ])
+                return .failure(NetworkError.pruneFailed(errorDescription(error)))
+            }
             if !attachments.isEmpty {
                 continue
             }

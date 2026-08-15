@@ -387,7 +387,7 @@ public struct ImageHandlers: Sendable {
             let danglingOnly = filters?["dangling"]?.first == "true" || filters?["dangling"]?.first == "1"
 
             // Get all container image IDs to check usage
-            let containers = try await containerManager.listContainers(all: true)
+            let containers = try await containerManager.listContainers(all: true, includeInternal: false)
             let usedImageIDs = Set(containers.map { $0.imageID })
 
             logger.debug("Image prune scan", metadata: [

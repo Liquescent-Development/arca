@@ -24,10 +24,20 @@ public struct OverlayFSMounter: Sendable {
     /// - Writable block device (for upper/work directories)
     /// - Layer block devices (read-only EXT4 filesystems)
     ///
-    /// Device layout in guest:
+    /// Device layout in guest, as the virtio-blk allocator happens to assign it:
     /// - /dev/vda: initfs (vminit image, read-only, created by VZVirtualMachineManager)
     /// - /dev/vdb: writable.ext4 (contains upper/ and work/ subdirectories, read-write)
     /// - /dev/vdc onwards: layer0.ext4, layer1.ext4, etc. (read-only layers)
+    /// - then whatever `additionalMounts` carries, which includes named-volume block devices
+    ///
+    /// **The guest does not depend on those positions and must not be made to.** Each image is
+    /// formatted with an `ArcaBlockDeviceRole` in its ext4 volume label, and
+    /// `ArcaBoot.prepareOverlayFS` classifies devices by that label alone. What the guest does
+    /// still take from this order is the *relative* order of the layer devices among
+    /// themselves: they are attached bottom-to-top here, the allocator assigns letters in
+    /// attach order, and the guest sorts the labelled layer devices by name to recover the
+    /// stack. Roles are named; order within a role is positional, because a cached
+    /// `layer.ext4` is shared between images and cannot carry an index of its own.
     ///
     /// Mount order is critical:
     /// - First mount is used by LinuxContainer as the rootfs mount
@@ -119,36 +129,11 @@ public struct OverlayFSMounter: Sendable {
         return mounts
     }
 
-    /// Get the writable device path in guest
-    ///
-    /// - Returns: Block device path for writable filesystem (/dev/vdb)
-    public static var writableDevicePath: String {
-        return "/dev/vdb"
-    }
-
-    /// Get mount path for writable filesystem in guest
-    ///
-    /// - Returns: Path where writable device is mounted
-    public static var writableMountPath: String {
-        return "/mnt/writable"
-    }
-
-    /// Get the layer block device paths in guest
-    ///
-    /// Returns the device paths that the guest will see for each layer.
-    /// Block devices start at /dev/vdc (after writable device at /dev/vdb).
-    ///
-    /// - Parameter layerCount: Number of layer block devices attached
-    /// - Returns: Array of block device paths in guest (e.g., ["/dev/vdc", "/dev/vdd", ...])
-    public func buildBlockDevicePaths(layerCount: Int) -> [String] {
-        var blockDevices: [String] = []
-        for i in 0..<layerCount {
-            // Start at 'c' (99) since vdb is writable device
-            let deviceChar = Character(UnicodeScalar(99 + i)!)  // 99 = 'c'
-            blockDevices.append("/dev/vd\(deviceChar)")
-        }
-        return blockDevices
-    }
+    // Removed with the move to labelled devices: `writableDevicePath` (/dev/vdb),
+    // `writableMountPath` and `buildBlockDevicePaths(layerCount:)`. All three computed a guest
+    // device path from a position or a count, which is the inference this change exists to
+    // delete, and none of them had a call site. Keeping them would leave the defect one
+    // `buildBlockDevicePaths` call away from returning.
 
     /// Create writable EXT4 filesystem for upper/work directories
     ///
@@ -176,10 +161,15 @@ public struct OverlayFSMounter: Sendable {
 
         // Create EXT4 filesystem using Apple's ContainerizationEXT4 framework
         // This is the same method used for creating temp-rootfs.ext4
+        //
+        // The volume label is how vminitd finds this device. It no longer assumes /dev/vdb:
+        // it scans every virtio-blk device and mounts the one labelled `arca.writable` at
+        // /mnt/writable. See ArcaBlockDeviceRole.
         let sizeBytes = UInt64(sizeMB) * 1024 * 1024  // Convert MB to bytes
         let formatter = try ContainerizationEXT4.EXT4.Formatter(
             FilePath(path),
-            minDiskSize: sizeBytes
+            minDiskSize: sizeBytes,
+            volumeLabel: ArcaBlockDeviceRole.overlayWritable.volumeLabel
         )
         try formatter.close()
 
