@@ -127,6 +127,23 @@ public struct EngineServer: Sendable {
         // it is not the postcondition -- `onClose` is, and it is awaited next.
         server.close(promise: nil)
         try await onClose.get()
+        try releaseSocketPath()
+    }
+
+    /// Removes the socket and gives up the claim on its path, without waiting
+    /// for the server to finish closing.
+    ///
+    /// The cleanup half of `shutDown()` on its own, for the one caller that
+    /// cannot afford the other half: an operator signalling a second time is
+    /// escalating past a wait for accepted connections to close, so a teardown
+    /// that began by awaiting the very thing being escalated past would be no
+    /// escalation at all. `arca-engine`'s shutdown handler calls this and then
+    /// ends the process.
+    ///
+    /// The two steps live here rather than being repeated at that call site so
+    /// the ordinary and the escalated path cannot drift into releasing
+    /// different things.
+    public func releaseSocketPath() throws {
         try removeOwnSocket()
         try lock.release()
     }

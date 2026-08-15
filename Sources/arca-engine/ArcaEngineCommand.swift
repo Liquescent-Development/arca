@@ -209,6 +209,11 @@ struct ServeCommand: AsyncParsableCommand {
     /// swapping the async `shutdownGracefully()` for a blocking
     /// `syncShutdownGracefully()` on a Dispatch thread were each measured and
     /// each still crashed.
+    ///
+    /// **That fix was necessary and it was not sufficient, because it released
+    /// the wrong objects.** Scoping the server here says nothing about the
+    /// connections the server ACCEPTED, and those are what `quiesced` below is
+    /// about.
     private func serve(
         service: SandboxEngineService,
         group: MultiThreadedEventLoopGroup,
@@ -221,15 +226,105 @@ struct ServeCommand: AsyncParsableCommand {
         )
         logger.info("engine listening", metadata: ["socket": "\(socketPath)"])
 
+        // **What this waits for is every ACCEPTED connection to have gone, and
+        // that is a different event from the listening socket closing.** It
+        // used to wait for `engine.onClose`, which is the LISTENING channel's
+        // `closeFuture`, and `ServerQuiescingHelper` closes that immediately --
+        // before the connections it has just asked to quiesce have finished
+        // doing so. So `run()` shut the event-loop group down underneath live
+        // channels: each one's `closeFuture` callback then tried to schedule
+        // `ChannelCollector.channelRemoved` on a loop that had gone, which NIO
+        // reports as `Cannot schedule tasks on an EventLoop that has already
+        // shut down`; the collector therefore never reached
+        // `shutdownCompleted()`, and deallocated still holding the promise it
+        // makes at `QuiescingHelper.swift:141` -- `Fatal error: leaking
+        // promise`, `Trace/BPT trap: 5`, exit 133.
+        //
+        // MEASURED with Gas Can's `shutdown.rs`, which stops 32 engines per
+        // figure because at this rate a single clean shutdown is worth nothing.
+        // Two binaries built from this file, run interleaved rather than
+        // A-then-B: awaiting `onClose`, **6 crashes in 192**; awaiting
+        // `quiesced`, **0 in 192**. The container case, 32 engines each:
+        // **12/32 (38%)** against `onClose`.
+        //
+        // **The defect never needed a container.** `docs/status/START-HERE.md`
+        // recorded it as happening "once containers have been created", and
+        // that was a correlate: an engine that never created one still crashed
+        // 1 time in 96. A container widens the window -- more accepted traffic,
+        // more to tear down -- it does not change the bug.
+        //
+        // **Handing `initiateGracefulShutdown` a promise rather than `nil` is a
+        // consequence of the wait and NOT the fix**, and that was measured
+        // rather than argued. A third binary that passes `quiesced` in and
+        // still awaits `onClose` -- the promise made, never waited on -- runs at
+        // **22/32 (69%)**, WORSE than the original. The crash does not go
+        // quiet, it changes address: the leaked promise stops being the
+        // collector's at `QuiescingHelper.swift:141` and becomes this
+        // function's own, which the trace names as `ArcaEngineCommand.swift`.
+        // The `Cannot schedule tasks` line is unchanged throughout, and that is
+        // the tell -- the group is still going down under live channels, and
+        // only the bookkeeping moved.
+        //
+        // **NOTHING IN THIS REPOSITORY CAN PROVE ANY OF IT, and a test was
+        // attempted rather than assumed away.** The claim is about two futures
+        // of a running server with an accepted connection outliving its
+        // listener, and no unit test can hold one there: a connection
+        // grpc-swift has finished configuring is closed by the same GOAWAY
+        // quiescing sends, and a raw socket it has not finished configuring
+        // cannot be observed to have been accepted -- so either fixture decides
+        // the assertion by a race. `serve()` is private and needs a real
+        // process besides. Gas Can's live tier is the instrument, and every
+        // rate above is its output.
+        let quiesced = group.next().makePromise(of: Void.self)
+
         // Held for the whole run: a DispatchSourceSignal stops delivering the
         // moment it is deallocated, so a source that is not kept alive is a
         // handler that silently never fires. Cancelling them here also drops
         // the last references these closures hold to the engine.
-        let signals = Self.installShutdownHandler(logger: logger, for: engine)
+        let signals = Self.installShutdownHandler(
+            logger: logger,
+            for: engine,
+            quiesced: quiesced
+        )
         defer { signals.forEach { $0.cancel() } }
 
-        try await engine.onClose.get()
+        try await quiesced.futureResult.get()
         try await engine.shutDown()
+    }
+
+    /// How long a graceful shutdown waits for accepted connections to drain
+    /// before stopping anyway.
+    ///
+    /// Ten seconds is chosen against the two clocks that already bound this
+    /// process from outside, so that the engine is the one that decides: Gas
+    /// Can's live tier gives a stopping engine 30s before it calls the
+    /// supervisor stuck (`LiveEngine::stop`), and launchd's `ExitTimeOut`
+    /// defaults to 20s before it escalates to SIGKILL. A drain that has not
+    /// finished in ten has met something that will not finish, and being
+    /// SIGKILLed instead would run none of the cleanup below.
+    ///
+    /// **Nothing measures this number**, and it is a policy rather than a
+    /// finding: an ordinary drain here completes in milliseconds.
+    private static let shutdownGrace = TimeAmount.seconds(10)
+
+    /// Gives up the socket path and ends the process.
+    ///
+    /// Both callers are past the point where returning is possible -- one is
+    /// an operator's second signal, the other a drain that ran out of grace --
+    /// and both must leave the path as `shutDown()` would.
+    private static func releaseAndExit(_ engine: EngineServer, logger: Logger) -> Never {
+        do {
+            try engine.releaseSocketPath()
+        } catch {
+            // Reported rather than dropped: whoever starts the next engine on
+            // this path has to reason about what is left there, and this is the
+            // only moment anything knows.
+            logger.error("could not release the socket path", metadata: ["error": "\(error)"])
+        }
+        // Qualified: bare `exit` inside a `ParsableCommand` resolves to
+        // ArgumentParser's own `exit(withError:)` instance method, and the
+        // compiler rejects it here rather than quietly calling something else.
+        Foundation.exit(EXIT_SUCCESS)
     }
 
     /// Turns SIGTERM and SIGINT into a graceful close, and a repeat of either
@@ -249,9 +344,18 @@ struct ServeCommand: AsyncParsableCommand {
     /// RPCs, and a client holding a stream open can hold the engine open with
     /// it. Without a second signal that forces the issue, "handles SIGTERM"
     /// would be true and "can be stopped" would not.
+    ///
+    /// **That paragraph was written before the code did any of it, and it is
+    /// true for the first time now.** Until `serve()` started waiting on
+    /// `quiesced`, one signal ended the process whatever a client was doing:
+    /// the wait was on the LISTENING channel's close, which
+    /// `ServerQuiescingHelper` performs synchronously, so nothing ever waited
+    /// for an in-flight RPC and the second signal had nothing left to force.
+    /// The wait is real now, so the escalation has to be.
     private static func installShutdownHandler(
         logger: Logger,
-        for engine: EngineServer
+        for engine: EngineServer,
+        quiesced: EventLoopPromise<Void>
     ) -> [DispatchSourceSignal] {
         // One serial queue shared by both sources, so the two handlers can
         // never run concurrently and `asked` needs no lock of its own.
@@ -263,10 +367,59 @@ struct ServeCommand: AsyncParsableCommand {
             source.setEventHandler {
                 if asked.recordAndReportFirst() {
                     logger.info("shutting down gracefully", metadata: ["signal": "\(number)"])
-                    engine.server.initiateGracefulShutdown(promise: nil)
+                    engine.server.initiateGracefulShutdown(promise: quiesced)
+
+                    // **The drain is bounded, and it has to be, because
+                    // quiescing cannot close every connection it asks to
+                    // close.** `ServerQuiescingHelper` sends each accepted
+                    // channel a `ChannelShouldQuiesceEvent`; grpc-swift turns
+                    // that into a GOAWAY and closes the connection once its
+                    // streams finish -- but only for a connection whose
+                    // protocol it has finished negotiating. One that has been
+                    // accepted and has sent nothing yet is in no protocol at
+                    // all, nothing closes it, and the drain waits on it for as
+                    // long as the peer cares to hold the socket.
+                    //
+                    // MEASURED, and it is not theoretical. A raw socket
+                    // connected to the engine and left silent held the first
+                    // SIGTERM open past 5s, **5 times out of 5**. It also
+                    // reached the live tier by accident: with the drain
+                    // unbounded,
+                    // `shutdown::the_engine_exits_cleanly_with_a_client_channel_still_open`
+                    // hung past its 30s bound once in roughly 200 engines --
+                    // a tonic channel whose HTTP/2 preface had not been
+                    // exchanged when the signal landed is exactly that state.
+                    //
+                    // So "handles SIGTERM" must not depend on a peer being
+                    // well behaved. The escalation below is the operator's
+                    // lever and this is the one that needs no operator.
+                    let forced = quiesced.futureResult.eventLoop.scheduleTask(in: shutdownGrace) {
+                        logger.notice(
+                            "connections did not drain within the grace period; closing anyway",
+                            metadata: ["grace": "\(shutdownGrace)"]
+                        )
+                        releaseAndExit(engine, logger: logger)
+                    }
+                    // Same event loop as the promise, so a drain that finishes
+                    // first and this cancellation are ordered against each
+                    // other rather than racing.
+                    quiesced.futureResult.whenComplete { _ in forced.cancel() }
                 } else {
                     logger.notice("closing immediately", metadata: ["signal": "\(number)"])
                     engine.server.close(promise: nil)
+
+                    // **Ending the process here rather than letting `serve()`
+                    // return, because what is being escalated past is the wait
+                    // for accepted connections to close.** Closing the
+                    // listening channel does not close them -- NIO's accepted
+                    // channels outlive their listener -- so returning would
+                    // leave `quiesced` pending for exactly as long as the
+                    // client holds its connection, and completing `quiesced`
+                    // instead would shut the event-loop group down with those
+                    // channels still registered, which is the crash the
+                    // graceful path exists to avoid. Nothing after this needs
+                    // the group.
+                    releaseAndExit(engine, logger: logger)
                 }
             }
             source.resume()
