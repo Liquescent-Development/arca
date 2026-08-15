@@ -3,6 +3,7 @@ import ArgumentParser
 import ContainerBridge
 import Foundation
 import Logging
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 
@@ -265,28 +266,77 @@ struct ServeCommand: AsyncParsableCommand {
         // the tell -- the group is still going down under live channels, and
         // only the bookkeeping moved.
         //
-        // **NOTHING IN THIS REPOSITORY CAN PROVE ANY OF IT, and a test was
-        // attempted rather than assumed away.** The claim is about two futures
-        // of a running server with an accepted connection outliving its
-        // listener, and no unit test can hold one there: a connection
-        // grpc-swift has finished configuring is closed by the same GOAWAY
-        // quiescing sends, and a raw socket it has not finished configuring
-        // cannot be observed to have been accepted -- so either fixture decides
-        // the assertion by a race. `serve()` is private and needs a real
-        // process besides. Gas Can's live tier is the instrument, and every
-        // rate above is its output.
+        // **A PREVIOUS VERSION OF THIS COMMENT SAID "NOTHING IN THIS
+        // REPOSITORY CAN PROVE ANY OF IT". THAT WAS FALSE AND A REVIEWER
+        // DISPROVED IT BY WRITING THE TEST.** The argument given was that a
+        // raw socket cannot be observed to have been accepted, so the fixture
+        // would decide the assertion by a race. The race is real but it is
+        // SETUP, not assertion, and it fails safe: an unaccepted connection
+        // lets the close drain immediately, so the pending assertion goes red
+        // rather than falsely green. Measured 20 runs, 20 passes, on a
+        // single-threaded loop with `EngineServer.start` and
+        // `SandboxEngineService.forTesting()`, which `EngineServerTests`
+        // already uses.
+        //
+        // The accurate statement is narrower. **The PREMISE is provable here
+        // and is not yet pinned**: that the listener closes while an accepted
+        // connection is still open, so `onClose` completes and `quiesced` does
+        // not. **The CALL SITE is not**, and privacy is not what stops it --
+        // `EngineProcess.swift` already spawns this binary to prove call sites.
+        // `run()` reaches `networkManager.initialize()`, which constructs a real
+        // `VmnetNetwork`, so a test of THIS function needs an entitlement and a
+        // host vmnet. Moving the wait into `ArcaEngine` would remove even that,
+        // and is recorded as the follow-up it is.
+        //
+        // Until then the mutation that matters here -- changing the line below
+        // back to `engine.onClose` -- leaves `swift test` at 151 passing, and
+        // Gas Can's live tier is the only thing that catches it. Every rate
+        // above is that tier's output.
         let quiesced = group.next().makePromise(of: Void.self)
 
         // Held for the whole run: a DispatchSourceSignal stops delivering the
         // moment it is deallocated, so a source that is not kept alive is a
         // handler that silently never fires. Cancelling them here also drops
         // the last references these closures hold to the engine.
+        let asked = ShutdownRequests()
         let signals = Self.installShutdownHandler(
             logger: logger,
             for: engine,
-            quiesced: quiesced
+            quiesced: quiesced,
+            asked: asked
         )
         defer { signals.forEach { $0.cancel() } }
+
+        // **The only thing that completes `quiesced` is the first signal, so a
+        // listening socket that closes for any OTHER reason would leave this
+        // function waiting on a promise nothing will ever fulfil.** That is a
+        // regression this change introduced and it is worse than what it
+        // replaced: awaiting `onClose` at least ended the process, whereas
+        // waiting forever holds the `flock` on the lockfile, which is precisely
+        // what makes `EngineServer.start` refuse the path to a successor. An
+        // engine that cannot serve and cannot be replaced is the worst of the
+        // three outcomes.
+        //
+        // The distinction is "did anything ask for this", not "did the listener
+        // close" -- the graceful path closes the listener itself, by design,
+        // and `asked` is recorded before that close is initiated, so a shutdown
+        // that was asked for always finds this true.
+        //
+        // **Reachability is unmeasured.** Within this function only the two
+        // handlers close the listener, and `EngineServer.start` configures no
+        // idle timeout; the case needs an unrecoverable failure in the server
+        // channel itself. Recorded as a guard whose trigger nothing drives.
+        engine.onClose.whenComplete { _ in
+            guard !asked.anyRecorded else { return }
+            logger.error(
+                """
+                the listening socket closed with no shutdown requested; the engine can no \
+                longer serve and nothing will complete its drain
+                """,
+                metadata: ["socket": "\(socketPath)"]
+            )
+            Self.releaseAndExit(engine, logger: logger, status: EXIT_FAILURE)
+        }
 
         try await quiesced.futureResult.get()
         try await engine.shutDown()
@@ -307,12 +357,29 @@ struct ServeCommand: AsyncParsableCommand {
     /// finding: an ordinary drain here completes in milliseconds.
     private static let shutdownGrace = TimeAmount.seconds(10)
 
-    /// Gives up the socket path and ends the process.
+    /// Gives up the socket path and ends the process with `status`.
     ///
-    /// Both callers are past the point where returning is possible -- one is
-    /// an operator's second signal, the other a drain that ran out of grace --
-    /// and both must leave the path as `shutDown()` would.
-    private static func releaseAndExit(_ engine: EngineServer, logger: Logger) -> Never {
+    /// Every caller is past the point where returning is possible, and each has
+    /// to leave the path exactly as `shutDown()` would.
+    ///
+    /// **`status` is a parameter because the callers do not mean the same
+    /// thing, and collapsing them onto `EXIT_SUCCESS` made a failure
+    /// unobservable.** An operator's second signal ASKED for the remaining
+    /// connections to be abandoned, so abandoning them is success. A drain that
+    /// ran out of grace abandoned them because it could not finish, and so did
+    /// a listener that closed underneath the engine; neither is.
+    ///
+    /// The consumer that matters reads exactly this byte: Gas Can's
+    /// `shutdown.rs` counts `!status.success()`, so while every path exited 0
+    /// its `0/96` could not distinguish 96 completed drains from 96 that gave
+    /// up at ten seconds -- in the instrument that measured this fix. One byte
+    /// carries that distinction, and it is cheaper and harder to lose than a
+    /// second assertion somewhere else would be.
+    private static func releaseAndExit(
+        _ engine: EngineServer,
+        logger: Logger,
+        status: Int32
+    ) -> Never {
         do {
             try engine.releaseSocketPath()
         } catch {
@@ -324,7 +391,7 @@ struct ServeCommand: AsyncParsableCommand {
         // Qualified: bare `exit` inside a `ParsableCommand` resolves to
         // ArgumentParser's own `exit(withError:)` instance method, and the
         // compiler rejects it here rather than quietly calling something else.
-        Foundation.exit(EXIT_SUCCESS)
+        Foundation.exit(status)
     }
 
     /// Turns SIGTERM and SIGINT into a graceful close, and a repeat of either
@@ -355,12 +422,14 @@ struct ServeCommand: AsyncParsableCommand {
     private static func installShutdownHandler(
         logger: Logger,
         for engine: EngineServer,
-        quiesced: EventLoopPromise<Void>
+        quiesced: EventLoopPromise<Void>,
+        asked: ShutdownRequests
     ) -> [DispatchSourceSignal] {
         // One serial queue shared by both sources, so the two handlers can
-        // never run concurrently and `asked` needs no lock of its own.
+        // never run concurrently. `asked` is the caller's because `serve()`
+        // reads it too, from the listening channel's close; it carries its own
+        // lock for that reason.
         let queue = DispatchQueue(label: "arca-engine.shutdown")
-        let asked = ShutdownRequests()
         return [SIGTERM, SIGINT].map { number in
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
@@ -394,11 +463,13 @@ struct ServeCommand: AsyncParsableCommand {
                     // well behaved. The escalation below is the operator's
                     // lever and this is the one that needs no operator.
                     let forced = quiesced.futureResult.eventLoop.scheduleTask(in: shutdownGrace) {
-                        logger.notice(
+                        logger.error(
                             "connections did not drain within the grace period; closing anyway",
                             metadata: ["grace": "\(shutdownGrace)"]
                         )
-                        releaseAndExit(engine, logger: logger)
+                        // Non-zero: this is the drain failing, not an operator
+                        // choosing to abandon it. See `releaseAndExit`.
+                        releaseAndExit(engine, logger: logger, status: EXIT_FAILURE)
                     }
                     // Same event loop as the promise, so a drain that finishes
                     // first and this cancellation are ordered against each
@@ -419,7 +490,11 @@ struct ServeCommand: AsyncParsableCommand {
                     // channels still registered, which is the crash the
                     // graceful path exists to avoid. Nothing after this needs
                     // the group.
-                    releaseAndExit(engine, logger: logger)
+                    //
+                    // Zero, unlike the grace-period path above: abandoning the
+                    // remaining connections is what the second signal asked
+                    // for, so doing it is this process succeeding.
+                    releaseAndExit(engine, logger: logger, status: EXIT_SUCCESS)
                 }
             }
             source.resume()
@@ -442,17 +517,29 @@ struct ServeCommand: AsyncParsableCommand {
     }
 }
 
-/// Counts shutdown signals.
+/// Counts shutdown signals, and answers whether any has arrived.
 ///
-/// `@unchecked Sendable` because every access happens on the one serial queue
-/// `installShutdownHandler` gives both of its signal sources; it carries no
-/// synchronisation of its own and must not be used anywhere else.
-private final class ShutdownRequests: @unchecked Sendable {
-    private var seen = 0
+/// **Locked rather than queue-confined, and it used to be the latter.** Both
+/// signal sources still share one serial queue, but `serve()` now also reads
+/// this from a `whenComplete` on the listening channel's close, which runs on a
+/// NIO event loop. Two threads, so the confinement argument no longer holds and
+/// a lock replaces it rather than a comment claiming a discipline the code no
+/// longer keeps.
+private final class ShutdownRequests: Sendable {
+    private let seen = NIOLockedValueBox(0)
 
     /// Records a request and answers whether it was the first.
     func recordAndReportFirst() -> Bool {
-        seen += 1
-        return seen == 1
+        seen.withLockedValue { seen in
+            seen += 1
+            return seen == 1
+        }
     }
+
+    /// Whether any signal has been recorded.
+    ///
+    /// Read to tell a listening socket that closed BECAUSE of a shutdown from
+    /// one that closed on its own. The handler records before it initiates, so
+    /// by the time a graceful close reaches the observer this is already true.
+    var anyRecorded: Bool { seen.withLockedValue { $0 > 0 } }
 }
