@@ -702,8 +702,8 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     func createContainer(
         request: Arca_Engine_V1_CreateContainerRequest
     ) async -> Arca_Engine_V1_CreateResponse {
-        if let missing = await firstRetainedResourceNotHeld(request.retained) {
-            return Self.createFailed([], missing)
+        if let refusal = await reusedTopologyRefusal(request) {
+            return Self.createFailed([], refusal)
         }
 
         let spec: SandboxContainerSpec
@@ -717,41 +717,101 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         return await buildContainer(spec: spec, created: [])
     }
 
-    /// The first retained resource this engine does not hold, or nil.
+    /// Why this recreate may not reuse the topology it names, or nil.
     ///
-    /// A store read, not a guess. Containers are not checked: the container is what
-    /// this RPC builds, so one appearing in `retained` is the caller's error and
-    /// `createContainer` will refuse it as a name conflict with a better message
-    /// than this could give.
-    private func firstRetainedResourceNotHeld(
-        _ retained: [Arca_Engine_V1_Resource]
+    /// **It verifies what the container will actually mount, and the first version
+    /// of this guard did not.** It checked `request.retained` -- a list the caller
+    /// supplies -- while the binds are built from `request.create.volumes`
+    /// (`EngineCreate.swift:106-123`) and the attachment from
+    /// `request.create.network`. Those are independent fields, so a request with
+    /// `retained: []` and populated `create.volumes` passed the guard untouched and
+    /// built the container: **the exact silent failure the guard exists to prevent,
+    /// reachable with the guard fully intact.** MEASURED by Task 1's review, which
+    /// also found that the test written to prove the guard asserted that bypass as
+    /// intended behaviour.
+    ///
+    /// So the topology is the subject and `retained` is an assertion the caller must
+    /// match, rather than the sole source of truth. Each volume the container will
+    /// mount, and the network it will attach to, must be:
+    ///
+    /// 1. named in `retained` -- the caller has to have declared it is reusing this,
+    ///    because a topology entry the caller never claimed is one nobody has said
+    ///    already exists;
+    /// 2. held by this engine, and
+    /// 3. owned by the caller, on the same three-tier comparison `Remove` uses.
+    ///
+    /// **This is not a contract change.** The wire format is untouched and
+    /// `engine.proto` does not forbid an engine refusing more than the minimum.
+    ///
+    /// **The reverse direction is deliberately not checked**: a `retained` entry
+    /// naming something outside the topology is ignored rather than refused. The
+    /// engine's business here is the mount, and Gas Can's
+    /// `validate_retained_resources` (`crates/gascan-core/src/runtime.rs:893-918`)
+    /// already requires exact count equality client-side, so refusing extras would
+    /// add a refusal no client can trigger and no test could keep honest.
+    ///
+    /// Containers are not in the topology this walks: the container is what this RPC
+    /// builds, so one appearing in `retained` is the caller's error and
+    /// `containerManager.createContainer` refuses it as a name conflict with a
+    /// better message than this could give.
+    private func reusedTopologyRefusal(
+        _ request: Arca_Engine_V1_CreateContainerRequest
     ) async -> Arca_Engine_V1_EngineError? {
-        for resource in retained {
-            let name = resource.identity.name
-            switch resource.identity.kind {
-            case .volume:
-                do {
-                    _ = try await volumeManager.inspectVolume(name: name)
-                } catch {
-                    return engineError(
-                        .notFound,
-                        resource: name,
-                        message: "this engine holds no volume named \(name)"
-                    )
-                }
-            case .network:
-                if await networkManager.getNetworkByName(name: name) == nil {
-                    return engineError(
-                        .notFound,
-                        resource: name,
-                        message: "this engine holds no network named \(name)"
-                    )
-                }
-            default:
-                continue
+        for resource in Self.reusedTopology(of: request.create) {
+            guard request.retained.contains(where: {
+                $0.identity.kind == resource.kind.resourceKind && $0.identity.name == resource.name
+            }) else {
+                return engineError(
+                    .invalidState,
+                    resource: resource.name,
+                    message: "this recreate mounts \(resource.kind.noun) \(resource.name) but "
+                        + "does not retain it; every resource the container reuses must be named "
+                        + "in retained"
+                )
+            }
+
+            // `storedLabels` rather than a lookup written here, because it is the
+            // one place that already distinguishes "this engine does not hold it"
+            // from "I could not tell" -- it catches `VolumeError.notFound` alone
+            // and turns any other throw into `command_io`. A blanket catch would
+            // report a failed store read as `not_found`, which instructs a
+            // reconciler to rebuild a volume that exists; that is the confusion
+            // `NetworkManager.swift:707-714` records as having made prune delete
+            // an in-use network.
+            let stored: [String: String]?
+            switch await storedLabels(kind: resource.kind, name: resource.name) {
+            case .failure(let error): return error
+            case .success(let labels): stored = labels
+            }
+
+            if let refusal = ownershipRefusal(
+                kind: resource.kind,
+                name: resource.name,
+                storedLabels: stored,
+                owner: request.create.owner,
+                action: .reuse
+            ) {
+                return refusal
             }
         }
         return nil
+    }
+
+    /// The resources a recreate reuses: exactly what the rebuilt container mounts
+    /// and attaches to, read from the same fields the spec is built from.
+    ///
+    /// Derived from `create` rather than from `retained` so that the guard and the
+    /// container cannot come to disagree about what the topology is. An offline
+    /// sandbox contributes no network, which is why the network is a `case` and not
+    /// an unconditional append.
+    private static func reusedTopology(
+        of request: Arca_Engine_V1_CreateRequest
+    ) -> [(kind: RemovableKind, name: String)] {
+        var topology = request.volumes.map { (kind: RemovableKind.volume, name: $0.name) }
+        if case .networkedName(let networkName) = request.network.mode {
+            topology.append((kind: .network, name: networkName))
+        }
+        return topology
     }
 
     public func createContainer(
