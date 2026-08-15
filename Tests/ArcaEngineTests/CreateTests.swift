@@ -432,6 +432,76 @@ final class CreateTests: XCTestCase {
         )
     }
 
+    /// A retained network this engine holds but that is not the caller's is
+    /// refused, unlabelled and mislabelled alike.
+    ///
+    /// **The network's ownership half, and it went unasserted for three rounds
+    /// while the volume's was covered.** MEASURED by the re-review: keeping
+    /// `not_found` for networks and dropping only the two ownership tiers passed
+    /// the whole suite at 166/0. The volume test covers both tiers for volumes;
+    /// nothing anywhere held a network under foreign labels, so `createContainer`
+    /// would attach a rebuilt container to any network of the right name whoever
+    /// owned it.
+    ///
+    /// **The unlabelled tier is not a hypothetical on networks, which is what
+    /// makes this different from its volume sibling.** This engine creates its own
+    /// `bridge` and `host` networks at startup with `labels: [:]`
+    /// (`NetworkManager.createDefaultNetworks`, `:297-338`), so an engine's own
+    /// defaults ARE the unlabelled case. A recreate naming `bridge` describes a
+    /// network that genuinely exists, that this engine genuinely holds, and that
+    /// belongs to no sandbox -- and without this tier the container would be
+    /// attached to it. Volumes have no equivalent: nothing creates an unlabelled
+    /// volume on this engine's behalf.
+    ///
+    /// The mislabelled tier is the same hazard as the volume's, on the resource
+    /// where it is worse: a container on another sandbox's network segment can
+    /// reach that sandbox, where a wrongly mounted volume only exposes its
+    /// contents.
+    func testCreateContainerRefusesARetainedNetworkThatIsNotTheCallers() async throws {
+        let engine = try await preparedEngine()
+        let held = "gascan-cache-\(Self.sandboxId)"
+        try await engine.hold(volume: held)
+
+        // Unlabelled first, and named for the engine's own default so the fixture
+        // is the production case rather than an invented one.
+        try await engine.hold(network: "bridge", labels: [:])
+        let unlabelled = await engine.service.createContainer(
+            request: Self.recreate(engine.request(
+                volumes: [(name: held, path: "/home/workspace/.cache")],
+                network: .networkedName("bridge")
+            ))
+        )
+        guard case .failed(let unowned) = unlabelled.outcome else {
+            return XCTFail("a network carrying no owner labels must be refused")
+        }
+        XCTAssertEqual(unowned.error.code, "foreign_resource_refused")
+        XCTAssertEqual(unowned.error.resource, "bridge")
+        XCTAssertTrue(
+            unowned.error.message.contains("will not mount it into a rebuilt container"),
+            "the refusal must say what a recreate was about to do: \(unowned.error.message)"
+        )
+
+        let other = Arca_Engine_V1_OwnerLabels.with {
+            $0.managedBy = "gascan"
+            $0.sandboxID = "gascan-sbx-0000-0000"
+        }
+        try await engine.hold(network: "sbx-net", ownedBy: other)
+        let foreign = await engine.service.createContainer(
+            request: Self.recreate(engine.request(
+                volumes: [(name: held, path: "/home/workspace/.cache")],
+                network: .networkedName("sbx-net")
+            ))
+        )
+        guard case .failed(let mismatched) = foreign.outcome else {
+            return XCTFail("a network labelled to another sandbox must be refused")
+        }
+        XCTAssertEqual(mismatched.error.code, "ownership_mismatch")
+        XCTAssertEqual(
+            mismatched.error.resource, "sbx-net",
+            "the refusal names the network, not the volume the guard walked past first"
+        )
+    }
+
     /// The retained-membership check compares kind as well as name.
     ///
     /// **Its own test because the kind half was decorative.** MEASURED by the
@@ -492,8 +562,20 @@ final class CreateTests: XCTestCase {
     ///
     /// Unreachable from Gas Can -- `PolicyCompiler` emits no empty names -- so this
     /// is diagnostic quality on a malformed-input path rather than a correctness
-    /// bug. It is pinned because the guard's position in front of `createSpec` is
-    /// the kind of thing a later edit reorders.
+    /// bug.
+    ///
+    /// **What this pins, stated exactly, because an earlier version of this comment
+    /// claimed more.** It said the test pinned the guard's position in front of
+    /// `createSpec`. It does not and cannot: MEASURED by the re-review, moving
+    /// `createSpec` ahead of the guard passes the whole suite. That is not a hole,
+    /// it is the design working -- the refusal above was deliberately built to be
+    /// byte-identical to `createSpec`'s, so the two orders are indistinguishable by
+    /// construction and the reorder changes no observable answer. A test cannot
+    /// detect a difference that was engineered away two sentences earlier.
+    ///
+    /// So what is pinned is the answer and not the ordering: an unnamed volume is
+    /// refused by identity with a `resource` field that names something, whichever
+    /// side of `createSpec` ends up answering it.
     func testCreateContainerRefusesAVolumeThatCarriesNoName() async throws {
         let engine = try await preparedEngine()
 
@@ -883,7 +965,8 @@ final class CreateTests: XCTestCase {
         /// network, and no test here should assert anything about connectivity.
         func hold(
             network name: String,
-            ownedBy owner: Arca_Engine_V1_OwnerLabels = CreateTests.owner
+            ownedBy owner: Arca_Engine_V1_OwnerLabels = CreateTests.owner,
+            labels overrideLabels: [String: String]? = nil
         ) async throws {
             _ = try await managers.networkManager.createNetwork(
                 name: name,
@@ -892,7 +975,7 @@ final class CreateTests: XCTestCase {
                 gateway: nil,
                 ipRange: nil,
                 options: [:],
-                labels: SandboxIdentity.labels(from: owner)
+                labels: overrideLabels ?? SandboxIdentity.labels(from: owner)
             )
         }
 
