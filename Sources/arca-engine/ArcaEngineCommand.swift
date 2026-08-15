@@ -352,6 +352,59 @@ struct ServeCommand: AsyncParsableCommand {
     /// delivery, it does not replace the disposition, so leaving the default in
     /// place would terminate the process before the handler ever ran.
     ///
+    /// **THAT IS NOT A HAZARD AVOIDED, IT IS A LIVE WINDOW: the default
+    /// disposition holds from `exec` until the `signal(number, SIG_IGN)` below,
+    /// and a SIGTERM inside it kills the engine with exit 143 (128 + 15).**
+    /// Everything `ServeCommand.run()` does before `serve()` is inside that
+    /// window -- input validation, the vminit load, and all three `initialize()`
+    /// calls including the one that builds a real `VmnetNetwork`. A client can
+    /// only observe the tail of it, because the socket does not exist until
+    /// `EngineServer.start` binds.
+    ///
+    /// MEASURED against `723875a` by spawning this binary directly and
+    /// signalling it, the two arms interleaved in one process against one
+    /// binary: **SIGTERM immediately after spawn, exit 143 twelve times out of
+    /// twelve; SIGTERM after the socket appears plus 300ms, exit 0 twelve times
+    /// out of twelve.** Perfect separation.
+    ///
+    /// It reached Gas Can's live tier first, as **2 of 440** engines exiting 143
+    /// in `shutdown::the_engine_exits_cleanly_with_nothing_holding_a_connection`
+    /// -- and in that workload only. It is `LiveEngine::start().await.stop()
+    /// .await`, with nothing whatever between the connect that decides the
+    /// engine is up and the pipe close that signals it; the other two open a
+    /// gRPC channel or boot a VM first, which closes the window long before
+    /// their signal lands. **Nothing in this file can produce 143 deliberately**
+    /// -- its only exit call is `Foundation.exit` with `EXIT_SUCCESS` or
+    /// `EXIT_FAILURE` -- so a 143 in a tier log is always the kernel and never
+    /// the engine. It is also NOT the pre-fix crash recorded on
+    /// `EngineServer.runUntilQuiesced`, which was exit 133.
+    ///
+    /// **The window predates the wait moving into `ArcaEngine`, and that is a
+    /// diff rather than a rate.** The region from `EngineServer.start` through
+    /// the `signal` call below is byte-identical between `fa1d707` and
+    /// `723875a`; that commit's whole executable delta is the two statements
+    /// ending `serve()` and the method they now call, all of which run after
+    /// this function has returned. No spike was run against `fa1d707` -- none is
+    /// needed to say the code is unchanged, and none was run, so nothing here
+    /// claims a rate for it.
+    ///
+    /// **A SECOND window is REASONED FROM THE libdispatch CONTRACT AND HAS NOT
+    /// BEEN MEASURED BY ANYONE.** Between the `signal(number, SIG_IGN)` below
+    /// and `source.resume()`, the disposition is already `SIG_IGN` but no kevent
+    /// is registered yet, so a signal arriving there should be discarded rather
+    /// than queued. The engine would then never shut down, and Gas Can's
+    /// supervisor would report `the engine supervisor ... did not exit within
+    /// 30s of its pipe closing` -- whose own message calls that "the engine
+    /// ignored `SIGTERM`", which would be literally true and would read as a
+    /// shutdown defect rather than a startup one. Nothing has driven it.
+    ///
+    /// **Neither window is closed here.** Closing the first means setting the
+    /// disposition before the bind, which this function cannot do as written
+    /// because its handlers capture `engine` -- and a bare `SIG_IGN` installed
+    /// early with no resumed source would turn a startup SIGTERM into a silent
+    /// no-op, which is worse than dying. Recorded as a decision for the
+    /// maintainer rather than taken inside the task that found it.
+    ///
     /// The escalation matters because a graceful shutdown waits for in-flight
     /// RPCs, and a client holding a stream open can hold the engine open with
     /// it. Without a second signal that forces the issue, "handles SIGTERM"
