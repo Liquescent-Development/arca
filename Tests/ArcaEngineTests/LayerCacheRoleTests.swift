@@ -108,6 +108,66 @@ final class LayerCacheRoleTests: XCTestCase {
         )
     }
 
+    /// The decision the cache actually makes, over a real cache layout.
+    ///
+    /// **The three tests above pin the PREDICATE, and a reviewer showed that is not the same
+    /// thing.** Bypassing the check at its call site -- `if true || cachedRole == .overlayLayer`,
+    /// which is the pre-fix behaviour exactly -- left `swift test --filter ArcaEngineTests` at
+    /// 155 passing. `OverlayFSUnpacker.cachedLayerIsReusable` exists so that the decision has a
+    /// name a test can reach; this drives it over `{cache}/{digest}/layer.ext4` rather than over
+    /// a bare temp file, so the fixture is the shape the unpacker meets.
+    func testAStaleCacheEntryIsNotReusableAndAFreshOneIs() throws {
+        let cache = scratch.appendingPathComponent("layers")
+        let stale = try cachedLayer(in: cache, digest: "sha256:stale", label: nil)
+        let fresh = try cachedLayer(
+            in: cache,
+            digest: "sha256:fresh",
+            label: ArcaBlockDeviceRole.overlayLayer.volumeLabel
+        )
+
+        XCTAssertTrue(OverlayFSUnpacker.cachedLayerExists(at: stale))
+        XCTAssertFalse(
+            OverlayFSUnpacker.cachedLayerIsReusable(at: stale),
+            "a cache entry written before role labels existed must be reformatted, not reused"
+        )
+        XCTAssertTrue(
+            OverlayFSUnpacker.cachedLayerIsReusable(at: fresh),
+            "a labelled entry must still be a hit; without this the check would reformat forever"
+        )
+    }
+
+    /// Discarding an entry twice is not an error, and a failure that is not "already gone" is.
+    ///
+    /// The unpacker is re-entrant across `await` and two `Create`s can share a layer digest, so
+    /// both can reach the discard. The loser must not fail the RPC over work the winner already
+    /// did -- but nothing else may be swallowed, because an entry that survives is handed to the
+    /// guest unlabelled, which is the defect this whole change exists to prevent.
+    func testDiscardingAnAlreadyDiscardedEntryIsNotAnError() throws {
+        let cache = scratch.appendingPathComponent("layers")
+        let entry = try cachedLayer(in: cache, digest: "sha256:raced", label: nil)
+
+        XCTAssertNoThrow(try OverlayFSUnpacker.discardCachedLayer(at: entry))
+        XCTAssertFalse(OverlayFSUnpacker.cachedLayerExists(at: entry))
+        XCTAssertNoThrow(
+            try OverlayFSUnpacker.discardCachedLayer(at: entry),
+            "a second discard races the first and must be the outcome it wanted, not a failure"
+        )
+    }
+
+    /// `{cache}/{digest}/layer.ext4`, which is the layout `unpackLayerToCache` builds.
+    private func cachedLayer(in cache: URL, digest: String, label: String?) throws -> URL {
+        let directory = cache.appendingPathComponent(digest)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("layer.ext4")
+        let formatter = try EXT4.Formatter(
+            FilePath(path.path),
+            minDiskSize: 2 * 1024 * 1024,
+            volumeLabel: label
+        )
+        try formatter.close()
+        return path
+    }
+
     /// A path holding no filesystem at all answers `nil` rather than throwing.
     ///
     /// The caller is classifying, not validating: it has to reach "reformat this" from a

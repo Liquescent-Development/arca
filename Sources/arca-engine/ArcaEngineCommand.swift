@@ -289,7 +289,7 @@ struct ServeCommand: AsyncParsableCommand {
         // and is recorded as the follow-up it is.
         //
         // Until then the mutation that matters here -- changing the line below
-        // back to `engine.onClose` -- leaves `swift test` at 151 passing, and
+        // back to `engine.onClose` -- leaves `swift test` at 157 passing, and
         // Gas Can's live tier is the only thing that catches it. Every rate
         // above is that tier's output.
         let quiesced = group.next().makePromise(of: Void.self)
@@ -517,29 +517,3 @@ struct ServeCommand: AsyncParsableCommand {
     }
 }
 
-/// Counts shutdown signals, and answers whether any has arrived.
-///
-/// **Locked rather than queue-confined, and it used to be the latter.** Both
-/// signal sources still share one serial queue, but `serve()` now also reads
-/// this from a `whenComplete` on the listening channel's close, which runs on a
-/// NIO event loop. Two threads, so the confinement argument no longer holds and
-/// a lock replaces it rather than a comment claiming a discipline the code no
-/// longer keeps.
-private final class ShutdownRequests: Sendable {
-    private let seen = NIOLockedValueBox(0)
-
-    /// Records a request and answers whether it was the first.
-    func recordAndReportFirst() -> Bool {
-        seen.withLockedValue { seen in
-            seen += 1
-            return seen == 1
-        }
-    }
-
-    /// Whether any signal has been recorded.
-    ///
-    /// Read to tell a listening socket that closed BECAUSE of a shutdown from
-    /// one that closed on its own. The handler records before it initiates, so
-    /// by the time a graceful close reaches the observer this is already true.
-    var anyRecorded: Bool { seen.withLockedValue { $0 > 0 } }
-}
