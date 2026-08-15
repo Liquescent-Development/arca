@@ -90,9 +90,8 @@ final class ShutdownObserverTests: XCTestCase {
         installObserver(engine, asked, wouldExit: wouldExit, ran: ran)
 
         // Recorded first, then initiated -- the order the handler makes structural.
-        let quiesced = group.next().makePromise(of: Void.self)
         XCTAssertTrue(asked.recordAndReportFirst())
-        engine.server.initiateGracefulShutdown(promise: quiesced)
+        engine.beginGracefulShutdown()
         try await Task.sleep(nanoseconds: 500_000_000)
 
         XCTAssertTrue(
@@ -147,8 +146,7 @@ final class ShutdownObserverTests: XCTestCase {
         let ran = NIOLockedValueBox(false)
         installObserver(engine, asked, wouldExit: wouldExit, ran: ran)
 
-        let quiesced = group.next().makePromise(of: Void.self)
-        engine.server.initiateGracefulShutdown(promise: quiesced)
+        engine.beginGracefulShutdown()
         try await Task.sleep(nanoseconds: 200_000_000)
         _ = asked.recordAndReportFirst()
         try await Task.sleep(nanoseconds: 300_000_000)

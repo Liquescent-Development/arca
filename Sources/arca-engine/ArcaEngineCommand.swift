@@ -227,30 +227,27 @@ struct ServeCommand: AsyncParsableCommand {
         )
         logger.info("engine listening", metadata: ["socket": "\(socketPath)"])
 
-        // The promise a graceful shutdown completes, and the wait for it is
-        // `EngineServer.runUntilQuiesced` -- which carries every measurement
-        // behind waiting for the ACCEPTED connections rather than the listening
-        // socket, and is where the mutation that would undo it now fails a test.
-        //
-        // It is made here rather than there because this file owns the only
-        // thing that completes it: the signal handler below hands it to
-        // `initiateGracefulShutdown` and schedules the grace period against it.
-        let quiesced = group.next().makePromise(of: Void.self)
-
         // Held for the whole run: a DispatchSourceSignal stops delivering the
         // moment it is deallocated, so a source that is not kept alive is a
         // handler that silently never fires. Cancelling them here also drops
         // the last references these closures hold to the engine.
+        //
+        // **This function no longer makes the drain promise, and that is the
+        // point rather than a tidy-up.** It used to make one and hand the future
+        // to `runUntilQuiesced`, which meant it could hand over `engine.onClose`
+        // instead -- the pre-fix defect, one identifier away, and MEASURED green
+        // across the entire suite at `723875a`. Starting the drain and waiting
+        // for it are two halves of `EngineServer` now, and neither takes a
+        // future from this file.
         let asked = ShutdownRequests()
         let signals = Self.installShutdownHandler(
             logger: logger,
             for: engine,
-            quiesced: quiesced,
             asked: asked
         )
         defer { signals.forEach { $0.cancel() } }
 
-        // **The only thing that completes `quiesced` is the first signal, so a
+        // **The only thing that completes the drain is the first signal, so a
         // listening socket that closes for any OTHER reason would leave this
         // function waiting on a promise nothing will ever fulfil.** That is a
         // regression this change introduced and it is worse than what it
@@ -284,7 +281,7 @@ struct ServeCommand: AsyncParsableCommand {
             Self.releaseAndExit(engine, logger: logger, status: EXIT_FAILURE)
         }
 
-        try await engine.runUntilQuiesced(connectionsDrained: quiesced.futureResult)
+        try await engine.runUntilQuiesced()
     }
 
     /// How long a graceful shutdown waits for accepted connections to drain
@@ -422,7 +419,6 @@ struct ServeCommand: AsyncParsableCommand {
     private static func installShutdownHandler(
         logger: Logger,
         for engine: EngineServer,
-        quiesced: EventLoopPromise<Void>,
         asked: ShutdownRequests
     ) -> [DispatchSourceSignal] {
         // One serial queue shared by both sources, so the two handlers can
@@ -436,7 +432,14 @@ struct ServeCommand: AsyncParsableCommand {
             source.setEventHandler {
                 if asked.recordAndReportFirst() {
                     logger.info("shutting down gracefully", metadata: ["signal": "\(number)"])
-                    engine.server.initiateGracefulShutdown(promise: quiesced)
+
+                    // The one call that starts the drain, and it is `asked`'s
+                    // branch condition that makes it happen exactly once --
+                    // `beginGracefulShutdown` hands `initiateGracefulShutdown` a
+                    // promise, and a second call would complete that promise
+                    // twice. The second signal takes the escalation branch below
+                    // instead, which closes the listener rather than draining.
+                    let drained = engine.beginGracefulShutdown()
 
                     // **The drain is bounded, and it has to be, because
                     // quiescing cannot close every connection it asks to
@@ -462,7 +465,7 @@ struct ServeCommand: AsyncParsableCommand {
                     // So "handles SIGTERM" must not depend on a peer being
                     // well behaved. The escalation below is the operator's
                     // lever and this is the one that needs no operator.
-                    let forced = quiesced.futureResult.eventLoop.scheduleTask(in: shutdownGrace) {
+                    let forced = drained.eventLoop.scheduleTask(in: shutdownGrace) {
                         logger.error(
                             "connections did not drain within the grace period; closing anyway",
                             metadata: ["grace": "\(shutdownGrace)"]
@@ -474,7 +477,7 @@ struct ServeCommand: AsyncParsableCommand {
                     // Same event loop as the promise, so a drain that finishes
                     // first and this cancellation are ordered against each
                     // other rather than racing.
-                    quiesced.futureResult.whenComplete { _ in forced.cancel() }
+                    drained.whenComplete { _ in forced.cancel() }
                 } else {
                     logger.notice("closing immediately", metadata: ["signal": "\(number)"])
                     engine.server.close(promise: nil)

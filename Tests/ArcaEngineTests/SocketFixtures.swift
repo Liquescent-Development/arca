@@ -2,7 +2,9 @@ import Darwin
 import Foundation
 import XCTest
 
-/// The socket paths a test created, and the raw peers it connected to them.
+/// The socket paths a test created. Raw peers are connected here but owned by
+/// the caller -- see `connectRawSocket` -- and `removeAll()` unlinks paths and
+/// closes no descriptors.
 ///
 /// One type rather than a copy per test class. `EngineServerTests` and
 /// `ShutdownObserverTests` each declared their own path generator, and
@@ -40,9 +42,17 @@ final class SocketFixtures {
     ///
     /// The caller closes the descriptor: when it is released is the thing those
     /// tests are measuring, so this type must not decide it for them.
+    ///
+    /// It THROWS on a failed syscall rather than recording an XCTest failure and
+    /// handing back the bad descriptor, which is what the two copies this
+    /// replaces did. The returned peer decides the central assertion of the
+    /// drain test, so a fixture that half-failed and continued would leave that
+    /// test asserting against a connection it does not have.
     func connectRawSocket(to path: String) throws -> Int32 {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        XCTAssertGreaterThanOrEqual(descriptor, 0, "socket() failed: \(errno)")
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
@@ -54,7 +64,11 @@ final class SocketFixtures {
         let result = withUnsafePointer(to: &address) { raw in
             raw.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(descriptor, $0, size) }
         }
-        XCTAssertEqual(result, 0, "connect() failed: \(errno)")
+        guard result == 0 else {
+            let code = errno
+            close(descriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
         return descriptor
     }
 

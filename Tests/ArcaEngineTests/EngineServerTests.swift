@@ -45,6 +45,42 @@ final class EngineServerTests: XCTestCase {
         sockets.path(prefix: "arca-engine-test")
     }
 
+    /// Waits for `condition`, and FAILS rather than hanging if it never holds.
+    ///
+    /// **The natural join is `try await waiting.value` and it is unbounded.**
+    /// XCTest applies no default per-test time limit under SwiftPM, so a wait
+    /// that never returns blocks `swift test` indefinitely with no diagnostic --
+    /// on every developer machine, and this project treats the local suite as
+    /// the gate. The regression that would do it is the one
+    /// `ShutdownObserverTests` names as most likely: a grpc-swift or swift-nio
+    /// bump that changes when a quiesced connection is closed, so closing the
+    /// peer stops completing the drain. A bounded wait turns that from a hang
+    /// into the named failure these tests already know how to describe.
+    ///
+    /// Polled rather than raced against a `Task.sleep` in a task group: a group
+    /// awaits its children at scope exit, and cancelling a task blocked in
+    /// `EventLoopFuture.get()` does not unblock it, so the group itself would
+    /// hang -- reintroducing exactly what this exists to prevent.
+    private func waitUntil(
+        _ what: String,
+        within seconds: Double = 10,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() {
+            guard Date() < deadline else {
+                return XCTFail(
+                    "timed out after \(seconds)s waiting for \(what)",
+                    file: file,
+                    line: line
+                )
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+    }
+
     /// The socket carries the engine's whole authority, so it must not be
     /// reachable by another user on a shared machine.
     func testTheSocketIsCreatedOwnerOnly() async throws {
@@ -217,24 +253,31 @@ final class EngineServerTests: XCTestCase {
         let closed = NIOLockedValueBox(false)
         engine.onClose.whenComplete { _ in closed.withLockedValue { $0 = true } }
 
-        let quiesced = group.next().makePromise(of: Void.self)
-        let returned = NIOLockedValueBox(false)
+        // The outcome rather than a bare `returned` flag, so a `runUntilQuiesced`
+        // that THREW is distinguishable from one that is still waiting. Without
+        // it a throw reads as "has not returned yet" and this test would report
+        // the wrong invariant.
+        let outcome = NIOLockedValueBox<String?>(nil)
         let waiting = Task {
-            try await engine.runUntilQuiesced(connectionsDrained: quiesced.futureResult)
-            returned.withLockedValue { $0 = true }
+            do {
+                try await engine.runUntilQuiesced()
+                outcome.withLockedValue { $0 = "returned" }
+            } catch {
+                outcome.withLockedValue { $0 = "threw \(error)" }
+            }
         }
 
-        engine.server.initiateGracefulShutdown(promise: quiesced)
+        engine.beginGracefulShutdown()
         try await Task.sleep(nanoseconds: 500_000_000)
 
         XCTAssertTrue(
             closed.withLockedValue { $0 },
             "the listener must have closed, or this test asserts nothing at all"
         )
-        XCTAssertFalse(
-            returned.withLockedValue { $0 },
+        XCTAssertNil(
+            outcome.withLockedValue { $0 },
             """
-            runUntilQuiesced returned while an accepted connection was still open. \
+            runUntilQuiesced finished while an accepted connection was still open. \
             That is the pre-fix behaviour: it waited on the LISTENING socket, which \
             ServerQuiescingHelper closes synchronously, and shut the event-loop \
             group down under live channels.
@@ -242,11 +285,55 @@ final class EngineServerTests: XCTestCase {
         )
 
         close(peer)
-        try await waiting.value
-        XCTAssertTrue(
-            returned.withLockedValue { $0 },
-            "once the peer is gone the drain completes and the wait must return"
+        try await waitUntil("the drain to complete once the peer is gone") {
+            outcome.withLockedValue { $0 != nil }
+        }
+        XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
+        _ = waiting
+    }
+
+    /// `runUntilQuiesced` gives the path back, which is the other half of what
+    /// it does and was unpinned until fix round 1.
+    ///
+    /// **Deleting `try await shutDown()` from it left the whole suite green**,
+    /// so half of what moved into the library had no test at all. The failure
+    /// that would let through: someone splits the wait from the teardown -- the
+    /// method's own doc says a pure wait needs a different method -- and takes
+    /// the teardown out without adding it at the call site. Every clean shutdown
+    /// then leaves a socket file and a lockfile behind, which is the ambiguous
+    /// artifact `removeStaleSocket` exists to reason about.
+    ///
+    /// **The successor is the assertion with teeth, and the `lstat` is not.**
+    /// Closing the server already unlinks the socket -- MEASURED, and recorded
+    /// on `shutDown()` -- so the first check passes even with the removal step
+    /// gone. Releasing the lock has no other owner, so a successor that can take
+    /// the path is the only proof the teardown ran. Both are asserted because
+    /// the pair is the postcondition; only the second can fail.
+    ///
+    /// No peer is connected, so the drain completes as soon as it is asked for
+    /// and this test needs no bounded wait.
+    func testRunUntilQuiescedReleasesThePathItServedOn() async throws {
+        let path = testSocketPath()
+        let engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
         )
+
+        engine.beginGracefulShutdown()
+        try await engine.runUntilQuiesced()
+
+        var status = stat()
+        XCTAssertNotEqual(lstat(path, &status), 0, "no socket may be left at the path")
+
+        let second = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let successor = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: second
+        )
+        try await successor.shutDown()
+        try await second.shutdownGracefully()
     }
 
     /// Binds a raw AF_UNIX socket to `path`.
