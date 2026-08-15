@@ -96,6 +96,95 @@ public struct EngineServer: Sendable {
         return EngineServer(server: server, socketPath: socketPath, lock: lock)
     }
 
+    /// Serves until every accepted connection has drained, then closes and gives
+    /// up the socket path.
+    ///
+    /// `connectionsDrained` is the future a graceful shutdown completes:
+    /// `arca-engine` makes a promise, hands it to
+    /// `Server.initiateGracefulShutdown` from its signal handler, and passes
+    /// that promise's future here. A future rather than the promise because
+    /// waiting is all this does with it -- the one thing that may complete it is
+    /// the shutdown that was asked for.
+    ///
+    /// **What this waits for is every ACCEPTED connection to have gone, and
+    /// that is a different event from the listening socket closing.** It used to
+    /// wait for `onClose`, which is the LISTENING channel's `closeFuture`, and
+    /// `ServerQuiescingHelper` closes that immediately -- before the connections
+    /// it has just asked to quiesce have finished doing so. So
+    /// `ServeCommand.run()` shut the event-loop group down underneath live
+    /// channels: each one's `closeFuture` callback then tried to schedule
+    /// `ChannelCollector.channelRemoved` on a loop that had gone, which NIO
+    /// reports as `Cannot schedule tasks on an EventLoop that has already shut
+    /// down`; the collector therefore never reached `shutdownCompleted()`, and
+    /// deallocated still holding the promise it makes at
+    /// `QuiescingHelper.swift:141` -- `Fatal error: leaking promise`,
+    /// `Trace/BPT trap: 5`, exit 133.
+    ///
+    /// MEASURED with Gas Can's `shutdown.rs`, which stops 32 engines per figure
+    /// because at this rate a single clean shutdown is worth nothing. Two
+    /// binaries built from the code this replaces, run interleaved rather than
+    /// A-then-B: awaiting `onClose`, **6 crashes in 192**; awaiting the drain,
+    /// **0 in 192**. The container case, 32 engines each: **12/32 (38%)**
+    /// against `onClose`.
+    ///
+    /// **The defect never needed a container.** `docs/status/START-HERE.md`
+    /// recorded it as happening "once containers have been created", and that
+    /// was a correlate: an engine that never created one still crashed 1 time in
+    /// 96. A container widens the window -- more accepted traffic, more to tear
+    /// down -- it does not change the bug.
+    ///
+    /// **Handing `initiateGracefulShutdown` a promise rather than `nil` is a
+    /// consequence of the wait and NOT the fix**, and that was measured rather
+    /// than argued. A third binary that passes the promise in and still awaits
+    /// `onClose` -- the promise made, never waited on -- runs at **22/32 (69%)**,
+    /// WORSE than the original. The crash does not go quiet, it changes address:
+    /// the leaked promise stops being the collector's at
+    /// `QuiescingHelper.swift:141` and becomes the one `ServeCommand.serve`
+    /// makes, which the trace names as `ArcaEngineCommand.swift`. The `Cannot
+    /// schedule tasks` line is unchanged throughout, and that is the tell -- the
+    /// group is still going down under live channels, and only the bookkeeping
+    /// moved.
+    ///
+    /// **AN EARLIER VERSION OF THIS COMMENT, WHILE IT LIVED IN
+    /// `ArcaEngineCommand.swift`, SAID "NOTHING IN THIS REPOSITORY CAN PROVE ANY
+    /// OF IT". THAT WAS FALSE AND A REVIEWER DISPROVED IT BY WRITING THE TEST.**
+    /// The argument given was that a raw socket cannot be observed to have been
+    /// accepted, so the fixture would decide the assertion by a race. The race is
+    /// real but it is SETUP, not assertion, and it fails safe: an unaccepted
+    /// connection lets the close drain immediately, so the pending assertion goes
+    /// red rather than falsely green. Measured 20 runs, 20 passes, on a
+    /// single-threaded loop with `EngineServer.start` and
+    /// `SandboxEngineService.forTesting()`.
+    ///
+    /// **The PREMISE is pinned now, and pinning it is why this function exists.**
+    /// That the listener closes while an accepted connection is still open -- so
+    /// `onClose` completes and the drain does not -- is what
+    /// `EngineServerTests.testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener`
+    /// drives, against a real `EngineServer` and a raw peer holding the drain
+    /// open. **The CALL SITE is still not pinned**, and privacy is not what stops
+    /// it -- `EngineProcess.swift` already spawns the binary to prove call sites.
+    /// `ServeCommand.run()` reaches `networkManager.initialize()`, which
+    /// constructs a real `VmnetNetwork`, so a test that the executable performs
+    /// this wait still needs an entitlement and a host vmnet.
+    ///
+    /// **The mutation that matters -- awaiting `onClose` below instead of
+    /// `connectionsDrained` -- is what moving the wait here made visible, and
+    /// both halves of that were measured rather than argued.** Applied where the
+    /// wait used to live, to `try await quiesced.futureResult.get()` in
+    /// `ServeCommand.serve` at `fa1d707`, `swift test --filter ArcaEngineTests`
+    /// reported `Executed 167 tests, with 0 failures`: the defect fully restored
+    /// and the suite entirely green, with Gas Can's live tier the only
+    /// instrument that caught it. Every rate above is that tier's output.
+    /// Applied to the line below instead: `Executed 168 tests, with 1 failure`,
+    /// the failure being
+    /// `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener`'s
+    /// `XCTAssertFalse`, and no other test moved. Restored, `Executed 168 tests,
+    /// with 0 failures`.
+    public func runUntilQuiesced(connectionsDrained: EventLoopFuture<Void>) async throws {
+        try await connectionsDrained.get()
+        try await shutDown()
+    }
+
     /// Closes the server, makes sure the socket is gone, and releases the path.
     ///
     /// MEASURED: closing the server already unlinks the socket file. A probe

@@ -227,71 +227,14 @@ struct ServeCommand: AsyncParsableCommand {
         )
         logger.info("engine listening", metadata: ["socket": "\(socketPath)"])
 
-        // **What this waits for is every ACCEPTED connection to have gone, and
-        // that is a different event from the listening socket closing.** It
-        // used to wait for `engine.onClose`, which is the LISTENING channel's
-        // `closeFuture`, and `ServerQuiescingHelper` closes that immediately --
-        // before the connections it has just asked to quiesce have finished
-        // doing so. So `run()` shut the event-loop group down underneath live
-        // channels: each one's `closeFuture` callback then tried to schedule
-        // `ChannelCollector.channelRemoved` on a loop that had gone, which NIO
-        // reports as `Cannot schedule tasks on an EventLoop that has already
-        // shut down`; the collector therefore never reached
-        // `shutdownCompleted()`, and deallocated still holding the promise it
-        // makes at `QuiescingHelper.swift:141` -- `Fatal error: leaking
-        // promise`, `Trace/BPT trap: 5`, exit 133.
+        // The promise a graceful shutdown completes, and the wait for it is
+        // `EngineServer.runUntilQuiesced` -- which carries every measurement
+        // behind waiting for the ACCEPTED connections rather than the listening
+        // socket, and is where the mutation that would undo it now fails a test.
         //
-        // MEASURED with Gas Can's `shutdown.rs`, which stops 32 engines per
-        // figure because at this rate a single clean shutdown is worth nothing.
-        // Two binaries built from this file, run interleaved rather than
-        // A-then-B: awaiting `onClose`, **6 crashes in 192**; awaiting
-        // `quiesced`, **0 in 192**. The container case, 32 engines each:
-        // **12/32 (38%)** against `onClose`.
-        //
-        // **The defect never needed a container.** `docs/status/START-HERE.md`
-        // recorded it as happening "once containers have been created", and
-        // that was a correlate: an engine that never created one still crashed
-        // 1 time in 96. A container widens the window -- more accepted traffic,
-        // more to tear down -- it does not change the bug.
-        //
-        // **Handing `initiateGracefulShutdown` a promise rather than `nil` is a
-        // consequence of the wait and NOT the fix**, and that was measured
-        // rather than argued. A third binary that passes `quiesced` in and
-        // still awaits `onClose` -- the promise made, never waited on -- runs at
-        // **22/32 (69%)**, WORSE than the original. The crash does not go
-        // quiet, it changes address: the leaked promise stops being the
-        // collector's at `QuiescingHelper.swift:141` and becomes this
-        // function's own, which the trace names as `ArcaEngineCommand.swift`.
-        // The `Cannot schedule tasks` line is unchanged throughout, and that is
-        // the tell -- the group is still going down under live channels, and
-        // only the bookkeeping moved.
-        //
-        // **A PREVIOUS VERSION OF THIS COMMENT SAID "NOTHING IN THIS
-        // REPOSITORY CAN PROVE ANY OF IT". THAT WAS FALSE AND A REVIEWER
-        // DISPROVED IT BY WRITING THE TEST.** The argument given was that a
-        // raw socket cannot be observed to have been accepted, so the fixture
-        // would decide the assertion by a race. The race is real but it is
-        // SETUP, not assertion, and it fails safe: an unaccepted connection
-        // lets the close drain immediately, so the pending assertion goes red
-        // rather than falsely green. Measured 20 runs, 20 passes, on a
-        // single-threaded loop with `EngineServer.start` and
-        // `SandboxEngineService.forTesting()`, which `EngineServerTests`
-        // already uses.
-        //
-        // The accurate statement is narrower. **The PREMISE is provable here
-        // and is not yet pinned**: that the listener closes while an accepted
-        // connection is still open, so `onClose` completes and `quiesced` does
-        // not. **The CALL SITE is not**, and privacy is not what stops it --
-        // `EngineProcess.swift` already spawns this binary to prove call sites.
-        // `run()` reaches `networkManager.initialize()`, which constructs a real
-        // `VmnetNetwork`, so a test of THIS function needs an entitlement and a
-        // host vmnet. Moving the wait into `ArcaEngine` would remove even that,
-        // and is recorded as the follow-up it is.
-        //
-        // Until then the mutation that matters here -- changing the line below
-        // back to `engine.onClose` -- leaves `swift test` at 157 passing, and
-        // Gas Can's live tier is the only thing that catches it. Every rate
-        // above is that tier's output.
+        // It is made here rather than there because this file owns the only
+        // thing that completes it: the signal handler below hands it to
+        // `initiateGracefulShutdown` and schedules the grace period against it.
         let quiesced = group.next().makePromise(of: Void.self)
 
         // Held for the whole run: a DispatchSourceSignal stops delivering the
@@ -322,10 +265,13 @@ struct ServeCommand: AsyncParsableCommand {
         // and `asked` is recorded before that close is initiated, so a shutdown
         // that was asked for always finds this true.
         //
-        // **Reachability is unmeasured.** Within this function only the two
-        // handlers close the listener, and `EngineServer.start` configures no
-        // idle timeout; the case needs an unrecoverable failure in the server
-        // channel itself. Recorded as a guard whose trigger nothing drives.
+        // **Reachability is unmeasured.** Three things below close the listener
+        // and none of them can reach this branch: the two signal handlers each
+        // record `asked` first, and `runUntilQuiesced`'s own close runs only
+        // after the drain has completed, which only the first signal starts. So
+        // the case needs an unrecoverable failure in the server channel itself
+        // -- `EngineServer.start` configures no idle timeout. Recorded as a
+        // guard whose trigger nothing drives.
         engine.onClose.whenComplete { _ in
             guard !asked.anyRecorded else { return }
             logger.error(
@@ -338,8 +284,7 @@ struct ServeCommand: AsyncParsableCommand {
             Self.releaseAndExit(engine, logger: logger, status: EXIT_FAILURE)
         }
 
-        try await quiesced.futureResult.get()
-        try await engine.shutDown()
+        try await engine.runUntilQuiesced(connectionsDrained: quiesced.futureResult)
     }
 
     /// How long a graceful shutdown waits for accepted connections to drain
@@ -413,9 +358,11 @@ struct ServeCommand: AsyncParsableCommand {
     /// would be true and "can be stopped" would not.
     ///
     /// **That paragraph was written before the code did any of it, and it is
-    /// true for the first time now.** Until `serve()` started waiting on
-    /// `quiesced`, one signal ended the process whatever a client was doing:
-    /// the wait was on the LISTENING channel's close, which
+    /// true for the first time now.** Until the engine started waiting on the
+    /// drain -- `EngineServer.runUntilQuiesced`, which `serve()` calls with the
+    /// future of the `quiesced` promise this function is handed -- one signal
+    /// ended the process whatever a client was doing: the wait was on the
+    /// LISTENING channel's close, which
     /// `ServerQuiescingHelper` performs synchronously, so nothing ever waited
     /// for an in-flight RPC and the second signal had nothing left to force.
     /// The wait is real now, so the escalation has to be.

@@ -33,7 +33,10 @@ import XCTest
 /// `onClose` completes relative to quiescence.
 final class ShutdownObserverTests: XCTestCase {
     private var group: MultiThreadedEventLoopGroup!
-    private var createdPaths: [String] = []
+
+    /// The paths and raw peers these tests need. See `SocketFixtures`, which is
+    /// where the path generator and the silent-peer connect now live.
+    private let sockets = SocketFixtures()
 
     override func setUp() {
         super.setUp()
@@ -42,44 +45,16 @@ final class ShutdownObserverTests: XCTestCase {
 
     override func tearDown() {
         XCTAssertNoThrow(try group.syncShutdownGracefully())
-        for path in createdPaths {
-            unlink(path)
-            unlink(path + ".lock")
-        }
-        createdPaths = []
+        sockets.removeAll()
         super.tearDown()
     }
 
-    /// `/tmp` for the `sun_path` reason `EngineServerTests` records.
     private func testSocketPath() -> String {
-        let path = "/tmp/arca-shutdown-observer-\(UUID().uuidString.prefix(8)).sock"
-        createdPaths.append(path)
-        return path
+        sockets.path(prefix: "arca-shutdown-observer")
     }
 
-    /// A raw peer, connected and silent.
-    ///
-    /// Silent on purpose: grpc-swift closes a connection whose protocol it has finished
-    /// negotiating when quiescing sends its GOAWAY, and closing is exactly what must NOT happen
-    /// while these tests look. One that has sent nothing is in no protocol at all, so it holds
-    /// the drain open and the listener closes long before quiescence completes -- which is the
-    /// window the guard has to survive.
     private func connectRawSocket(to path: String) throws -> Int32 {
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        XCTAssertGreaterThanOrEqual(descriptor, 0, "socket() failed: \(errno)")
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
-            path.withCString { source in
-                strncpy(UnsafeMutableRawPointer(raw).assumingMemoryBound(to: CChar.self), source, 103)
-            }
-        }
-        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let result = withUnsafePointer(to: &address) { raw in
-            raw.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(descriptor, $0, size) }
-        }
-        XCTAssertEqual(result, 0, "connect() failed: \(errno)")
-        return descriptor
+        try sockets.connectRawSocket(to: path)
     }
 
     /// The observer, wired as `serve()` wires it, reporting whether it would have exited.

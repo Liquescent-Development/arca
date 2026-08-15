@@ -1,5 +1,6 @@
 import Foundation
 import GRPC
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 import XCTest
@@ -25,10 +26,8 @@ final class EngineServerTests: XCTestCase {
     private var engine: EngineServer?
 
     /// Every path any test in this class handed to `EngineServer` or bound
-    /// itself. `/tmp` is not swept outside a reboot, so a test that leaves its
-    /// socket and lockfile behind grows the directory on every run of the suite
-    /// -- on a developer's machine and on CI alike.
-    private var createdPaths: [String] = []
+    /// itself, given back in `tearDown`. See `SocketFixtures`.
+    private let sockets = SocketFixtures()
 
     override func setUp() {
         super.setUp()
@@ -38,24 +37,12 @@ final class EngineServerTests: XCTestCase {
     override func tearDown() {
         XCTAssertNoThrow(try engine?.server.close().wait())
         XCTAssertNoThrow(try group.syncShutdownGracefully())
-        for path in createdPaths {
-            unlink(path)
-            unlink(path + ".lock")
-        }
-        createdPaths = []
+        sockets.removeAll()
         super.tearDown()
     }
 
-    /// `sockaddr_un.sun_path` holds at most 103 usable bytes (`SocketAddress.
-    /// init(unixDomainSocketPath:)`, swift-nio's SocketAddresses.swift:352),
-    /// and `NSTemporaryDirectory()` on macOS is a per-invocation path under
-    /// `/var/folders/...` long enough that a descriptive prefix plus a UUID
-    /// overflows it. `/tmp` is short enough to leave headroom and is the
-    /// conventional location for Unix domain sockets for exactly this reason.
     private func testSocketPath() -> String {
-        let path = "/tmp/arca-engine-test-\(UUID().uuidString).sock"
-        createdPaths.append(path)
-        return path
+        sockets.path(prefix: "arca-engine-test")
     }
 
     /// The socket carries the engine's whole authority, so it must not be
@@ -193,6 +180,73 @@ final class EngineServerTests: XCTestCase {
         )
         try await successor.shutDown()
         try await second.shutdownGracefully()
+    }
+
+    /// `runUntilQuiesced` returns when the ACCEPTED connections have drained,
+    /// not when the listening socket closes.
+    ///
+    /// **This is the test the executable could not have.** `ServeCommand.serve`
+    /// is private and `run()` constructs a real `VmnetNetwork`, so proving this
+    /// there needs an entitlement and a host vmnet. The mutation that matters --
+    /// awaiting `onClose` instead of the drain, which is the pre-fix behaviour
+    /// exactly -- left `swift test --filter ArcaEngineTests` at `Executed 167
+    /// tests, with 0 failures` while the wait lived there, and Gas Can's live
+    /// tier was the only thing that caught it. Every measurement behind that is
+    /// recorded on `runUntilQuiesced` itself.
+    ///
+    /// **The accept race is SETUP, not assertion, and it fails safe.** An
+    /// unaccepted connection lets the drain complete immediately, so the pending
+    /// assertion goes red rather than falsely green.
+    ///
+    /// `closed` is the control, and without it the second assertion passes
+    /// against a shutdown that never started. It is a `whenComplete` rather than
+    /// `onClose.wait()` because `wait()` is `noasync` (swift-nio's
+    /// `EventLoopFuture.swift:1090`) and so cannot be called from an `async`
+    /// test method at all; `ShutdownObserverTests` takes the same control from
+    /// its `ran` box.
+    func testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener() async throws {
+        let path = testSocketPath()
+        let engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+        let peer = try sockets.connectRawSocket(to: path)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let closed = NIOLockedValueBox(false)
+        engine.onClose.whenComplete { _ in closed.withLockedValue { $0 = true } }
+
+        let quiesced = group.next().makePromise(of: Void.self)
+        let returned = NIOLockedValueBox(false)
+        let waiting = Task {
+            try await engine.runUntilQuiesced(connectionsDrained: quiesced.futureResult)
+            returned.withLockedValue { $0 = true }
+        }
+
+        engine.server.initiateGracefulShutdown(promise: quiesced)
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertTrue(
+            closed.withLockedValue { $0 },
+            "the listener must have closed, or this test asserts nothing at all"
+        )
+        XCTAssertFalse(
+            returned.withLockedValue { $0 },
+            """
+            runUntilQuiesced returned while an accepted connection was still open. \
+            That is the pre-fix behaviour: it waited on the LISTENING socket, which \
+            ServerQuiescingHelper closes synchronously, and shut the event-loop \
+            group down under live channels.
+            """
+        )
+
+        close(peer)
+        try await waiting.value
+        XCTAssertTrue(
+            returned.withLockedValue { $0 },
+            "once the peer is gone the drain completes and the wait must return"
+        )
     }
 
     /// Binds a raw AF_UNIX socket to `path`.
