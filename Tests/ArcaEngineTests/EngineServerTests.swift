@@ -247,6 +247,18 @@ final class EngineServerTests: XCTestCase {
             service: .forTesting(),
             group: group
         )
+        // The engine is a local rather than the `engine` property, because on the
+        // happy path `runUntilQuiesced` has already closed it and `tearDown`'s
+        // `close().wait()` would then report `alreadyClosed` through an
+        // `XCTAssertNoThrow`. Closing it on the FAILURE paths is therefore this
+        // test's own job: without this, a `waitUntil` timeout leaves a live
+        // server channel for `tearDown`'s `syncShutdownGracefully()` to run
+        // under -- which is the `Cannot schedule tasks on an EventLoop that has
+        // already shut down` condition this whole task is about, printed on top
+        // of an already-red result. Idempotent: `close` on a closed channel
+        // reports `alreadyClosed` into a promise that is dropped.
+        defer { engine.server.close(promise: nil) }
+
         let peer = try sockets.connectRawSocket(to: path)
         try await Task.sleep(nanoseconds: 300_000_000)
 

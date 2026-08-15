@@ -27,12 +27,26 @@ public struct EngineServer: Sendable {
     /// initiated.
     public var onClose: EventLoopFuture<Void> { server.onClose }
 
-    /// Completes when every ACCEPTED connection has drained, which is a
-    /// different event from `onClose` -- see `runUntilQuiesced`, which is the
-    /// only thing that should be waiting on it. Exposed for the one caller that
-    /// has to bound the drain from outside: `arca-engine` schedules its grace
-    /// period against this and cancels it when this completes.
-    public var drained: EventLoopFuture<Void> { drain.promise().futureResult }
+    // **There is deliberately no `drained` property, and it is not an oversight.**
+    // One existed for a single round and it was loaded: reading it MINTED the
+    // promise, because its getter was `drain.promise().futureResult` and `Drain`
+    // creates on first ask. A caller that observed the drain and then shut the
+    // engine down by any other path -- the second-signal escalation, the
+    // `onClose` guard, or a bare `shutDown()` -- left a promise nothing would
+    // ever complete. MEASURED: a probe that did nothing but `_ = engine.drained`
+    // and then `shutDown()` normally gave `EngineServer.swift:443: Fatal error:
+    // leaking promise` and `exited with unexpected signal code 5` -- a dead test
+    // binary, no results for any test in the class.
+    //
+    // It justified itself as how `arca-engine` bounds the drain, and
+    // `arca-engine` never read it: the grace period is scheduled against the
+    // LOCAL future `beginGracefulShutdown()` returns. Its only reader was
+    // `runUntilQuiesced`, inside this type.
+    //
+    // **The affordance is gone rather than documented**, because a hazard on a
+    // public surface that is safe only while nobody uses it is not safe --
+    // especially one whose own doc invited the use that arms it. Anything
+    // needing the future gets it by initiating the shutdown it means to observe.
 
     /// Starts the engine on `socketPath`.
     ///
@@ -130,11 +144,21 @@ public struct EngineServer: Sendable {
     /// takes no arguments`. Initiating and waiting are two halves of one object
     /// and neither takes a future from anyone.
     ///
-    /// **Call this at most once.** `initiateGracefulShutdown` completes the
-    /// promise it is handed, and handing the same promise over twice would
-    /// complete it twice. `arca-engine` guarantees it structurally: the call sits
-    /// inside `if asked.recordAndReportFirst()`, and a second signal takes the
-    /// escalation branch instead, which closes the listener rather than draining.
+    /// **Call this at most once**, which `arca-engine` guarantees structurally:
+    /// the call sits inside `if asked.recordAndReportFirst()`, and a second
+    /// signal takes the escalation branch instead, closing the listener rather
+    /// than draining. A second call would re-enter `initiateGracefulShutdown` on
+    /// an already-quiescing server, which is not a thing to ask for.
+    ///
+    /// **It is a rule, not a hazard, and an earlier revision of this paragraph
+    /// claimed otherwise.** It said handing the same promise over twice "would
+    /// complete it twice" -- stated as a consequence, never run. MEASURED: a
+    /// probe calling this twice and then `runUntilQuiesced()` passes cleanly, in
+    /// 0.016s, with no trap, no leak and no diagnostic. NIO's
+    /// `EventLoopFuture._setValue` is `if self._value == nil { ... }` and
+    /// silently drops a second completion, with no `precondition` on the success
+    /// path (swift-nio's `EventLoopFuture.swift:906-916`). The rule stands on the
+    /// server, not on the promise.
     @discardableResult
     public func beginGracefulShutdown() -> EventLoopFuture<Void> {
         let promise = drain.promise()
@@ -163,9 +187,10 @@ public struct EngineServer: Sendable {
     /// `EngineServerTests` case starts an engine and never quiesces it, so every
     /// one of them would deallocate an uncompleted promise. MEASURED with
     /// exactly that change applied -- `ArcaEngine/EngineServer.swift:101: Fatal
-    /// error: leaking promise created at ...`, and the test binary died on the
-    /// FIRST test to run with `unexpected signal code 5`. Not a failing test: no
-    /// results at all for any test in the class. The check is
+    /// error: leaking promise created at ...` (line 101 of the MUTATED tree,
+    /// where the `makePromise` sat; not an anchor into this one), and the test
+    /// binary died on the FIRST test to run with `unexpected signal code 5`. Not
+    /// a failing test: no results at all for any test in the class. The check is
     /// `EventLoopFuture.deinit`, which under `debugOnly` calls `fatalError` when
     /// a future deallocates with no value (swift-nio's
     /// `EventLoopFuture.swift:479`).
@@ -253,8 +278,8 @@ public struct EngineServer: Sendable {
     /// `networkManager.initialize()`, which constructs a real `VmnetNetwork`, so
     /// it needs an entitlement and a host vmnet.
     ///
-    /// **The mutation that matters -- awaiting `onClose` below instead of
-    /// `drained` -- is what moving the wait here made visible, and both halves
+    /// **The mutation that matters -- awaiting `onClose` below instead of the
+    /// drain -- is what moving the wait here made visible, and both halves
     /// of that were measured rather than argued.** Applied where the wait used
     /// to live, to `try await quiesced.futureResult.get()` in
     /// `ServeCommand.serve` at `fa1d707`, `swift test --filter ArcaEngineTests`
@@ -272,7 +297,7 @@ public struct EngineServer: Sendable {
     /// because nothing released the lock. Restored, `Executed 169 tests, with 0
     /// failures`.
     public func runUntilQuiesced() async throws {
-        try await drained.get()
+        try await drain.promise().futureResult.get()
         try await shutDown()
     }
 
@@ -422,8 +447,17 @@ public struct EngineServer: Sendable {
 /// **It is also what keeps the promise out of `start()`.** A promise made for
 /// every engine is leaked by every engine nothing shuts down, which is every
 /// case in `EngineServerTests` -- and NIO turns that into a dead test binary
-/// rather than a failing test. The measurement is on `runUntilQuiesced`. Here,
-/// an engine that is never asked to quiesce never creates a promise at all.
+/// rather than a failing test. The measurement is on `runUntilQuiesced`.
+///
+/// **What that buys is bounded, and an earlier revision of this paragraph
+/// overstated it.** It said "an engine that is never asked to quiesce never
+/// creates a promise at all", which was true only while nothing read the
+/// `drained` property this type published -- and reading it minted one, then
+/// killed the binary. The accurate statement is narrower: minting is reachable
+/// only through `beginGracefulShutdown` and `runUntilQuiesced`, both of which
+/// are explicit calls that mean a shutdown is happening, and the caller that
+/// makes either is the caller that completes it. There is no longer any way to
+/// arm this by reading.
 final class Drain: Sendable {
     private let eventLoop: EventLoop
     private let made = NIOLockedValueBox<EventLoopPromise<Void>?>(nil)
