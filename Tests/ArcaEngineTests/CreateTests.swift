@@ -285,6 +285,171 @@ final class CreateTests: XCTestCase {
         XCTAssertEqual(untouched, [], "the refusal must come before the volume step")
     }
 
+    /// A retained volume the engine holds gets past the gate; one it does not
+    /// hold is refused before anything is built.
+    ///
+    /// **The failure this prevents is silent.** A container attached to a volume
+    /// the engine no longer holds starts anyway and the mount is simply absent --
+    /// which is the exact shape of the named-volume defect of 2026-08-14, where
+    /// three volumes were attached, mounted somewhere unreachable, and nothing
+    /// refused. `not_found` naming the volume is the loud form of the same state.
+    ///
+    /// **Paired, for the reason
+    /// `testAHeldDigestPassesTheImageGateAndAnAbsentOneIsRefusedBeforeAnythingIsCreated`
+    /// is paired, and it is not decoration.** The refused half alone is passed by
+    /// an engine that refuses EVERY retained resource -- a
+    /// `firstRetainedResourceNotHeld` reduced to `return engineError(.notFound,
+    /// resource: retained.first…)`, reading no store at all, satisfies every
+    /// assertion in it. That mutation makes a recreate impossible while looking
+    /// exactly like a working guard. The held half is what fails against it, so
+    /// the two names differ in nothing but whether the volume was created, and
+    /// the store read is what has to decide between them.
+    ///
+    /// The held half is recognised by how far it gets: past the retained gate,
+    /// through `createSpec`, and into `createContainer`'s own uninitialised-manager
+    /// guard -- the same recognition
+    /// `testAnOfflineCreateMakesNoNetworkAndReachesTheContainerStep` uses, and the
+    /// furthest this target can reach without a VM.
+    func testCreateContainerRefusesARetainedResourceTheEngineDoesNotHold() async throws {
+        let engine = try await preparedEngine()
+        let held = "gascan-cache-\(Self.sandboxId)"
+
+        // The refused half runs first, while the engine is known to hold no
+        // volume at all: an absent name and a name that was never asked for are
+        // the same thing here only until the second half creates one.
+        var absent = Arca_Engine_V1_CreateContainerRequest()
+        absent.create = engine.request()
+        absent.retained = [
+            resourceMessage(kind: .volume, name: "a-volume-nothing-holds", labels: [:])
+        ]
+
+        let refused = await engine.service.createContainer(request: absent)
+
+        guard case .failed(let failure) = refused.outcome else {
+            return XCTFail("a retained resource the engine does not hold must be refused")
+        }
+        XCTAssertEqual(failure.error.code, "not_found")
+        XCTAssertEqual(
+            failure.error.resource,
+            "a-volume-nothing-holds",
+            "the resource field names the offender; prose goes in message"
+        )
+        XCTAssertTrue(
+            failure.created.isEmpty,
+            "the refusal runs before anything is built, so there is nothing to report"
+        )
+
+        _ = try await engine.managers.volumeManager.createVolume(
+            name: held,
+            driver: "local",
+            driverOpts: [:],
+            labels: [:]
+        )
+        var present = Arca_Engine_V1_CreateContainerRequest()
+        present.create = engine.request()
+        present.retained = [resourceMessage(kind: .volume, name: held, labels: [:])]
+
+        let accepted = await engine.service.createContainer(request: present)
+
+        guard case .failed(let past) = accepted.outcome else {
+            return XCTFail("expected the container-step failure, got \(accepted.outcome as Any)")
+        }
+        XCTAssertEqual(
+            past.error.resource, Self.sandboxId,
+            "a retained volume the engine DOES hold must get past the gate and reach the "
+                + "container step; a guard that refused it read no store"
+        )
+        XCTAssertEqual(
+            past.error.message, "ContainerManager not initialized",
+            "and it must be the uninitialised-manager guard rather than an earlier refusal"
+        )
+    }
+
+    /// `CreateContainer` builds the container and nothing else, even when the
+    /// request it shares with `Create` names volumes and a network.
+    ///
+    /// **This test is the heir of a deleted one, and the risk it inherits has
+    /// inverted rather than expired.** `SandboxEngineServiceTests
+    /// .testCreateContainerAnswersUnsupportedCapabilityNamingTheRpc` held this
+    /// method down while it was a stub, and its comment said why it was the one
+    /// worth watching: `CreateContainer` "shares `CreateRequest` with `Create`
+    /// and is a create in every respect except that its resources already exist,
+    /// so it is the method most likely to be quietly satisfied by a change aimed
+    /// at its neighbour". That test was removed when this method became real,
+    /// which is the rule five other methods left it under -- but the hazard it
+    /// named did not go with it. It turned around:
+    ///
+    /// - **Then:** `createContainer` accidentally made to *work* by a change to
+    ///   `create`. The stub assertion caught that.
+    /// - **Now:** `createContainer` accidentally made to do *everything*
+    ///   `create` does -- creating the very volumes and network it was told to
+    ///   reuse. Nothing caught that until this.
+    ///
+    /// `buildContainer` is shared by both paths deliberately, and sharing is
+    /// correct -- see the note on it -- but it also puts the two methods one
+    /// careless edit apart. `engine.proto:296-302` is the line being defended:
+    /// everything named in `retained` already exists and is reused.
+    ///
+    /// **The assertion is on what the managers hold, not on what the response
+    /// says.** A response arm is satisfied by a refusal for any reason at all. So
+    /// the host is asked directly: no volume, and no network by the name the
+    /// request asked for.
+    ///
+    /// **And it asserts the run reached the container step, because the absence
+    /// check alone has the same hole in the same direction.** A
+    /// `createContainer` that refused at `createSpec` or earlier also creates no
+    /// volume and no network, and would pass on absence alone -- a green test
+    /// against an engine that cannot recreate anything. Reaching
+    /// `containerManager`'s uninitialised-manager guard is what says the volume
+    /// loop and the network branch were *skipped* rather than never reached.
+    /// Same three-part shape, and the same reason, as
+    /// `testAnOfflineCreateMakesNoNetworkAndReachesTheContainerStep`.
+    ///
+    /// `retained` is left empty on purpose: this isolates "does this method build
+    /// resources" from the retained gate, which
+    /// `testCreateContainerRefusesARetainedResourceTheEngineDoesNotHold` owns.
+    func testCreateContainerBuildsNoVolumeOrNetworkEvenWhenTheRequestNamesThem() async throws {
+        let engine = try await preparedEngine()
+        let networkName = "sbx-net"
+
+        var request = Arca_Engine_V1_CreateContainerRequest()
+        request.create = engine.request(
+            volumes: [
+                (name: "gascan-cache-\(Self.sandboxId)", path: "/home/workspace/.cache"),
+                (name: "gascan-config-\(Self.sandboxId)", path: "/home/workspace/.config"),
+            ],
+            network: .networkedName(networkName)
+        )
+
+        let response = await engine.service.createContainer(request: request)
+
+        let volumes = try await engine.managers.volumeManager.listVolumes().map(\.name)
+        XCTAssertEqual(
+            volumes, [],
+            "a recreate reuses the volumes it was told about; building one is the defect "
+                + "this exists for, and the host is what says whether it happened"
+        )
+        let network = await engine.managers.networkManager.getNetworkByName(name: networkName)
+        XCTAssertNil(
+            network,
+            "and it must create no network either, by the name the shared CreateRequest names"
+        )
+
+        guard case .failed(let failed) = response.outcome else {
+            return XCTFail("the container step cannot succeed here, got \(response.outcome as Any)")
+        }
+        XCTAssertEqual(
+            failed.error.resource, Self.sandboxId,
+            "the two absences above must be a skipped volume loop and a skipped network branch, "
+                + "not a refusal that happened before either could run"
+        )
+        XCTAssertEqual(
+            failed.error.message, "ContainerManager not initialized",
+            "and it must be the uninitialised-manager guard, which is as far as a VM-free "
+                + "test can follow this method"
+        )
+    }
+
     // MARK: - Fixtures
 
     /// A resource as `kind name managed_by/sandbox_id`.

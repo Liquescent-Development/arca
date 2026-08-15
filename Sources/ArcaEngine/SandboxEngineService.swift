@@ -10,10 +10,15 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, eight of the eleven are implemented: `Capabilities`,
-/// `Inspect`, `ListResources`, `PrepareImage`, `Create`, `Start`, `Stop` and
-/// `Remove`.** The other three -- `CreateContainer`, `Exec` and `Logs` -- answer
-/// `unsupported_capability` inside their response `oneof`.
+/// **In this build, nine of the eleven are implemented: `Capabilities`,
+/// `Inspect`, `ListResources`, `PrepareImage`, `Create`, `CreateContainer`,
+/// `Start`, `Stop` and `Remove`.** The other two -- `Exec` and `Logs` -- answer
+/// `unsupported_capability`, and both send it inside a stream frame rather than
+/// a response `oneof`: `ExecServerFrame.frame.error` (`:1099`) and
+/// `LogsChunk.outcome.error` (`:1109`). That is why neither is reachable from a
+/// test in this target, which cannot construct a
+/// `GRPCAsyncResponseStreamWriter`, and why gascan's live tier is what asserts
+/// they answer at all.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -390,6 +395,22 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
             )
         }
 
+        return await buildContainer(spec: spec, created: created)
+    }
+
+    /// The container phase of a create, shared by `Create` and `CreateContainer`.
+    ///
+    /// **Extracted rather than duplicated, and the reason is a mutation that
+    /// survived.** `createSpec`'s comment records that a review replaced the one
+    /// line deciding the image reference with `references.first ?? …` and the whole
+    /// suite stayed green -- every sandbox would have recorded a tag and every
+    /// `Inspect` would have answered `invalid_output`. Two independent container
+    /// build paths would let exactly that drift back in on one of them.
+    private func buildContainer(
+        spec: SandboxContainerSpec,
+        created: [Arca_Engine_V1_Resource]
+    ) async -> Arca_Engine_V1_CreateResponse {
+        var created = created
         let container = await Self.createCatching(resource: spec.name) {
             try await self.containerManager.createContainer(
                 image: spec.image,
@@ -671,12 +692,66 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     }
 
     /// See the note on the `create(request:)` overload above.
-    func createContainer(request: Arca_Engine_V1_CreateContainerRequest) async -> Arca_Engine_V1_CreateResponse {
-        Arca_Engine_V1_CreateResponse.with {
-            $0.failed = Arca_Engine_V1_CreateFailed.with {
-                $0.error = Self.notImplemented("CreateContainer")
+    ///
+    /// **The container only.** `engine.proto:296-302` states it: everything named
+    /// in `retained` already exists and is reused, so this creates no volume and no
+    /// network. Gas Can already enforces the other half --
+    /// `CreateOutcome::for_recreate` refuses an answer carrying the whole topology
+    /// (`crates/gascan-arca/tests/backend_unary.rs:740`) -- so an engine that
+    /// rebuilt a retained resource would be caught there rather than here.
+    func createContainer(
+        request: Arca_Engine_V1_CreateContainerRequest
+    ) async -> Arca_Engine_V1_CreateResponse {
+        if let missing = await firstRetainedResourceNotHeld(request.retained) {
+            return Self.createFailed([], missing)
+        }
+
+        let spec: SandboxContainerSpec
+        switch await createSpec(for: request.create) {
+        case .failure(let error):
+            return Self.createFailed([], error)
+        case .success(let translated):
+            spec = translated
+        }
+
+        return await buildContainer(spec: spec, created: [])
+    }
+
+    /// The first retained resource this engine does not hold, or nil.
+    ///
+    /// A store read, not a guess. Containers are not checked: the container is what
+    /// this RPC builds, so one appearing in `retained` is the caller's error and
+    /// `createContainer` will refuse it as a name conflict with a better message
+    /// than this could give.
+    private func firstRetainedResourceNotHeld(
+        _ retained: [Arca_Engine_V1_Resource]
+    ) async -> Arca_Engine_V1_EngineError? {
+        for resource in retained {
+            let name = resource.identity.name
+            switch resource.identity.kind {
+            case .volume:
+                do {
+                    _ = try await volumeManager.inspectVolume(name: name)
+                } catch {
+                    return engineError(
+                        .notFound,
+                        resource: name,
+                        message: "this engine holds no volume named \(name)"
+                    )
+                }
+            case .network:
+                if await networkManager.getNetworkByName(name: name) == nil {
+                    return engineError(
+                        .notFound,
+                        resource: name,
+                        message: "this engine holds no network named \(name)"
+                    )
+                }
+            default:
+                continue
             }
         }
+        return nil
     }
 
     public func createContainer(
