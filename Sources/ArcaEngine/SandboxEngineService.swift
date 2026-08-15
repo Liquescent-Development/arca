@@ -758,6 +758,26 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         _ request: Arca_Engine_V1_CreateContainerRequest
     ) async -> Arca_Engine_V1_EngineError? {
         for resource in Self.reusedTopology(of: request.create) {
+            // `createSpec` refuses an unnamed volume with `invalid_resource_identity`
+            // (`EngineCreate.swift:106-113`), and this guard now runs in front of it
+            // -- so without this the same request answers `not_found` carrying an
+            // EMPTY `resource` field and the message "this engine holds no volume
+            // named ". "The `resource` field names the offender" is a stated rule of
+            // this contract and an empty string names nothing. This preserves the
+            // answer the caller used to get rather than inventing a new one.
+            guard !resource.name.isEmpty else {
+                return engineError(
+                    .invalidResourceIdentity,
+                    resource: SandboxIdentity.containerName(forSandboxId: request.create.sandboxID),
+                    message: "a \(resource.kind.noun) in this request carries no name"
+                )
+            }
+
+            // The KIND half of this comparison is as load-bearing as the name half:
+            // without it a `retained` entry naming a volume would satisfy the
+            // network's requirement, and vice versa. Gas Can's names make that
+            // collision unlikely rather than impossible, and `resourceKind` exists
+            // precisely so the comparison can be total.
             guard request.retained.contains(where: {
                 $0.identity.kind == resource.kind.resourceKind && $0.identity.name == resource.name
             }) else {

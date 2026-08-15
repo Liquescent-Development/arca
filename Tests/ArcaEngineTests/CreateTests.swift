@@ -419,6 +419,100 @@ final class CreateTests: XCTestCase {
             "the refusal must name the network, not the sandbox and not the volume it walked past"
         )
         XCTAssertTrue(failed.created.isEmpty)
+
+        // Real, and it covers the half the refusal itself cannot: a
+        // `createContainer` that built the network BEFORE consulting the guard
+        // would leave it here and then refuse. Build-AFTER-guard is unreachable
+        // from this request and is covered by
+        // `testCreateContainerBuildsNoVolumeOrNetworkEvenWhenTheRequestNamesThem`.
+        let networks = try await engine.managers.networkManager.listNetworks().map(\.name)
+        XCTAssertEqual(
+            networks, [],
+            "and a refused recreate must not have created the network on its way to refusing"
+        )
+    }
+
+    /// The retained-membership check compares kind as well as name.
+    ///
+    /// **Its own test because the kind half was decorative.** MEASURED by the
+    /// re-review: dropping `$0.identity.kind == resource.kind.resourceKind` from
+    /// the predicate passed the whole suite at 164/0, so half of a comparison that
+    /// `RemovableKind.resourceKind` was added to make total was unpinned.
+    ///
+    /// The request retains a **volume** carrying the network's name, and nothing
+    /// else changes. Name-only matching accepts it and the recreate proceeds;
+    /// matching on both refuses, because the network the container will attach to
+    /// is not in `retained` at all. Consequence in production terms: a caller that
+    /// mislabelled one entry's kind would have the engine agree its topology was
+    /// fully retained when one member of it was never declared.
+    func testTheRetainedMembershipCheckComparesKindAndNotOnlyName() async throws {
+        let engine = try await preparedEngine()
+        let networkName = "sbx-net"
+        let held = "gascan-cache-\(Self.sandboxId)"
+        try await engine.hold(volume: held)
+        try await engine.hold(network: networkName)
+
+        var request = Arca_Engine_V1_CreateContainerRequest()
+        request.create = engine.request(
+            volumes: [(name: held, path: "/home/workspace/.cache")],
+            network: .networkedName(networkName)
+        )
+        // The volume entry is correct; the second entry names the network but
+        // calls it a volume. Under a name-only comparison it satisfies the
+        // network's requirement.
+        request.retained = [
+            resourceMessage(kind: .volume, name: held, labels: [:]),
+            resourceMessage(kind: .volume, name: networkName, labels: [:]),
+        ]
+
+        let response = await engine.service.createContainer(request: request)
+
+        guard case .failed(let failed) = response.outcome else {
+            return XCTFail("a retained entry of the wrong kind must not satisfy the topology")
+        }
+        XCTAssertEqual(failed.error.code, "invalid_state")
+        XCTAssertEqual(
+            failed.error.resource, networkName,
+            "the network is the member that was never retained, whatever a volume of its "
+                + "name might suggest"
+        )
+    }
+
+    /// A volume in the request that carries no name is refused by identity, not by
+    /// absence.
+    ///
+    /// **The guard moved in front of the validation that used to answer this.**
+    /// `createSpec` refuses an unnamed volume with `invalid_resource_identity`
+    /// (`EngineCreate.swift:106-113`), and since fix round 1 the topology guard
+    /// runs first -- so the same request would otherwise answer `not_found` with an
+    /// **empty** `resource` field and the message "this engine holds no volume
+    /// named ". `engine.proto` makes `resource` the field that names the offender
+    /// and an empty string names nothing, which is the difference between a
+    /// consumer being told what is wrong and being told a blank.
+    ///
+    /// Unreachable from Gas Can -- `PolicyCompiler` emits no empty names -- so this
+    /// is diagnostic quality on a malformed-input path rather than a correctness
+    /// bug. It is pinned because the guard's position in front of `createSpec` is
+    /// the kind of thing a later edit reorders.
+    func testCreateContainerRefusesAVolumeThatCarriesNoName() async throws {
+        let engine = try await preparedEngine()
+
+        let response = await engine.service.createContainer(
+            request: Self.recreate(engine.request(
+                volumes: [(name: "", path: "/home/workspace/.cache")]
+            ))
+        )
+
+        guard case .failed(let failed) = response.outcome else {
+            return XCTFail("a volume carrying no name must be refused")
+        }
+        XCTAssertEqual(failed.error.code, "invalid_resource_identity")
+        XCTAssertEqual(
+            failed.error.resource, Self.sandboxId,
+            "an unnamed volume cannot name itself, so the refusal names the sandbox -- which "
+                + "is what createSpec answers for the same request"
+        )
+        XCTAssertEqual(failed.error.message, "a volume in this request carries no name")
     }
 
     /// A volume the container would mount but the caller did not retain is refused.
@@ -510,6 +604,16 @@ final class CreateTests: XCTestCase {
         }
         XCTAssertEqual(unowned.error.code, "foreign_resource_refused")
         XCTAssertEqual(unowned.error.resource, unlabelled)
+        // The one assertion that pins `OwnershipAction` doing anything. MEASURED
+        // by the re-review: swapping this path's `action: .reuse` for `.remove`
+        // passed the whole suite at 164/0, so the enum's entire reason for
+        // existing -- not telling an operator the engine was about to DELETE a
+        // volume it was about to MOUNT -- was unpinned in both directions.
+        XCTAssertTrue(
+            unowned.error.message.contains("will not mount it into a rebuilt container"),
+            "a recreate's refusal must say what a recreate was about to do, not what a "
+                + "remove would have: \(unowned.error.message)"
+        )
 
         let foreign = await engine.service.createContainer(
             request: Self.recreate(engine.request(volumes: [
@@ -579,12 +683,28 @@ final class CreateTests: XCTestCase {
     /// one: an engine that rebuilt a volume here would hit `VolumeError.alreadyExists`
     /// and answer `resource_conflict` naming it, which the reason assertion rejects.
     ///
-    /// **Offline, and that is a real limitation rather than a choice.**
-    /// `preparedEngine()` leaves `NetworkManager` uninitialised, so no request
-    /// naming a managed network can pass the guard in this target at all. The
-    /// `listNetworks` assertion below is therefore a statement of intent that no
-    /// mutation in this file can falsify; the network half of "builds nothing" is
-    /// `recreate.rs`'s, and it is labelled here so nobody mistakes it for proof.
+    /// **The request names a managed network and the engine genuinely holds it,
+    /// and getting that back was the point of fix round 2.** The first rewrite
+    /// went offline, because the amended guard refuses any network the engine does
+    /// not hold and `preparedEngine()` initialises no `NetworkManager`. That was
+    /// forced but it cost the network half outright: MEASURED by the re-review,
+    /// a `createContainer` that rebuilt the network it was told to reuse passed
+    /// the whole suite at 164/0, where the same mutation was **caught** before the
+    /// rewrite. Coverage went backwards.
+    ///
+    /// `PreparedEngine.hold(network:)` is what buys it back without a VM -- see
+    /// its note for why the `null` driver answers the guard's two questions
+    /// identically to a `bridge` one.
+    ///
+    /// **The REASON assertions are what carry the network half, not the
+    /// `listNetworks` line**, and saying so precisely is a correction: the first
+    /// rewrite's comment blamed the absence assertion, which had already been
+    /// unfalsifiable before it. A `createContainer` that rebuilt the network
+    /// answers `resource_conflict` naming `sbx-net` (the name is taken) or
+    /// `command_failed` naming it (no WireGuard backend) -- either way
+    /// `error.resource` stops being the sandbox id, and that is the assertion that
+    /// fails. `listNetworks` staying equal is a weaker statement kept for the
+    /// failure message.
     ///
     /// **The half this does NOT inherit is the response shape, and no test in this
     /// target can.** An engine that reused the retained resources correctly but
@@ -597,8 +717,16 @@ final class CreateTests: XCTestCase {
     /// (`crates/gascan-arca/tests/backend_unary.rs:740`), which feeds
     /// `create_container` a full `Created` payload and requires `invalid_state`.
     /// Named here so a later reader does not assume the Swift suite guards it.
+    ///
+    /// **That test proves the CLIENT refuses such an answer, not that the ENGINE
+    /// never sends one, and the two are different facts.** What makes stopping
+    /// there legitimate is the failure mode: an engine reporting the whole
+    /// topology would make every recreate fail loudly at `for_recreate` rather
+    /// than corrupt anything quietly. A loud failure guarded on the consumer's
+    /// side is a defensible place to stop; a silent one would not be.
     func testCreateContainerBuildsNoVolumeOrNetworkEvenWhenTheRequestNamesThem() async throws {
         let engine = try await preparedEngine()
+        let networkName = "sbx-net"
         let topology = [
             (name: "gascan-cache-\(Self.sandboxId)", path: "/home/workspace/.cache"),
             (name: "gascan-config-\(Self.sandboxId)", path: "/home/workspace/.config"),
@@ -606,23 +734,28 @@ final class CreateTests: XCTestCase {
         for volume in topology {
             try await engine.hold(volume: volume.name)
         }
-        let before = try await engine.managers.volumeManager.listVolumes().map(\.name).sorted()
+        try await engine.hold(network: networkName)
+        let volumesBefore = try await engine.managers.volumeManager.listVolumes().map(\.name).sorted()
+        let networksBefore = try await engine.managers.networkManager.listNetworks().map(\.name)
 
         let response = await engine.service.createContainer(
-            request: Self.recreate(engine.request(volumes: topology))
+            request: Self.recreate(engine.request(
+                volumes: topology,
+                network: .networkedName(networkName)
+            ))
         )
 
-        let after = try await engine.managers.volumeManager.listVolumes().map(\.name).sorted()
+        let volumesAfter = try await engine.managers.volumeManager.listVolumes().map(\.name).sorted()
         XCTAssertEqual(
-            after, before,
+            volumesAfter, volumesBefore,
             "a recreate reuses the volumes it was told about; building one is the defect "
                 + "this exists for, and the host is what says whether it happened"
         )
-        let networks = try await engine.managers.networkManager.listNetworks().map(\.name)
+        let networksAfter = try await engine.managers.networkManager.listNetworks().map(\.name)
         XCTAssertEqual(
-            networks, [],
-            "and it must create no network either -- though this request is offline, so no "
-                + "mutation in this target can falsify this line; see the note above"
+            networksAfter, networksBefore,
+            "and the network set must be unchanged -- the weaker of the two network "
+                + "statements; the reason assertion below is the one that fails under a rebuild"
         )
 
         guard case .failed(let failed) = response.outcome else {
@@ -630,8 +763,9 @@ final class CreateTests: XCTestCase {
         }
         XCTAssertEqual(
             failed.error.resource, Self.sandboxId,
-            "the absence above must be a skipped volume loop, not a refusal that happened "
-                + "before it could run and not a conflict from trying to rebuild one"
+            "the absences above must be a skipped volume loop AND a skipped network branch, "
+                + "not a refusal that happened before either could run and not a conflict from "
+                + "trying to rebuild one -- a rebuild names the resource it collided with"
         )
         XCTAssertEqual(
             failed.error.message, "ContainerManager not initialized",
@@ -724,6 +858,41 @@ final class CreateTests: XCTestCase {
                 driver: "local",
                 driverOpts: [:],
                 labels: overrideLabels ?? SandboxIdentity.labels(from: owner)
+            )
+        }
+
+        /// Puts a network on the host that this engine genuinely holds, under the
+        /// caller's labels, without a VM.
+        ///
+        /// **`null` is the one driver that reaches the store without a backend,
+        /// and that is the whole reason it is here.** `createNetwork`'s `bridge`
+        /// arm needs `wireGuardBackend` and its `vmnet` arm constructs a live
+        /// `VmnetNetworkBackend` (`NetworkManager.swift:393-440`), neither of
+        /// which `preparedEngine()` has. The `null` arm (`:441-470`) persists to
+        /// the `StateStore` and registers the name mapping, and `getNetworkByName`
+        /// -> `getNetwork(id:)` reads that arm's networks straight back out of the
+        /// store (`:671-687`).
+        ///
+        /// **What that buys is exactly what the guard reads and nothing more.**
+        /// `reusedTopologyRefusal` asks two questions of a network -- does this
+        /// engine hold one by that name, and whose labels does it carry -- and both
+        /// are answered identically for a `null` network and a `bridge` one. The
+        /// driver decides what the network *does*, which is a VM's business and is
+        /// `recreate.rs`'s to prove; it decides nothing about what the guard sees.
+        /// So this is a fixture for the guard, not a stand-in for a working
+        /// network, and no test here should assert anything about connectivity.
+        func hold(
+            network name: String,
+            ownedBy owner: Arca_Engine_V1_OwnerLabels = CreateTests.owner
+        ) async throws {
+            _ = try await managers.networkManager.createNetwork(
+                name: name,
+                driver: "null",
+                subnet: nil,
+                gateway: nil,
+                ipRange: nil,
+                options: [:],
+                labels: SandboxIdentity.labels(from: owner)
             )
         }
 
