@@ -79,7 +79,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// is true before its code exists induces a consumer to send a request the
     /// engine cannot honour.
     ///
-    /// **Three flags are true, and each one names a live test that drove the
+    /// **Four flags are true, and each one names a live test that drove the
     /// capability from outside this engine's own store.** `Inspect` reports what
     /// the store holds, deliberately, so it can corroborate none of them; every
     /// flag below that is true was earned by an observation of the guest or of
@@ -109,18 +109,22 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     ///   -- four CPUs and ContainerBridge's 4GiB default, in place of the one
     ///   CPU and 1GiB that were asked for.
     ///
-    /// **`namedVolumes` stays false, and it is not an oversight.** `Create`
-    /// makes the volumes, `volumeDriver` formats each as an EXT4 image at its
-    /// requested capacity, and `parseVolumeMounts` resolves each one and builds
-    /// a `Mount.block` for it -- and the guest mounts none of them. MEASURED
-    /// from the live tier: three volumes of 256MiB, 512MiB and 1GiB arrive in
-    /// the guest as three block devices of exactly 262144, 524288 and 1048576
-    /// 1K-blocks, while `/proc/mounts` names none of the three targets, with no
-    /// warning and no error anywhere in the log. The mount points were ruled out
-    /// as the cause: the same run with an image carrying all three directories
-    /// behaves identically. `the_managed_volumes_are_attached_to_the_guest_but_this_engine_mounts_none_of_them`
-    /// is the instrument that holds this flag down, and it fails the day the
-    /// mount starts working.
+    /// - `namedVolumes`: the guest's own `/proc/mounts` names all three managed
+    ///   targets, each backed by a distinct ext4 block device whose size in
+    ///   `/proc/partitions` is the capacity that target's volume was declared
+    ///   with -- 262144, 524288 and 1048576 1K-blocks for 256MiB, 512MiB and
+    ///   1GiB -- and the guest writes a token into each and reads it back.
+    ///   Earned by
+    ///   `mounts::the_managed_volumes_are_mounted_at_their_declared_targets_and_writable`.
+    ///   SEEN TO FAIL, against this repository at 6c77bb8: the same test reported
+    ///   `/home/workspace/.local is not mounted in the guest`, with the guest's
+    ///   overlay reading
+    ///   `lowerdir=/mnt/layer4:/mnt/layer3:/mnt/layer2:/mnt/layer1:/mnt/layer0`
+    ///   -- five lowerdirs for a two-layer image, because vminitd counted
+    ///   /dev/vdc upwards and swallowed the three volume devices as layers.
+    ///   The writability half of that test passed even then, which is why it is
+    ///   not the assertion that carries the claim: the targets exist in the
+    ///   image, so the write landed in the container's own overlay.
     ///
     /// `tty` and `signals` are milestone 3's, with `Exec`. `offline` stays
     /// `.unverified` until milestone 4 proves it.
@@ -138,7 +142,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
                 capabilities.engineVersion = version
                 capabilities.contractMinor = 0
                 capabilities.projectMount = true
-                capabilities.namedVolumes = false
+                capabilities.namedVolumes = true
                 capabilities.tty = false
                 capabilities.signals = false
                 capabilities.loopbackPublish = true

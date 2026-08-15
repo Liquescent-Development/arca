@@ -21,11 +21,17 @@ final class CapabilitiesTests: XCTestCase {
     /// **This asserts the false flags as hard as the true ones, and that is the
     /// point.** A capability that is true before its code exists is how a
     /// consumer is induced to send a request the engine cannot honour, so the
-    /// four `XCTAssertFalse`s below are not leftovers from an emptier build:
-    /// `namedVolumes` is false because the guest mounts none, `tty` and
-    /// `signals` because `Exec` is not implemented, and `offline` is
-    /// `.unverified` because nothing has proven isolation. See the note on
-    /// `capabilities(request:)` for what earned each of the three that are true.
+    /// `XCTAssertFalse`s below are not leftovers from an emptier build: `tty`
+    /// and `signals` are false because `Exec` is not implemented, and `offline`
+    /// is `.unverified` because nothing has proven isolation. See the note on
+    /// `capabilities(request:)` for what earned each of the four that are true.
+    ///
+    /// `namedVolumes` was one of the falses until vminitd stopped identifying
+    /// its OverlayFS block devices by counting `/dev/vd` letters -- which
+    /// swallowed the volume devices -- and started reading a role out of each
+    /// image's ext4 volume label. This assertion flipping is a deliberate part
+    /// of that change; it failing on its own would mean the flag moved without
+    /// one.
     ///
     /// **This test cannot corroborate any of them.** It reads the same literals
     /// the source holds; what makes those literals honest is gascan's live
@@ -44,7 +50,7 @@ final class CapabilitiesTests: XCTestCase {
             return XCTFail("Capabilities must answer with capabilities")
         }
         XCTAssertTrue(capabilities.projectMount)
-        XCTAssertFalse(capabilities.namedVolumes)
+        XCTAssertTrue(capabilities.namedVolumes)
         XCTAssertFalse(capabilities.tty)
         XCTAssertFalse(capabilities.signals)
         XCTAssertTrue(capabilities.loopbackPublish)
