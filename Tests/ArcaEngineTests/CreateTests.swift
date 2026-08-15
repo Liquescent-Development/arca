@@ -445,13 +445,21 @@ final class CreateTests: XCTestCase {
     ///
     /// **The unlabelled tier is not a hypothetical on networks, which is what
     /// makes this different from its volume sibling.** This engine creates its own
-    /// `bridge` and `host` networks at startup with `labels: [:]`
-    /// (`NetworkManager.createDefaultNetworks`, `:297-338`), so an engine's own
+    /// `bridge`, `host` and `none` networks at startup, all three with
+    /// `labels: [:]` (`NetworkManager.createDefaultNetworks`, `:297-358`; the
+    /// three `labels: [:]` are at `:310`, `:331` and `:349`), so an engine's own
     /// defaults ARE the unlabelled case. A recreate naming `bridge` describes a
     /// network that genuinely exists, that this engine genuinely holds, and that
     /// belongs to no sandbox -- and without this tier the container would be
     /// attached to it. Volumes have no equivalent: nothing creates an unlabelled
     /// volume on this engine's behalf.
+    ///
+    /// **That citation read `:297-338` for one round, and how it was wrong is
+    /// worth more than the correction.** The range was not incorrect, it was
+    /// SHORT -- it ended inside the second default and cut off the third
+    /// entirely. A reader who follows a short range finds the claim borne out and
+    /// stops looking, so understating survives review in a way misstating does
+    /// not. End the range where the claim ends.
     ///
     /// The mislabelled tier is the same hazard as the volume's, on the resource
     /// where it is worse: a container on another sandbox's network segment can
@@ -570,8 +578,16 @@ final class CreateTests: XCTestCase {
     /// `createSpec` ahead of the guard passes the whole suite. That is not a hole,
     /// it is the design working -- the refusal above was deliberately built to be
     /// byte-identical to `createSpec`'s, so the two orders are indistinguishable by
-    /// construction and the reorder changes no observable answer. A test cannot
-    /// detect a difference that was engineered away two sentences earlier.
+    /// construction for a request malformed in this ONE way. A test cannot detect
+    /// a difference that was engineered away two sentences earlier.
+    ///
+    /// One qualifier, DERIVED from the code path and not measured: a request
+    /// malformed in two ways at once -- an image this engine does not hold AND a
+    /// resource it does not hold -- does distinguish the orders, because
+    /// `createSpec` consults `heldImageReferences` first and would answer about
+    /// the image where the guard answers about the resource. Both answers are
+    /// correct refusals naming real offenders, which is why this is a qualifier
+    /// and not a defect.
     ///
     /// So what is pinned is the answer and not the ordering: an unnamed volume is
     /// refused by identity with a `resource` field that names something, whichever
