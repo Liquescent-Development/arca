@@ -106,6 +106,25 @@ public struct EngineServer: Sendable {
     /// waiting is all this does with it -- the one thing that may complete it is
     /// the shutdown that was asked for.
     ///
+    /// **This is not a pure wait.** It calls `shutDown()`, so it returns with the
+    /// server closed, the socket unlinked and the path lock released. A caller
+    /// that wants to observe the drain without ending the engine needs a
+    /// different method, not a flag on this one.
+    ///
+    /// **Do not move the promise onto `EngineServer`, and that is measured
+    /// rather than reasoned about.** Storing `quiesced` as a `let` created in
+    /// `start()`, so the type owns its own drain and callers stop passing one in,
+    /// is the obvious tidier refactor and it is unbuildable: every
+    /// `EngineServerTests` case starts an engine and never quiesces it, so every
+    /// one of them deallocates an uncompleted promise. MEASURED with exactly
+    /// that change applied -- `ArcaEngine/EngineServer.swift:101: Fatal error:
+    /// leaking promise created at ...`, and the test binary died on the FIRST
+    /// test to run with `unexpected signal code 5`. Not a failing test: no
+    /// results at all for any test in the class. The check is
+    /// `EventLoopFuture.deinit`, which under `debugOnly` calls `fatalError` when
+    /// a future deallocates with no value (swift-nio's
+    /// `EventLoopFuture.swift:479`).
+    ///
     /// **What this waits for is every ACCEPTED connection to have gone, and
     /// that is a different event from the listening socket closing.** It used to
     /// wait for `onClose`, which is the LISTENING channel's `closeFuture`, and
