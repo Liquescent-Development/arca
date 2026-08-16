@@ -55,15 +55,20 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     let volumeManager: VolumeManager
     let networkManager: NetworkManager
     let imageManager: ImageManager
-    let execManager: ExecManager
+    /// `any ExecInstanceSource` rather than `ExecManager`, for the reason
+    /// recorded on that protocol: the concrete actor cannot be made to hang, and
+    /// a teardown that cannot be made to hang is a teardown nothing tests.
+    let execManager: any ExecInstanceSource
     let logger: Logger
 
-    public init(
+    /// `package` rather than `public` because `ExecInstanceSource` is, and
+    /// because the only caller is `EngineManagers.makeService(execManager:)`.
+    package init(
         containerManager: ContainerManager,
         volumeManager: VolumeManager,
         networkManager: NetworkManager,
         imageManager: ImageManager,
-        execManager: ExecManager,
+        execManager: any ExecInstanceSource,
         logger: Logger
     ) {
         self.containerManager = containerManager

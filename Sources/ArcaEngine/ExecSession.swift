@@ -59,12 +59,47 @@ package final class ExecFrameRelay: Sendable {
     }
 }
 
+/// A one-shot "it is over" that a waiter can be given up on, which a `Task`'s
+/// own `value` cannot.
+///
+/// **`Task.value`'s getter has no `withTaskCancellationHandler`**, so cancelling
+/// the task that awaits it does not resume that await. Racing `task.value`
+/// against a sleep therefore bounds nothing: `withTaskGroup` drains every child
+/// before it returns, and a child parked in `task.value` drains only once that
+/// task finishes -- so the race returns exactly when the thing it was supposed
+/// to be bounding returns. `AsyncStream`'s iteration **is** cancellation-aware,
+/// so a signal built out of one can be abandoned, and that is the whole of why
+/// this type exists rather than another `await task.value`.
+private final class ExecCompletion: Sendable {
+    private let events: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+
+    init() {
+        let (events, continuation) = AsyncStream.makeStream(of: Void.self)
+        self.events = events
+        self.continuation = continuation
+    }
+
+    /// Marks the work finished. `AsyncStream.Continuation.finish()` is
+    /// idempotent, so this can sit in a `defer` that runs on return, on throw
+    /// and on cancellation alike.
+    func signal() {
+        continuation.finish()
+    }
+
+    /// Returns once `signal()` has been called -- or at once, if the calling
+    /// task is cancelled first. The second half is the property being bought.
+    func wait() async {
+        for await _ in events {}
+    }
+}
+
 /// A `Writer` that turns one guest write into one server frame.
 ///
 /// This and `ExecStdinRelay` are the two adapters `Exec` is built out of, and
 /// they are where the logic lives because they are what a VM-free test can
 /// reach: `startExec` requires a native container instance
-/// (`ExecManager.swift:197-199`), so `Exec` end to end cannot be driven from
+/// (`ExecManager.swift:262-264`), so `Exec` end to end cannot be driven from
 /// this repository at all.
 package struct ExecOutputWriter: Writer {
     package enum Stream: Sendable {
@@ -101,7 +136,7 @@ package struct ExecOutputWriter: Writer {
     /// **Deliberately does nothing, and must not finish the relay.**
     ///
     /// `startExec` closes stdout and then stderr once the process has exited
-    /// (`ExecManager.swift:269-289`), and both writers share one relay. A
+    /// (`ExecManager.swift:334-354`), and both writers share one relay. A
     /// `close()` that finished it would end the response stream at whichever
     /// writer closed first -- discarding the other stream's frames and, after
     /// them, the `Exit` frame that is the answer the consumer is waiting for.
@@ -213,7 +248,7 @@ extension SandboxEngineService {
     /// that cannot be carried, and `createExec`'s own refusals -- because no
     /// VM-free path can put a container in state `running`, so `createExec`
     /// throws `containerNotRunning` against a real `ContainerManager`
-    /// (`ExecManager.swift:132`, measured in the note on `ExecContainerSource`).
+    /// (`ExecManager.swift:197`, measured in the note on `ExecContainerSource`).
     /// Everything after it needs a booted guest and is gascan's live
     /// `exec.rs`. Be precise about which is which: the tests in this repository
     /// pin the refusals, not the session.
@@ -341,7 +376,7 @@ extension SandboxEngineService {
         // `argv` is `repeated bytes` because "execve takes bytes, and a consumer
         // holding a non-UTF-8 argument must be able to send it"
         // (engine.proto:414-416). This engine cannot: `createExec` takes
-        // `[String]` (`ExecManager.swift:107`) and so does
+        // `[String]` (`ExecManager.swift:172`) and so does
         // `LinuxProcessConfiguration.arguments`. It is refused by name rather
         // than lossily decoded -- `String(decoding:as:UTF8.self)` would
         // substitute U+FFFD and run a command the consumer did not ask for.
@@ -362,7 +397,7 @@ extension SandboxEngineService {
 
         // `attachStderr` is true even when `tty` is set, and the tty rule is
         // NOT restated here. `startExec` sets `processConfig.terminal` and then
-        // sets stderr only when that is false (`ExecManager.swift:211`, `:231`),
+        // sets stderr only when that is false (`ExecManager.swift:276`, `:296`),
         // because a terminal merges stderr into stdout. Repeating the decision
         // here would put one gate in two places, which this project has
         // measured as removing the instrument rather than adding a defence:
@@ -411,21 +446,30 @@ extension SandboxEngineService {
 
         // **Unstructured, and only because the alternative cannot be made to
         // return.** `startExec` awaits `process.wait()`, which nothing bounds
-        // (`ExecManager.swift:265`; `LinuxProcess.wait` takes a timeout it is
+        // (`ExecManager.swift:329`; `LinuxProcess.wait` takes a timeout it is
         // not given). Under `async let` or a task group this scope must await
         // that child before it can exit, so a guest that never dies -- a wedged
         // VM, an unreachable agent, a kill that did not land -- would hold the
         // RPC handler open for the life of the engine, with the response stream
         // and the exec instance behind it. Abandoning a task is the only thing
-        // in structured concurrency that a hung child cannot veto, and the
-        // shutdown path below bounds the wait so this method always returns.
+        // in structured concurrency that a hung child cannot veto.
+        //
+        // **`completion` and not `execution.value` is what the shutdown path
+        // below waits on, and the difference is the whole of the bound.**
+        // Awaiting a `Task`'s value cannot be given up on -- see the note on
+        // `ExecCompletion` -- so a wait written that way returns only when the
+        // task it was bounding returns, which is the one case the bound exists
+        // for. `runProcess` fires this signal from the same `defer` that
+        // finishes `inbound`, so it means exactly "that task is over".
+        let completion = ExecCompletion()
         let execution = Task { [self] in
             try await runProcess(
                 execID: execID,
                 stdin: stdin,
                 stdout: stdout,
                 stderr: stderr,
-                inbound: inbound
+                inbound: inbound,
+                completion: completion
             )
         }
 
@@ -449,7 +493,7 @@ extension SandboxEngineService {
                 stdin.close()
             case .resize(let resize):
                 do {
-                    try await awaitingProcess(execID: execID) {
+                    try await Self.awaitingProcess(execManager, execID: execID) {
                         try await self.execManager.resizeExec(
                             execID: execID,
                             height: Int(resize.rows),
@@ -461,7 +505,7 @@ extension SandboxEngineService {
                 }
             case .signal(let number):
                 do {
-                    try await awaitingProcess(execID: execID) {
+                    try await Self.awaitingProcess(execManager, execID: execID) {
                         try await self.execManager.signalExec(execID: execID, signal: number)
                     }
                 } catch {
@@ -486,6 +530,44 @@ extension SandboxEngineService {
         }
         stdin.close()
 
+        // **The wait for the caller's own command happens BEFORE the teardown
+        // decision, and on `completion` rather than on `execution.value`.**
+        //
+        // A client reset does not reach this engine as a stream failure, and
+        // that is the whole of it. gascan's relay task breaks on its own
+        // cancellation and returns (`gascan-arca/src/backend.rs:263-266`),
+        // dropping the sender that feeds the request stream -- which arrives
+        // here as an ordinary end of input, so `inbound.failure` stays nil. The
+        // RST_STREAM that makes grpc-swift cancel the task running the handler
+        // comes later, once the transport's own relay notices its receiver is
+        // gone and drops the tonic stream (`gascan-arca/src/channel.rs:193`).
+        // So the dispatch loop above ended the way a half-close ends it,
+        // `clientReset` read at that moment was **false**, and the session went
+        // down the ordinary path into `await execution.value` -- the one wait
+        // in the language that cancellation cannot interrupt. The cancellation
+        // then landed on a task parked there for as long as the guest process
+        // lived, and the kill and the reap below were never reached at all.
+        //
+        // MEASURED against a real VM before this change: an exec of
+        // `sh -c "sleep 3600"` whose client dropped the session unread logged
+        // `Exec instance created`, `Starting exec instance`, `Exec instance
+        // started` and then nothing for that exec id -- no `Exec instance
+        // completed`, no `Deleting exec instance`, and none of this teardown's
+        // own diagnostics -- while the guest's process table still held
+        // `sleep 3600` thirty seconds later. Across that test region the engine
+        // started 58 execs and deleted 57.
+        //
+        // `ExecCompletion.wait()` returns on cancellation where `Task.value`
+        // does not (see the note on that type), so the wait is still unbounded
+        // for the caller's command -- a bound here would be the engine deciding
+        // how long a consumer's own process may take -- and abandonable the
+        // instant the consumer stops being there to receive its output. What
+        // was an `else` is now a decision taken after the wait, because the
+        // cancellation this path exists for arrives *during* it.
+        if violation == nil && inbound.failure == nil {
+            await completion.wait()
+        }
+
         let clientReset = inbound.failure != nil || Task.isCancelled
         var failure = violation
         if clientReset || violation != nil {
@@ -503,7 +585,12 @@ extension SandboxEngineService {
             // response stream. That is the shape the engine's own shutdown work
             // exists to prevent, so the guest gets a bounded chance to die and
             // then the session stops waiting on it.
-            if await Self.completes(execution, within: .seconds(10)) == false {
+            //
+            // All three of the calls this teardown makes to the guest are
+            // bounded, and none of them may be the one that is not: the kill
+            // above, this wait, and the reap below. A single unbounded one puts
+            // the whole method back where it started.
+            if await Self.finishes(completion, within: Self.guestTeardownBound) == false {
                 execution.cancel()
                 logger.error(
                     "exec did not end after being killed; abandoning the wait so the stream can close",
@@ -514,14 +601,18 @@ extension SandboxEngineService {
                     ?? engineError(
                         .commandIo,
                         resource: resource,
-                        message: "exec \(execID) did not end within 10s of being killed"
+                        message: "exec \(execID) did not end within "
+                            + "\(Self.guestTeardownBound) of being killed"
                     )
             }
         } else {
-            // The ordinary path, and deliberately unbounded: this is waiting
-            // for the command the caller asked to run, and a bound here would
-            // be the engine deciding how long a consumer's own process may
-            // take.
+            // The ordinary path, and the one place `execution.value` is still
+            // awaited -- for the error `runProcess` threw, which the completion
+            // signal does not carry. It cannot hang here the way it hung
+            // before: this line is reached only once `completion` has fired,
+            // and `runProcess` signals it from a `defer` that is the last thing
+            // its task does, so the task being awaited has already run every
+            // await it has.
             do {
                 try await execution.value
             } catch {
@@ -529,7 +620,9 @@ extension SandboxEngineService {
             }
         }
 
-        let info = await execManager.getExecInfo(execID: execID)
+        // Read before the reap, because the reap drops the instance the code is
+        // recorded on (`ExecManager.swift:516`).
+        let exitCode = await execManager.execExitCode(execID: execID)
         await reap(execID: execID, resource: resource)
 
         // A consumer that has reset the stream is told nothing, because there is
@@ -549,9 +642,9 @@ extension SandboxEngineService {
         if let failure {
             return outbound.send(Self.execFailed(failure))
         }
-        guard let code = info?.exitCode else {
+        guard let code = exitCode else {
             // Unreachable by construction -- `startExec` records the exit code
-            // before it returns (`ExecManager.swift:293`) and it returned
+            // before it returns (`ExecManager.swift:358`) and it returned
             // without throwing -- and reported rather than defaulted, because an
             // `Exit{code: 0}` invented here is a failing command reported as a
             // successful one.
@@ -593,16 +686,26 @@ extension SandboxEngineService {
     ///
     /// **`tty` is passed as nil so that `createExec`'s stored flag decides,
     /// once.** `startExec` reads `tty ?? execInfo.config.tty`
-    /// (`ExecManager.swift:211`), and two sources for one fact is how they come
+    /// (`ExecManager.swift:276`), and two sources for one fact is how they come
     /// to disagree.
+    ///
+    /// **`completion` is signalled from the same `defer`, and belongs there
+    /// rather than after the call.** A `defer` runs on the throwing exit and on
+    /// the cancelled one too, and those are precisely the exits a shutdown path
+    /// is waiting to hear about; a signal placed after `startExec` would fire on
+    /// the one exit that never needed bounding.
     private func runProcess(
         execID: String,
         stdin: ExecStdinRelay,
         stdout: ExecOutputWriter,
         stderr: ExecOutputWriter,
-        inbound: ExecClientRelay
+        inbound: ExecClientRelay,
+        completion: ExecCompletion
     ) async throws {
-        defer { inbound.finish() }
+        defer {
+            inbound.finish()
+            completion.signal()
+        }
         try await execManager.startExec(
             execID: execID,
             detach: false,
@@ -618,17 +721,17 @@ extension SandboxEngineService {
     ///
     /// **The race is real and it lands on the most ordinary thing a client
     /// does.** `createExec` records the exec with `process` nil
-    /// (`ExecManager.swift:155`) and `startExec` fills it in only after a round
-    /// trip to the guest agent (`:245-255`), while this session starts
+    /// (`ExecManager.swift:220`) and `startExec` fills it in only after a round
+    /// trip to the guest agent (`:310-320`), while this session starts
     /// dispatching client frames immediately. A `signal` frame inside that
     /// window reaches `signalExec`, which throws `execNotStarted`
-    /// (`:399-401`) -- so an interactive consumer that opens a shell and sends
+    /// (`:483-485`) -- so an interactive consumer that opens a shell and sends
     /// Ctrl-C in the first tens of milliseconds had its exec refused before the
     /// shell ever ran.
     ///
     /// **Waiting rather than ignoring, and that distinction is Task 4's
     /// ruling.** `resizeExec` tolerates the same race by returning silently
-    /// (`:325-328`), which is right for a window size and wrong for a signal:
+    /// (`:409-412`), which is right for a window size and wrong for a signal:
     /// "a signal that goes nowhere while the caller is told nothing is
     /// precisely this project's recurring defect". So the signal is neither
     /// dropped nor fatal -- it is held for as long as starting can reasonably
@@ -638,9 +741,15 @@ extension SandboxEngineService {
     /// said, and the guest keeps the default terminal size.
     ///
     /// **Polling, and it is a trade rather than an oversight.** The alternative
-    /// is a readiness signal on `ExecManager`, which is shared with Arca's
+    /// is a readiness *signal* on `ExecManager`, which is shared with Arca's
     /// Docker surface -- a second consumer for a seam only this one needs.
-    /// `getExecInfo` is already public and already answers the exact question.
+    /// `execProcessStarted` is already there and already answers the exact
+    /// question.
+    ///
+    /// **Static, and taking its exec manager, because `forceKill` calls it from
+    /// inside a detached closure.** That closure must not capture `self`; the
+    /// exec manager is `Sendable` and the exec id is a `String`, and those are
+    /// everything this needs.
     ///
     /// The bound is 2 seconds: long against a guest round trip, short enough
     /// that a `startExec` which threw -- and so will never record a process --
@@ -650,7 +759,7 @@ extension SandboxEngineService {
     /// `act` and waited only if it threw `execNotStarted` -- which works for
     /// `signalExec`, because that throws, and does nothing whatsoever for
     /// `resizeExec`, which **returns silently** in exactly the same situation
-    /// (`ExecManager.swift:325-328`). So a resize sent before the process
+    /// (`ExecManager.swift:409-412`). So a resize sent before the process
     /// existed was still dropped with nothing said, and the wrapper only looked
     /// as though it covered both.
     ///
@@ -660,12 +769,13 @@ extension SandboxEngineService {
     /// trap never fired. The same test with a readiness handshake in front of
     /// the resize passed, which is what proved the instrument sound and the
     /// window real rather than the trap being broken.
-    private func awaitingProcess(
+    private static func awaitingProcess(
+        _ execManager: any ExecInstanceSource,
         execID: String,
         _ act: () async throws -> Void
     ) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-        while await execManager.getExecInfo(execID: execID)?.process == nil {
+        while await execManager.execProcessStarted(execID: execID) == false {
             if ContinuousClock.now >= deadline {
                 break
             }
@@ -674,65 +784,167 @@ extension SandboxEngineService {
         try await act()
     }
 
-    /// Whether `task` finished inside `bound`, without cancelling it if it did
-    /// not.
+    /// How long the session waits on the guest at each of the three points its
+    /// teardown touches it: the kill, the process's own exit, and the reap.
     ///
-    /// Structured concurrency has no way to stop waiting on a child, which is
-    /// why `execution` is an unstructured task and why this is written by
-    /// racing two of them.
-    private static func completes(_ task: Task<Void, Error>, within bound: Duration) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                _ = try? await task.value
-                return true
-            }
-            group.addTask {
-                try? await Task.sleep(for: bound)
-                return false
-            }
-            let finished = await group.next() ?? false
-            group.cancelAll()
-            return finished
-        }
-    }
+    /// One constant rather than three because there is one reason -- a guest
+    /// agent that has not answered in ten seconds is not going to -- and because
+    /// the worst case a reader has to hold in their head is then three times
+    /// this rather than the sum of three unrelated numbers.
+    private static let guestTeardownBound: Duration = .seconds(10)
 
-    /// SIGKILL to the exec's process, whatever this task's own state.
+    /// Whether `signal` fired inside `bound`.
     ///
-    /// Detached because both callers reach it on paths where this task may
-    /// already be cancelled -- a client reset -- and a cancelled task cannot be
-    /// relied on to complete an RPC to the guest agent. The whole point of the
-    /// path is that the guest process must not outlive the stream that started
-    /// it, so the work has to be somewhere cancellation does not reach.
+    /// The two arms race and the loser is cancelled, which works only because
+    /// **both arms are cancellation-aware**: `Task.sleep` throws and
+    /// `ExecCompletion.wait` returns. `withTaskGroup` drains every child before
+    /// it returns, so an arm that ignored cancellation would hold this function
+    /// open for exactly as long as the work it was bounding -- which is what an
+    /// arm written as `await task.value` does, and what the note on
+    /// `ExecCompletion` records.
     ///
-    /// A failure is logged and not raised. It is a best effort by construction:
-    /// the process may have exited between the decision and the signal, in which
-    /// case `signalExec` throws `execNotStarted` or the guest reports no such
-    /// process, and neither is a fact the consumer asked about.
-    private func forceKill(execID: String, resource: String) async {
-        let logger = self.logger
-        let execManager = self.execManager
+    /// **The race runs detached, and `Task.value` is awaited on purpose -- the
+    /// one place in this file where that wait's immunity to cancellation is the
+    /// property being bought.** Every caller of this function is on the
+    /// teardown path, and the teardown path's defining case is a task that is
+    /// *already cancelled*: a client reset cancels the handler. Run in the
+    /// calling task, both arms would then return at once -- the sleep by
+    /// throwing and `wait()` by returning -- and `wait()` winning means this
+    /// reports `true`, "the guest answered", when nothing answered. Every bound
+    /// the previous round added would collapse to zero on the only path they
+    /// exist for: `forceKill` would report a kill nobody acknowledged, the wait
+    /// for the process would report an exit that never happened, and the reap
+    /// would be issued to the guest agent while the kill was still in flight,
+    /// all three silently. Detached, the bound is a real `bound` and the answer
+    /// is a real answer; the cost is that a cancelled teardown may take up to
+    /// three times `guestTeardownBound` to unwind, which is the worst case the
+    /// note on that constant already states.
+    private static func finishes(_ signal: ExecCompletion, within bound: Duration) async -> Bool {
         await Task.detached {
-            do {
-                try await execManager.signalExec(
-                    execID: execID, signal: Signal.Linux.kill.rawValue)
-            } catch {
-                logger.info(
-                    "exec could not be killed; it may already have exited",
-                    metadata: [
-                        "exec_id": "\(execID)",
-                        "container": "\(resource)",
-                        "error": "\(error)",
-                    ])
+            await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    await signal.wait()
+                    return true
+                }
+                group.addTask {
+                    try? await Task.sleep(for: bound)
+                    return false
+                }
+                let finished = await group.next() ?? false
+                group.cancelAll()
+                return finished
             }
         }.value
     }
 
+    /// Runs `work` detached, and waits at most `bound` for it. False when the
+    /// bound expired first.
+    ///
+    /// **Detached and bounded are two requirements, not one, and the second was
+    /// missing.** Detached, because both callers reach this on paths where the
+    /// calling task may already be cancelled -- a client reset -- and a
+    /// cancelled task cannot be relied on to complete an RPC to the guest agent.
+    /// Bounded, because the RPC it completes is a ttrpc call over vsock with no
+    /// timeout of its own: `signalExec` reaches `agent.signalProcess` and
+    /// `deleteExec` reaches `agent.deleteProcess`, and a guest that has stopped
+    /// answering does not answer either. `await Task.detached { }.value` is no
+    /// more cancellation-aware than any other `Task.value`, so on its own it is
+    /// the unbounded wait the detachment was supposed to survive.
+    ///
+    /// On expiry the task is abandoned rather than cancelled, for the reason it
+    /// was detached in the first place: the guest still ought to be killed, and
+    /// cancelling is how that stops happening.
+    private static func detached(
+        within bound: Duration,
+        _ work: @escaping @Sendable () async -> Void
+    ) async -> Bool {
+        let done = ExecCompletion()
+        Task.detached {
+            defer { done.signal() }
+            await work()
+        }
+        return await finishes(done, within: bound)
+    }
+
+    /// SIGKILL to the exec's process, once there is a process to send it to.
+    ///
+    /// **The readiness wait is the difference between killing the process and
+    /// losing it, and it is inside the detached closure because that is the only
+    /// place cancellation does not reach.** `createExec` records the exec with
+    /// `process` nil (`ExecManager.swift:220`) and `startExec` fills it in only
+    /// after a round trip to the guest agent (`:310-320`). A violation or a
+    /// client reset inside that window reaches `signalExec` while `process` is
+    /// still nil, and nothing in `ExecManager` ever clears `process` once set
+    /// (`:316` assigns it and no line anywhere unassigns it), so
+    /// `execNotStarted` from here means that and only that: **the kill arrived
+    /// before the process existed** -- which is exactly when it is mandatory,
+    /// because the guest goes on to start a process nothing then owns. It is the
+    /// same window `awaitingProcess` closes for `resize` and `signal`, and it is
+    /// closed here the same way.
+    ///
+    /// **The two failures are logged apart, because after that wait they mean
+    /// opposite things.** `execNotStarted` is a real failure and this engine's
+    /// own: the process has still not appeared, so this kill went nowhere and a
+    /// guest process may outlive the stream that started it. Anything else came
+    /// back from the agent, which is what an already-exited process looks like
+    /// from here, and that stays the best effort it always was.
+    private func forceKill(execID: String, resource: String) async {
+        let logger = self.logger
+        let execManager = self.execManager
+        let answered = await Self.detached(within: Self.guestTeardownBound) {
+            do {
+                try await Self.awaitingProcess(execManager, execID: execID) {
+                    try await execManager.signalExec(
+                        execID: execID, signal: Signal.Linux.kill.rawValue)
+                }
+            } catch {
+                if case .some(.execNotStarted) = error as? ExecManagerError {
+                    logger.error(
+                        "exec still had no process to kill; anything the guest starts is unowned",
+                        metadata: [
+                            "exec_id": "\(execID)",
+                            "container": "\(resource)",
+                        ])
+                } else {
+                    logger.info(
+                        "exec could not be killed; it may already have exited",
+                        metadata: [
+                            "exec_id": "\(execID)",
+                            "container": "\(resource)",
+                            "error": "\(error)",
+                        ])
+                }
+            }
+        }
+        if answered == false {
+            logger.error(
+                "the kill did not come back from the guest; abandoning it so the stream can close",
+                metadata: ["exec_id": "\(execID)", "container": "\(resource)"]
+            )
+        }
+    }
+
     /// Drops the exec instance, so `execInstances` does not grow by one per
-    /// exec for the life of the process. Detached for `forceKill`'s reason.
+    /// exec for the life of the process. Detached and bounded for `forceKill`'s
+    /// reasons, both of them.
+    ///
+    /// **The bound matters most on the path that reaches here after a kill that
+    /// did not land.** `deleteExec` calls `process.delete()`
+    /// (`ExecManager.swift:505-507`), which is another ttrpc call to the same
+    /// guest agent that has just failed to answer a SIGKILL -- so on the
+    /// `clientReset` and `violation` paths, where `startExec` never reached its
+    /// own `process.delete()`, this is a real round trip and an unbounded one
+    /// would hang the session here having bounded everything before it.
+    ///
+    /// It stays cheap on the success path: `startExec` has already run
+    /// `process.delete()` (`:363`) and `_delete()` memoises on a stored
+    /// `deletionTask` (`LinuxProcess.swift:425-439`), so the bound is never
+    /// approached and all
+    /// this adds is the detached task the method already created.
     private func reap(execID: String, resource: String) async {
         let logger = self.logger
         let execManager = self.execManager
-        await Task.detached {
+        let answered = await Self.detached(within: Self.guestTeardownBound) {
             do {
                 try await execManager.deleteExec(execID: execID)
             } catch {
@@ -744,7 +956,13 @@ extension SandboxEngineService {
                         "error": "\(error)",
                     ])
             }
-        }.value
+        }
+        if answered == false {
+            logger.error(
+                "the reap did not come back from the guest; the exec instance stays until it does",
+                metadata: ["exec_id": "\(execID)", "container": "\(resource)"]
+            )
+        }
     }
 
     /// The failure arm of an `ExecServerFrame`, in one place, for `ackFailed`'s

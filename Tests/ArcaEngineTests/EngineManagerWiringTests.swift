@@ -155,7 +155,7 @@ final class EngineManagerWiringTests: XCTestCase {
     ///
     /// `ExecManager.init` used to take a concrete `ContainerManager`, so wiring
     /// it to anything else was a compile error and no test was needed. It now
-    /// takes `any ExecContainerSource` (`ExecManager.swift:99`) so that
+    /// takes `any ExecContainerSource` (`ExecManager.swift:164`) so that
     /// `signalExec`'s guards are reachable without a VM. That trade bought
     /// testability by giving up a compile-time guarantee, and this test is what
     /// replaces it -- the third line of engine wiring nothing else asserts.
@@ -165,7 +165,7 @@ final class EngineManagerWiringTests: XCTestCase {
     /// what an `ExecManager` returns when its source holds no row for this id --
     /// which is what every mis-wiring reachable by construction produces, since a
     /// source that is not the engine's `ContainerManager` does not have the
-    /// engine's rows. `containerNotRunning` (`ExecManager.swift:132`) means the
+    /// engine's rows. `containerNotRunning` (`ExecManager.swift:197`) means the
     /// lookup came back with a state at all, so it crossed the wiring. A test
     /// asserting merely "createExec threw" would pass in both worlds, which is
     /// the failure mode this suite exists to avoid.

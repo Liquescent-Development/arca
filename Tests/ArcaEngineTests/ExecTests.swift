@@ -12,9 +12,9 @@ import XCTest
 ///
 /// **What this suite covers is deliberately less than `Exec`, and saying so
 /// precisely is half the work.** `startExec` needs a native container instance
-/// (`ExecManager.swift:197-199`) and no VM-free path can produce one -- nor can
+/// (`ExecManager.swift:262-264`) and no VM-free path can produce one -- nor can
 /// one put a container into state `running`, which `createExec` demands
-/// (`:132`, measured in the note on `ExecContainerSource`). So everything below
+/// (`ExecManager.swift:197`, measured in the note on `ExecContainerSource`). So everything below
 /// stops at or before `createExec`. **Nothing here says a byte ever reached a
 /// guest, that stdin was ever read, that a signal was ever delivered, or that
 /// `tty` merges stderr into stdout.** Those are gascan's live `exec.rs`, and the
@@ -52,7 +52,7 @@ final class ExecTests: XCTestCase {
     /// because the obvious implementation of that method is wrong.**
     ///
     /// `startExec` closes stdout and then stderr after the process exits
-    /// (`ExecManager.swift:269-289`), and the two writers share one relay. A
+    /// (`ExecManager.swift:334-354`), and the two writers share one relay. A
     /// `close()` that finished the relay -- which is what a `Writer` is normally
     /// for -- would end the response stream at the first close, dropping
     /// whatever the other stream had still to say and, after it, the `Exit`
@@ -405,24 +405,15 @@ final class ExecTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private static let logger = Logger(label: "arca-engine-exec-tests")
-    private static let dockerID = String(repeating: "a", count: 64)
-    private static let sandboxID = "exec-a1b2c3d4e5f6"
-    private static let image = "ghcr.io/liquescent-development/gascan/workspace@sha256:"
-        + String(repeating: "1", count: 64)
-
-    private static let ownerLabels = Arca_Engine_V1_OwnerLabels.with {
-        $0.managedBy = "gascan"
-        $0.sandboxID = sandboxID
-    }
+    /// The container, the ids and the opening frame live in `ExecFixtures`,
+    /// because `ExecTeardownTests` drives the same engine and the same seeded
+    /// container one method further in.
+    private static let dockerID = ExecFixtures.dockerID
+    private static let sandboxID = ExecFixtures.sandboxID
+    private static let ownerLabels = ExecFixtures.ownerLabels
 
     private static func start(sandboxID: String) -> Arca_Engine_V1_ExecClientFrame {
-        Arca_Engine_V1_ExecClientFrame.with { frame in
-            frame.start = Arca_Engine_V1_ExecStart.with { start in
-                start.sandboxID = sandboxID
-                start.argv = [Data("/bin/sh".utf8)]
-            }
-        }
+        ExecFixtures.start(sandboxID: sandboxID)
     }
 
     /// Every frame a relay holds, once it has been finished.
@@ -474,51 +465,13 @@ final class ExecTests: XCTestCase {
         return error
     }
 
-    /// The engine's own managers over a throwaway state root, as `LogsTests` and
-    /// `InspectTests` build them and for their reason: this is the factory
-    /// `arca-engine` calls, so what these tests drive is what it serves.
     private static func managers() throws -> EngineManagers {
-        try EngineManagers(
-            stateRoot: URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("arca-exec-tests-\(UUID().uuidString)"),
-            kernelPath: URL(fileURLWithPath: "/opt/arca/vmlinux"),
-            logLevel: "info",
-            logger: logger
-        )
+        try ExecFixtures.managers()
     }
 
-    /// One container row through `StateStore` and then `loadPersistedState()`,
-    /// which is the restore path the engine itself runs.
     private static func seed(
         _ managers: EngineManagers, labels: [String: String]
     ) async throws {
-        try await managers.stateStore.saveContainer(
-            id: dockerID,
-            name: sandboxID,
-            image: image,
-            imageID: "sha256:probe",
-            createdAt: Date(),
-            status: "created",
-            running: false,
-            paused: false,
-            restarting: false,
-            pid: 0,
-            exitCode: 0,
-            startedAt: nil,
-            finishedAt: Date(),
-            stoppedByUser: false,
-            entrypoint: nil,
-            configJSON: String(
-                decoding: try JSONEncoder().encode(
-                    ContainerConfiguration(image: image, labels: labels)
-                ),
-                as: UTF8.self
-            ),
-            hostConfigJSON: String(
-                decoding: try JSONEncoder().encode(HostConfig(portBindings: [:])),
-                as: UTF8.self
-            )
-        )
-        try await managers.containerManager.loadPersistedState()
+        try await ExecFixtures.seed(managers, labels: labels)
     }
 }

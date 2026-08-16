@@ -58,6 +58,71 @@ package protocol ExecContainerSource: Sendable {
 
 extension ContainerManager: ExecContainerSource {}
 
+/// Everything an exec session drives, and nothing else: creating an instance,
+/// running it, acting on the process behind it, and the two questions the
+/// session asks about its state.
+///
+/// **It exists for `ExecContainerSource`'s reason, one level up.** That seam
+/// made `ExecManager`'s own guards reachable without a VM. It cannot make
+/// `SandboxEngineService.runSession` reachable, because everything that session
+/// has to get right on teardown happens after `startExec` has a `LinuxProcess`,
+/// and a `LinuxProcess` comes from `LinuxContainer.exec` (`:310` below).
+/// `LinuxContainer` is `final` and vends processes only out of its `started`
+/// state (`LinuxContainer.swift:1087`), which is reached by booting a virtual
+/// machine. So against the concrete actor, `execInfo.process` is nil in every
+/// VM-free test that can ever be written, `startExec` returns as soon as it
+/// finds no native container, and the one situation the teardown exists for --
+/// a guest that does not answer -- cannot be staged at all.
+///
+/// That is not an abstract gap. The session's teardown shipped three defects
+/// that no test in this repository could see, each of them an `Exec` RPC that
+/// never returns, and each needing an exec manager that can be told to hang.
+/// `ExecTeardownTests` is what the seam bought; every measurement recorded there
+/// reverts one defect and fails exactly the one test written for it.
+///
+/// **The two reads are narrower than `getExecInfo` deliberately.** An `ExecInfo`
+/// carries a `LinuxProcess?`, so a protocol vending one could only be
+/// implemented by something holding a real guest process -- the very thing no
+/// test has. The session asks an exec's state two questions, and those two are
+/// what this vends.
+///
+/// `package` rather than `public`, named for what it supplies rather than for
+/// the type that supplies it, following `ExecContainerSource` above.
+package protocol ExecInstanceSource: Sendable {
+    func createExec(
+        containerID: String,
+        cmd: [String],
+        env: [String]?,
+        workingDir: String?,
+        user: String?,
+        tty: Bool,
+        attachStdin: Bool,
+        attachStdout: Bool,
+        attachStderr: Bool
+    ) async throws -> String
+
+    func startExec(
+        execID: String,
+        detach: Bool,
+        tty: Bool?,
+        stdin: ReaderStream?,
+        stdout: Writer?,
+        stderr: Writer?
+    ) async throws
+
+    func resizeExec(execID: String, height: Int?, width: Int?) async throws
+    func signalExec(execID: String, signal: Int32) async throws
+    func deleteExec(execID: String) async throws
+
+    /// Whether `startExec` has recorded this exec's guest process yet.
+    func execProcessStarted(execID: String) async -> Bool
+
+    /// The exit code `startExec` recorded, or nil if it recorded none.
+    func execExitCode(execID: String) async -> Int?
+}
+
+extension ExecManager: ExecInstanceSource {}
+
 /// Manages exec instances for running containers
 public actor ExecManager {
     private let containerManager: any ExecContainerSource
@@ -307,6 +372,25 @@ public actor ExecManager {
     /// Get exec instance info
     public func getExecInfo(execID: String) -> ExecInfo? {
         return execInstances[execID]
+    }
+
+    /// Whether `startExec` has reached `:316` for this exec and recorded its
+    /// process.
+    ///
+    /// The one fact `signalExec`'s and `resizeExec`'s start-window guards turn
+    /// on, answered on its own so that a caller waiting for the window to close
+    /// does not have to hold an `ExecInfo` -- and so that
+    /// `ExecInstanceSource` can vend it without vending a `LinuxProcess`.
+    /// **Never reset:** nothing clears `process` once set, so a false here means
+    /// the process has not started, never that it has finished.
+    public func execProcessStarted(execID: String) -> Bool {
+        execInstances[execID]?.process != nil
+    }
+
+    /// The exit code `startExec` recorded at `:358`, or nil for an exec that has
+    /// not got that far.
+    public func execExitCode(execID: String) -> Int? {
+        execInstances[execID]?.exitCode
     }
 
     /// Resize the TTY for an exec instance

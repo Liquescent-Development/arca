@@ -197,6 +197,17 @@ public struct EngineManagers: Sendable {
     /// six arguments spelt out twice is six chances for the command and the
     /// tests to hand the service different managers.
     public func makeService() -> SandboxEngineService {
+        makeService(execManager: execManager)
+    }
+
+    /// The same service with the exec manager substituted, which is how
+    /// `ExecTeardownTests` stages a guest that does not answer.
+    ///
+    /// An overload rather than a defaulted parameter on the method above,
+    /// because `ExecInstanceSource` is `package` and that method is `public`.
+    /// The public one delegates here so there is still one place the six
+    /// arguments are spelt out.
+    package func makeService(execManager: any ExecInstanceSource) -> SandboxEngineService {
         SandboxEngineService(
             containerManager: containerManager,
             volumeManager: volumeManager,
