@@ -198,14 +198,21 @@ final class LayerCacheRoleTests: XCTestCase {
     /// either way, so nothing but the file's identity separates discard-and-rebuild from
     /// reformat-in-place.
     ///
-    /// **Each of the three is measured against its opposite by
-    /// `testUnpackingOverALabelledCacheEntryLeavesItAlone`, which runs the same three readings
-    /// over an entry that is reused and gets the other answer to every one** -- on unmutated
-    /// code, in the same run. That is what says these assertions can distinguish anything.
+    /// The content is asserted as BYTES and not as filenames, which is the same finding a third
+    /// time and one level further down. MEASURED by a reviewer: emptying the fixture entry while
+    /// leaving the entry itself in place -- a layer with the label, the right filenames, a fresh
+    /// inode, 2GB of size and none of the image's data -- left this file at 8 tests, 0 failures.
+    ///
+    /// **The CONTENT and the INODE are each measured against their opposite by
+    /// `testUnpackingOverALabelledCacheEntryLeavesItAlone`, which takes the same readings over
+    /// an entry that is reused and gets the other answer to both** -- on unmutated code, in the
+    /// same run. That is what says those two readings can distinguish anything. **The LABEL is
+    /// not among them**: a reused entry keeps `.overlayLayer`, so there is no opposite answer to
+    /// get, and the label is pinned absolutely rather than differentially. Its receipt is the
+    /// maintainer's `if true || …` mutation instead, which fails this test and only this test.
     func testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt() async throws {
-        let image = try await loadedImage(
-            reference: "stale-cache-probe:latest", payload: "the layer this test unpacks"
-        )
+        let payload = "the layer this test unpacks"
+        let image = try await loadedImage(reference: "stale-cache-probe:latest", payload: payload)
         let platform = SystemPlatform.linuxArm.ociPlatform()
         // Awaited into a local first: `XCTUnwrap` takes an autoclosure, which
         // cannot carry the `await`.
@@ -257,6 +264,11 @@ final class LayerCacheRoleTests: XCTestCase {
             empty filesystem instead of by reusing a stale one.
             """
         )
+        XCTAssertEqual(
+            try sizeOfEntry(named: "/payload", inImageAt: seeded), Int64(payload.utf8.count),
+            "the rebuilt entry must hold the image's layer BYTES, not merely a file bearing its "
+                + "name: an entry present and empty is the same absence one level down"
+        )
         XCTAssertNotEqual(
             try inodeOfFile(at: seeded), seededInode,
             "the stale entry must be DISCARDED and rebuilt, not reformatted in place: the label "
@@ -282,10 +294,12 @@ final class LayerCacheRoleTests: XCTestCase {
     /// cache-hit branch unreachable fails this test and only this test.
     ///
     /// **It also reads the content and the inode, and that is the half that is not about this
-    /// test at all.** The test above asserts a rebuilt entry gains `/payload` and changes inode;
-    /// this one asserts a reused entry does neither. Two readings, two opposite answers, one
-    /// run, no mutation -- which is what makes those assertions demonstrably able to tell the
-    /// two outcomes apart rather than merely able to pass.
+    /// test at all.** The test above asserts a rebuilt entry gains `/payload` holding the
+    /// image's bytes, and changes inode; this one asserts a reused entry does neither. Two
+    /// readings, two opposite answers, one run, no mutation -- which is what makes those
+    /// assertions demonstrably able to tell the two outcomes apart rather than merely able to
+    /// pass. The LABEL is deliberately not among them: a reused entry keeps `.overlayLayer`, so
+    /// there is no opposite answer for this test to get.
     func testUnpackingOverALabelledCacheEntryLeavesItAlone() async throws {
         let image = try await loadedImage(
             reference: "fresh-cache-probe:latest", payload: "the layer this test does not unpack"
@@ -379,18 +393,32 @@ final class LayerCacheRoleTests: XCTestCase {
         )
     }
 
-    /// Every path inside the ext4 image at `path`, sorted.
+    /// Every entry inside the ext4 image at `path`.
     ///
     /// This is what separates a layer that holds its image from one that merely carries its
     /// label. The two are indistinguishable to every other reading here -- same path, same
-    /// label, same size -- and the second is a container booting on a rootfs built from none of
-    /// its image, with `Start` succeeding.
-    private func pathsIn(imageAt path: URL) throws -> [String] {
+    /// label, same size on disk -- and the second is a container booting on a rootfs built from
+    /// none of its image, with `Start` succeeding.
+    private func entriesIn(imageAt path: URL) throws -> [EXT4.FilesystemEnumerator.FileInfo] {
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(path.path))
-        return try EXT4.FilesystemEnumerator(reader: reader)
-            .enumerateFilesystem()
-            .map(\.path)
-            .sorted()
+        return try EXT4.FilesystemEnumerator(reader: reader).enumerateFilesystem()
+    }
+
+    /// The image's structure: which entries exist, sorted.
+    private func pathsIn(imageAt path: URL) throws -> [String] {
+        try entriesIn(imageAt: path).map(\.path).sorted()
+    }
+
+    /// The image's content: how many bytes one named entry actually holds.
+    ///
+    /// Asked separately from `pathsIn` because they are separate properties, and a reviewer
+    /// measured that the difference matters: an entry that exists and holds nothing satisfies
+    /// every structural reading while carrying none of the image.
+    private func sizeOfEntry(named name: String, inImageAt path: URL) throws -> Int64 {
+        try XCTUnwrap(
+            try entriesIn(imageAt: path).first { $0.path == name }?.size,
+            "the image must hold an entry at \(name)"
+        )
     }
 
     /// A path holding no filesystem at all answers `nil` rather than throwing.

@@ -43,8 +43,10 @@ enum OCILayoutFixture {
         // load to a different digest" -- vacuous: it passed for two layouts
         // holding identical payloads, so it could not tell "the vminit changed"
         // from "the fixture was written twice".
-        // MEASURED both ways: four writes of one payload give four distinct
-        // `index.json` digests without this line and one with it.
+        // MEASURED with this line deleted: 500 writes of one payload gave 13
+        // distinct layouts, one of them 57% of the time. `OCILayoutFixtureTests`
+        // is the guard, and that distribution is why it takes 32 samples rather
+        // than 2 -- at 2 it missed the regression about 40% of the time.
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let layer = try writeBlob(
@@ -104,12 +106,21 @@ enum OCILayoutFixture {
     ///
     /// Uncompressed, with every entry field fixed, so the bytes are a function
     /// of `payload` alone. libarchive's gzip filter stamps the current time into
-    /// its header: MEASURED by a reviewer, two archives of byte-identical input
-    /// under `filter: .gzip` hash to `2716afac6428…` and `3c556546a081…`, while
-    /// under `filter: .none` both hash to `8d8ebad7804a…`. **That was one of two
-    /// nondeterminism sources and closing it alone was not enough** -- see the
-    /// `.sortedKeys` note in `write(at:reference:payload:)` for the other, which
-    /// left the layout nondeterministic until this same round.
+    /// its header. MEASURED against the entry exactly as built below, two writes
+    /// a second apart: under `filter: .gzip` they hash to `8982bec5474d…` and
+    /// `1bd8b529ffa4…`, under `filter: .none` both to `331693e76444…` -- which
+    /// is reproducible from here, being the layer blob's own filename in a
+    /// layout written with `payload: "the layer this test unpacks"`.
+    ///
+    /// **The stamp has one-second resolution, so this would have been an
+    /// intermittent flake rather than a constant one**: two gzip writes inside
+    /// the same second hash identically (measured, `282a67e774c6…` twice), which
+    /// is why nothing ever caught it.
+    ///
+    /// **It was one of two nondeterminism sources and closing it alone was not
+    /// enough** -- see the `.sortedKeys` note in `write(at:reference:payload:)`
+    /// for the other, which left the layout nondeterministic until the same
+    /// round that added `OCILayoutFixtureTests`.
     ///
     /// `MediaTypes.imageLayer` is then honest twice over: the unpacker reads the
     /// media type to pick its decompressor, and an uncompressed layer's digest
