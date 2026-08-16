@@ -493,20 +493,21 @@ final class LogsTests: XCTestCase {
     /// handler that passed its own would satisfy every other test in this file,
     /// because every other log here fits in one frame either way.
     ///
-    /// Two and a half frames' worth of payload: enough that both the count and
-    /// the sizes are decided by the limit, and small enough to stay fast.
+    /// **The fixture is a literal and does not move with the constant.** It was
+    /// `chunkByteLimit * 5 / 2`, which made the test circular: at
+    /// `chunkByteLimit = 7` the line count computed to **zero**, the log was
+    /// empty, the expected frame count computed to zero, and every assertion
+    /// held vacuously -- the test was not among the failures of that mutation.
+    /// A test that sizes its input from the thing it is pinning cannot catch a
+    /// change to it. 160KiB is fixed here and the bounds test above keeps
+    /// `chunkByteLimit` under a quarter of it, so there are always at least two
+    /// frames.
     func testTheHandlerCutsAnOrdinaryLogOnTheShippedLimit() async throws {
         let managers = try Self.managers()
         try await Self.seed(managers, labels: SandboxIdentity.labels(from: Self.ownerLabels))
         let (stdout, _) = try managers.containerManager.logManager
             .createLogWriters(dockerID: Self.dockerID)
-
-        let line = String(repeating: "x", count: 99) + "\n"
-        let lineCount = (LogReader.chunkByteLimit * 5 / 2) / line.utf8.count
-        for _ in 0..<lineCount {
-            try stdout.write(Data(line.utf8))
-        }
-        let written = lineCount * line.utf8.count
+        let written = try Self.writeFixedLog(to: stdout)
 
         let frames = try await Self.frames(
             managers.makeService(),
@@ -514,6 +515,11 @@ final class LogsTests: XCTestCase {
         )
         let sizes = try Self.dataSizes(frames)
 
+        XCTAssertGreaterThanOrEqual(
+            sizes.count, 2,
+            "a \(written)-byte log must be more than one frame at any limit the bounds "
+                + "test permits; a single frame means the handler cut on something else"
+        )
         XCTAssertEqual(
             sizes.count,
             written / LogReader.chunkByteLimit + (written % LogReader.chunkByteLimit == 0 ? 0 : 1),
@@ -551,10 +557,7 @@ final class LogsTests: XCTestCase {
         let (stdout, _) = try managers.containerManager.logManager
             .createLogWriters(dockerID: Self.dockerID)
 
-        let line = String(repeating: "x", count: 99) + "\n"
-        for _ in 0..<((LogReader.chunkByteLimit * 3 / 2) / line.utf8.count) {
-            try stdout.write(Data(line.utf8))
-        }
+        _ = try Self.writeFixedLog(to: stdout)
         let paths = try XCTUnwrap(
             managers.containerManager.logManager.getLogPaths(dockerID: Self.dockerID)
         )
@@ -618,6 +621,110 @@ final class LogsTests: XCTestCase {
             XCTFail("the sink's own error must arrive unchanged, not as \(error)")
         }
         XCTAssertEqual(delivered, 1, "the sink must not be called again after it failed")
+    }
+
+    /// **A file with no line terminator is refused at the cap, not after the
+    /// whole of it is in memory.**
+    ///
+    /// The class comment claimed peak memory was constant in the log's size. It
+    /// was not: MEASURED by review, a 512KiB file containing no `0x0A` byte
+    /// accumulated all eight read windows into the carry before the decode
+    /// failed, so the real bound was the longest run without a terminator --
+    /// the whole file, for a file that is not a log. That is not a hypothetical
+    /// input for this reader in particular: it throws on an unreadable line
+    /// precisely because it exists to notice a truncated or foreign file, and a
+    /// foreign file is the one with no terminators.
+    ///
+    /// The bound is a constant now because `maxEntryBytes` makes it one. What
+    /// this test cannot see is the memory itself -- it asserts the refusal and
+    /// its message, and the bound follows from the refusal happening at the cap
+    /// rather than at the end of the file.
+    func testAFileWithNoTerminatorIsRefusedAtTheCapRatherThanHeldWhole() async throws {
+        let root = Self.throwawayRoot()
+        let combinedPath = root.appendingPathComponent("combined.log")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        // One byte past the cap, so the refusal is the cap's and not the
+        // decode's, and no `0x0A` anywhere.
+        try Data(repeating: UInt8(ascii: "x"), count: LogReader.maxEntryBytes + 1)
+            .write(to: combinedPath)
+
+        do {
+            _ = try await Self.read(combinedPath)
+            XCTFail("a file with no terminator must be refused")
+        } catch let error as LogReaderError {
+            guard case .entryTooLong(_, let limit) = error else {
+                return XCTFail("expected entryTooLong, got \(error)")
+            }
+            XCTAssertEqual(limit, LogReader.maxEntryBytes)
+            XCTAssertTrue(
+                error.description.contains("\(LogReader.maxEntryBytes)"),
+                "the message must name the limit: \(error.description)"
+            )
+        }
+    }
+
+    /// **An unreadable line's error message is bounded, whatever the line is.**
+    ///
+    /// MEASURED while running the mutation that removes the cap above: a 4MiB
+    /// line with no terminator produced a **4MiB error message**, because the
+    /// whole line went into `unreadableEntry`, out through
+    /// `engineErrorCatching(.commandIo)` into `EngineError.message`, and onto
+    /// the wire. A diagnostic the size of the thing it diagnoses is a second
+    /// failure on top of the first.
+    ///
+    /// Asserted against a corrupt line the cap does not catch, because the two
+    /// bounds are independent: the cap stops a file with no terminators, and
+    /// this stops a long line that *is* terminated and still will not parse.
+    func testAnUnreadableLinesErrorMessageIsBoundedHoweverLongTheLineIs() async throws {
+        let root = Self.throwawayRoot()
+        let combinedPath = root.appendingPathComponent("combined.log")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var corrupt = Data(repeating: UInt8(ascii: "x"), count: 300_000)
+        corrupt.append(UInt8(ascii: "\n"))
+        try corrupt.write(to: combinedPath)
+
+        do {
+            _ = try await Self.read(combinedPath)
+            XCTFail("a line that is not an entry must be refused")
+        } catch {
+            let message = "\(error)"
+            XCTAssertLessThan(
+                message.count, 2_000,
+                "the message must not carry the line; it was \(message.count) characters"
+            )
+            XCTAssertTrue(
+                message.contains("300000 bytes in total"),
+                "and must still say how long the line really was: \(message.prefix(400))"
+            )
+        }
+    }
+
+    /// The cap refuses a run with no terminator, and nothing else.
+    ///
+    /// A log larger than the cap made of ordinary terminated entries must come
+    /// back whole. A cap that bounded the *file* rather than the *carry* would
+    /// pass the test above and silently refuse every large log, which is the
+    /// failure that would be worst to ship: it turns a working `Logs` into
+    /// `command_io` at exactly the size the streaming contract exists for.
+    func testALogLargerThanTheCapIsReturnedWholeWhenItsLinesAreTerminated() async throws {
+        let root = Self.throwawayRoot()
+        let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
+        let (stdout, _) = try manager.createLogWriters(dockerID: Self.dockerID)
+
+        let line = String(repeating: "y", count: 999) + "\n"
+        let lineCount = LogReader.maxEntryBytes / line.utf8.count + 8
+        for _ in 0..<lineCount {
+            try stdout.write(Data(line.utf8))
+        }
+
+        let paths = try XCTUnwrap(manager.getLogPaths(dockerID: Self.dockerID))
+        let read = try await Self.read(paths.combinedPath)
+
+        XCTAssertEqual(
+            read.count, lineCount * line.utf8.count,
+            "the cap bounds one entry, not the log; a \(read.count)-byte answer for a "
+                + "\(lineCount * line.utf8.count)-byte log means it bounds the wrong thing"
+        )
     }
 
     /// An empty log is an empty stream, not one empty frame.
@@ -852,7 +959,8 @@ final class LogsTests: XCTestCase {
     ///
     /// `limit` omitted calls the **production overload**, so a test that omits
     /// it exercises the shipped `chunkByteLimit` rather than one the test chose.
-    /// That distinction is the whole of `testAnOrdinaryLogIsCutByTheShippedLimit`.
+    /// That distinction is the whole of
+    /// `testTheHandlerCutsAnOrdinaryLogOnTheShippedLimit`.
     private static func chunks(
         _ combinedPath: URL, since: Int64? = nil, limit: Int? = nil
     ) async throws -> [Data] {
@@ -977,6 +1085,22 @@ final class LogsTests: XCTestCase {
             buffer.append(data)
         }
         return buffer
+    }
+
+    /// A log of a fixed, literal size, written one 100-byte entry at a time.
+    ///
+    /// 160KiB, chosen here and not derived from `chunkByteLimit`: a fixture that
+    /// scales with the constant under test moves with it and stops pinning it.
+    /// Returns the byte count so a caller asserts against a number it did not
+    /// compute from the constant either.
+    @discardableResult
+    private static func writeFixedLog(to writer: FileLogWriter) throws -> Int {
+        let line = String(repeating: "x", count: 99) + "\n"
+        let lineCount = 160 * 1024 / line.utf8.count
+        for _ in 0..<lineCount {
+            try writer.write(Data(line.utf8))
+        }
+        return lineCount * line.utf8.count
     }
 
     /// Every frame's payload size, failing on any frame that is not data.

@@ -30,9 +30,19 @@ import Foundation
 /// `combined.log`: `ContainerBridge` has no rotation at all, so a long-lived
 /// chatty sandbox's log is bounded only by the disk. That made one `Logs` call
 /// able to allocate the whole file several times over inside the process that
-/// hosts every sandbox. Peak memory is now `O(readWindow + chunkByteLimit)`
-/// regardless of the log's size, and the first frame goes out as soon as one
-/// frame's worth of payload exists.
+/// hosts every sandbox. Peak memory is now
+/// `readWindowBytes + maxEntryBytes + 2 * chunkByteLimit` -- a constant, and
+/// **not** a function of the log's size -- and the first frame goes out as soon
+/// as one frame's worth of payload exists.
+///
+/// CORRECTED: that sentence read "`O(readWindow + chunkByteLimit)` regardless of
+/// the log's size", and it was **measurably false**. A 512KiB file containing no
+/// `0x0A` byte anywhere accumulated all eight read windows into the carry before
+/// the decode failed, so the real bound was the longest run without a terminator
+/// -- which is the whole file for a file that is not one of ours, and a file
+/// that is not one of ours is precisely the input this reader exists to detect.
+/// `maxEntryBytes` is what makes the corrected sentence true rather than merely
+/// narrower.
 package enum LogReader {
     /// The default cut size.
     ///
@@ -45,13 +55,36 @@ package enum LogReader {
     /// each with its own proto and its own `send`.
     package static let chunkByteLimit = 64 * 1024
 
-    /// How much of the file is held while looking for the next terminator.
+    /// How much of the file is read at a time while looking for the next
+    /// terminator.
     ///
     /// Independent of `chunkByteLimit`: one bounds the frame, this bounds the
-    /// read. A single log entry longer than this is still handled -- the
-    /// remainder carries across windows -- so this is a buffer size and not a
-    /// limit on anything.
+    /// read. An entry longer than this is still handled, because the bytes after
+    /// the last terminator carry into the next window -- so this bounds the read
+    /// and `maxEntryBytes` bounds the carry. **This comment used to end "so this
+    /// is a buffer size and not a limit on anything", one sentence after the
+    /// class comment claimed a constant memory bound. Both could not be true and
+    /// the carry was the one that was unbounded.**
     package static let readWindowBytes = 64 * 1024
+
+    /// The longest run of bytes with no terminator that this reader will hold
+    /// before refusing the file.
+    ///
+    /// **A policy limit, and it is stated as one rather than derived**, because
+    /// nothing in this repository bounds the length of one entry: an entry is
+    /// one runtime `write(_:)` chunk up to its first `\n`, wrapped in JSON, and
+    /// the chunking is the container runtime's. What the limit buys is the
+    /// class comment's bound being true; what it costs is that a single log line
+    /// longer than this becomes an error rather than a log, and
+    /// `LogReaderError.entryTooLong` names the limit so that an operator who
+    /// meets it knows what to change.
+    ///
+    /// 4MiB is far above any entry this writer has been seen to produce and
+    /// still bounds one `Logs` call to a few megabytes inside the process that
+    /// hosts every sandbox. The failure it really exists for is not a long line
+    /// at all: it is a file that is not a log, which has no terminators at any
+    /// length.
+    package static let maxEntryBytes = 4 * 1024 * 1024
 
     /// The log at `combinedPath`, filtered, cut, and handed to `sink` one frame
     /// at a time in order.
@@ -107,6 +140,11 @@ package enum LogReader {
             for line in split.lines {
                 try await take(line)
             }
+            // Checked after each window rather than at the end, which is the
+            // whole point: at the end the file is already in memory.
+            guard carried.count <= maxEntryBytes else {
+                throw LogReaderError.entryTooLong(bytes: carried.count, limit: maxEntryBytes)
+            }
         }
         // A trailing partial line can only be a torn write, and `take` reports
         // it as the unreadable entry it is rather than dropping it.
@@ -135,11 +173,19 @@ package enum LogReader {
 
 package enum LogReaderError: Error, CustomStringConvertible {
     case unreadableTimestamp(String)
+    /// Names the limit as well as the length, because the two questions an
+    /// operator has on meeting this are "how long was it" and "how long is
+    /// allowed", and a message carrying one of them answers neither.
+    case entryTooLong(bytes: Int, limit: Int)
 
     package var description: String {
         switch self {
         case .unreadableTimestamp(let time):
             return "log entry time \(time) is not a readable timestamp"
+        case .entryTooLong(let bytes, let limit):
+            return "no line terminator in \(bytes) bytes, past this reader's "
+                + "\(limit)-byte limit on one entry; either the log holds a single line "
+                + "longer than that, or this file is not a container log"
         }
     }
 }

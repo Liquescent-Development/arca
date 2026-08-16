@@ -56,8 +56,8 @@ public enum LogEntryTimestamp {
 /// One line of a container's log, as the log files hold it.
 ///
 /// Docker-compatible: `stream`, `log` and `time` are the three fields Docker's
-/// json-file driver writes and the three both of this repository's existing
-/// readers look up by name.
+/// json-file driver writes, and the three that every one of this repository's
+/// four readers looks up by name.
 public struct ContainerLogEntry: Codable, Sendable, Equatable {
     /// `"stdout"` or `"stderr"`.
     public let stream: String
@@ -174,14 +174,35 @@ public enum ContainerLogCodec {
         return split.remainder.isEmpty ? split.lines : split.lines + [split.remainder]
     }
 
+    /// How much of an unreadable line an error message quotes.
+    ///
+    /// **MEASURED, and not a tidiness limit.** Driving a 4MiB line with no
+    /// terminator through `LogReader` produced a 4MiB error message: the whole
+    /// line went into `unreadableEntry`, out through
+    /// `engineErrorCatching(.commandIo)` into `EngineError.message`, and onto
+    /// the wire. A diagnostic that is the size of the thing it is diagnosing is
+    /// a second failure on top of the first, and `EngineError.message` is prose
+    /// a consumer never parses -- so it needs enough to recognise the line and
+    /// no more. The full length is reported separately, because "the line was
+    /// long" is the fact the prefix alone hides.
+    public static let quotedLineLimit = 200
+
     public static func decode(line: Data) throws -> ContainerLogEntry {
         do {
             return try JSONDecoder().decode(ContainerLogEntry.self, from: line)
         } catch {
-            throw LogWriterError.unreadableEntry(
-                String(decoding: line, as: UTF8.self), "\(error)"
-            )
+            throw LogWriterError.unreadableEntry(quoted(line), "\(error)")
         }
+    }
+
+    /// A line as an error message may carry it: the first `quotedLineLimit`
+    /// bytes, and the full length when there was more.
+    private static func quoted(_ line: Data) -> String {
+        guard line.count > quotedLineLimit else {
+            return String(decoding: line, as: UTF8.self)
+        }
+        return String(decoding: line.prefix(quotedLineLimit), as: UTF8.self)
+            + "... (\(line.count) bytes in total)"
     }
 
     /// The bytes `entry` was made from.
@@ -191,7 +212,9 @@ public enum ContainerLogCodec {
             return Data(entry.log.utf8)
         case .some(base64Encoding):
             guard let decoded = Data(base64Encoded: entry.log) else {
-                throw LogWriterError.unreadableEntry(entry.log, "log is not valid base64")
+                throw LogWriterError.unreadableEntry(
+                    quoted(Data(entry.log.utf8)), "log is not valid base64"
+                )
             }
             return decoded
         case .some(let other):

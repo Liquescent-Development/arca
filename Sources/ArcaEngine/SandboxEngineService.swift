@@ -1246,17 +1246,9 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// is itself gascan-labelled the ownership guard below passes it through.
     /// The refusal is `invalid_resource_identity`, as it is on `Create`,
     /// `Start`, `Stop` and `Remove`.
-    /// **A failure of `sink` is not a failure of `Logs`.** The two are told
-    /// apart because they demand opposite answers: a log that could not be read
-    /// is reported to the consumer through an error frame, and a consumer that
-    /// has gone away cannot be reported anything. Merging them would either
-    /// describe a broken connection as `command_io` -- putting a transport
-    /// message inside an engine error's prose -- or swallow a real read failure
-    /// because the send after it also failed.
-    private struct LogSinkFailure: Error {
-        let underlying: Error
-    }
-
+    ///
+    /// **A failure of `sink` is not a failure of `Logs`**, and `LogSinkFailure`
+    /// below is what tells them apart. See it for why.
     func streamLogs(
         request: Arca_Engine_V1_LogsRequest,
         into sink: (Arca_Engine_V1_LogsChunk) async throws -> Void
@@ -1319,6 +1311,25 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
                 engineError(.commandIo, resource: name, message: "\(error)")
             ))
         }
+    }
+
+    /// **A failure of `sink` is not a failure of `Logs`.** The two are told
+    /// apart because they demand opposite answers: a log that could not be read
+    /// is reported to the consumer through an error frame, and a consumer that
+    /// has gone away cannot be reported anything. Merging them would either
+    /// describe a broken connection as `command_io` -- putting a transport
+    /// message inside an engine error's prose -- or swallow a real read failure
+    /// because the send after it also failed.
+    ///
+    /// Declared **after** `streamLogs` on purpose. It sat between that method
+    /// and its doc comment, which attached the whole contract -- the refusal
+    /// rules, the `not_found`-where-`Inspect`-says-`absent` distinction, and the
+    /// resolver-hazard rationale that stops a cross-sandbox disclosure -- to
+    /// this two-field error wrapper, leaving `streamLogs` with no documentation
+    /// at all on hover, in Xcode and in `swift-docc`. Nothing behaved
+    /// differently, which is exactly why it would have survived.
+    private struct LogSinkFailure: Error {
+        let underlying: Error
     }
 
     /// The failure arm of a `LogsChunk`, in one place, for `ackFailed`'s reason.
