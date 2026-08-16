@@ -409,15 +409,38 @@ extension SandboxEngineService {
         let stdout = ExecOutputWriter(stream: .stdout, relay: outbound)
         let stderr = ExecOutputWriter(stream: .stderr, relay: outbound)
 
-        async let execution: Void = runProcess(
-            execID: execID,
-            stdin: stdin,
-            stdout: stdout,
-            stderr: stderr,
-            inbound: inbound
-        )
+        // **Unstructured, and only because the alternative cannot be made to
+        // return.** `startExec` awaits `process.wait()`, which nothing bounds
+        // (`ExecManager.swift:265`; `LinuxProcess.wait` takes a timeout it is
+        // not given). Under `async let` or a task group this scope must await
+        // that child before it can exit, so a guest that never dies -- a wedged
+        // VM, an unreachable agent, a kill that did not land -- would hold the
+        // RPC handler open for the life of the engine, with the response stream
+        // and the exec instance behind it. Abandoning a task is the only thing
+        // in structured concurrency that a hung child cannot veto, and the
+        // shutdown path below bounds the wait so this method always returns.
+        let execution = Task { [self] in
+            try await runProcess(
+                execID: execID,
+                stdin: stdin,
+                stdout: stdout,
+                stderr: stderr,
+                inbound: inbound
+            )
+        }
 
-        var refusal: Arca_Engine_V1_EngineError?
+        // **A frame this engine cannot carry out is reported and the session
+        // continues; only a protocol violation or a client reset ends it.** An
+        // earlier version ended the exec on any refusal and force-killed the
+        // guest, so a client that sent one unmapped signal number had its
+        // perfectly healthy process destroyed -- an answer far larger than the
+        // question, and one `engine.proto` never asks for. The consumer decides
+        // what a refusal means to it: gascan stops reading at an error frame
+        // (`gascan-arca/src/backend.rs:322-324`), and a consumer that stops
+        // reading is a consumer that has reset, which the path below already
+        // handles as cancellation. **The distinction is between a frame the
+        // engine will not act on and a stream it can no longer trust.**
+        var violation: Arca_Engine_V1_EngineError?
         dispatch: while let frame = await frames.next() {
             switch frame.frame {
             case .stdin(let bytes):
@@ -426,24 +449,26 @@ extension SandboxEngineService {
                 stdin.close()
             case .resize(let resize):
                 do {
-                    try await execManager.resizeExec(
-                        execID: execID,
-                        height: Int(resize.rows),
-                        width: Int(resize.columns)
-                    )
+                    try await awaitingProcess(execID: execID) {
+                        try await self.execManager.resizeExec(
+                            execID: execID,
+                            height: Int(resize.rows),
+                            width: Int(resize.columns)
+                        )
+                    }
                 } catch {
-                    refusal = Self.execError(for: error, resource: resource)
-                    break dispatch
+                    outbound.send(Self.execFailed(Self.execError(for: error, resource: resource)))
                 }
             case .signal(let number):
                 do {
-                    try await execManager.signalExec(execID: execID, signal: number)
+                    try await awaitingProcess(execID: execID) {
+                        try await self.execManager.signalExec(execID: execID, signal: number)
+                    }
                 } catch {
-                    refusal = Self.execError(for: error, resource: resource)
-                    break dispatch
+                    outbound.send(Self.execFailed(Self.execError(for: error, resource: resource)))
                 }
             case .start:
-                refusal = engineError(
+                violation = engineError(
                     .invalidState,
                     resource: resource,
                     message: "exactly one ExecStart may appear per exec stream "
@@ -451,7 +476,7 @@ extension SandboxEngineService {
                 )
                 break dispatch
             case nil:
-                refusal = engineError(
+                violation = engineError(
                     .invalidState,
                     resource: resource,
                     message: "an exec client frame arrived with no frame set"
@@ -461,25 +486,45 @@ extension SandboxEngineService {
         }
         stdin.close()
 
-        // **A refusal ends the exec, and that follows from the consumer rather
-        // than from taste.** gascan treats an `ExecServerFrame.error` as
-        // terminal and stops reading (`gascan-arca/src/backend.rs:322-324`), so
-        // a session that carried on after one would be running a guest process
-        // for a client that has already gone -- and would send its `Exit` into
-        // a stream nobody is draining.
         let clientReset = inbound.failure != nil || Task.isCancelled
-        if clientReset || refusal != nil {
+        var failure = violation
+        if clientReset || violation != nil {
             // Before awaiting `execution`, not after: it is blocked in
             // `process.wait()` and only the guest process exiting frees it. An
             // await here without the kill is how this method would hang on a
             // sandbox whose command was `sleep 300`.
             await forceKill(execID: execID, resource: resource)
-        }
-        var failure = refusal
-        do {
-            try await execution
-        } catch {
-            if failure == nil {
+            // **And bounded afterwards, because `forceKill` is a best effort
+            // that logs its own failure.** If the signal did not land -- an
+            // unreachable agent, a stopped container, a wedged VM -- the wait
+            // below never ends on its own, and this method not returning means
+            // `outbound` is never finished, the caller's drain never ends, and
+            // the RPC handler leaks along with the exec instance and the
+            // response stream. That is the shape the engine's own shutdown work
+            // exists to prevent, so the guest gets a bounded chance to die and
+            // then the session stops waiting on it.
+            if await Self.completes(execution, within: .seconds(10)) == false {
+                execution.cancel()
+                logger.error(
+                    "exec did not end after being killed; abandoning the wait so the stream can close",
+                    metadata: ["exec_id": "\(execID)", "container": "\(resource)"]
+                )
+                failure =
+                    failure
+                    ?? engineError(
+                        .commandIo,
+                        resource: resource,
+                        message: "exec \(execID) did not end within 10s of being killed"
+                    )
+            }
+        } else {
+            // The ordinary path, and deliberately unbounded: this is waiting
+            // for the command the caller asked to run, and a bound here would
+            // be the engine deciding how long a consumer's own process may
+            // take.
+            do {
+                try await execution.value
+            } catch {
                 failure = Self.execError(for: error, resource: resource)
             }
         }
@@ -566,6 +611,89 @@ extension SandboxEngineService {
             stdout: stdout,
             stderr: stderr
         )
+    }
+
+    /// Runs `act`, and if it fails only because the process is not recorded
+    /// yet, waits for it and runs it once more.
+    ///
+    /// **The race is real and it lands on the most ordinary thing a client
+    /// does.** `createExec` records the exec with `process` nil
+    /// (`ExecManager.swift:155`) and `startExec` fills it in only after a round
+    /// trip to the guest agent (`:245-255`), while this session starts
+    /// dispatching client frames immediately. A `signal` frame inside that
+    /// window reaches `signalExec`, which throws `execNotStarted`
+    /// (`:399-401`) -- so an interactive consumer that opens a shell and sends
+    /// Ctrl-C in the first tens of milliseconds had its exec refused before the
+    /// shell ever ran.
+    ///
+    /// **Waiting rather than ignoring, and that distinction is Task 4's
+    /// ruling.** `resizeExec` tolerates the same race by returning silently
+    /// (`:325-328`), which is right for a window size and wrong for a signal:
+    /// "a signal that goes nowhere while the caller is told nothing is
+    /// precisely this project's recurring defect". So the signal is neither
+    /// dropped nor fatal -- it is held for as long as starting can reasonably
+    /// take, and then delivered. A resize goes through the same wait for a
+    /// smaller reason: `resizeExec`'s silent return means an initial window
+    /// size sent immediately after `ExecStart` is otherwise lost with nothing
+    /// said, and the guest keeps the default terminal size.
+    ///
+    /// **Polling, and it is a trade rather than an oversight.** The alternative
+    /// is a readiness signal on `ExecManager`, which is shared with Arca's
+    /// Docker surface -- a second consumer for a seam only this one needs.
+    /// `getExecInfo` is already public and already answers the exact question.
+    ///
+    /// The bound is 2 seconds: long against a guest round trip, short enough
+    /// that a `startExec` which threw -- and so will never record a process --
+    /// stalls one frame's dispatch rather than the session. Stdin is unaffected
+    /// either way; it buffers in `ExecStdinRelay` and nothing is lost.
+    /// **The wait comes first, and it has to.** An earlier version of this ran
+    /// `act` and waited only if it threw `execNotStarted` -- which works for
+    /// `signalExec`, because that throws, and does nothing whatsoever for
+    /// `resizeExec`, which **returns silently** in exactly the same situation
+    /// (`ExecManager.swift:325-328`). So a resize sent before the process
+    /// existed was still dropped with nothing said, and the wrapper only looked
+    /// as though it covered both.
+    ///
+    /// MEASURED, and the live tier is what caught it: with the retry keyed on
+    /// the throw, `exec::a_resize_sent_before_the_process_starts_still_reaches_the_guests_terminal`
+    /// failed with `stdout: "done\r\n"` and no `WINCH` -- the guest's SIGWINCH
+    /// trap never fired. The same test with a readiness handshake in front of
+    /// the resize passed, which is what proved the instrument sound and the
+    /// window real rather than the trap being broken.
+    private func awaitingProcess(
+        execID: String,
+        _ act: () async throws -> Void
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await execManager.getExecInfo(execID: execID)?.process == nil {
+            if ContinuousClock.now >= deadline {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        try await act()
+    }
+
+    /// Whether `task` finished inside `bound`, without cancelling it if it did
+    /// not.
+    ///
+    /// Structured concurrency has no way to stop waiting on a child, which is
+    /// why `execution` is an unstructured task and why this is written by
+    /// racing two of them.
+    private static func completes(_ task: Task<Void, Error>, within bound: Duration) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = try? await task.value
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: bound)
+                return false
+            }
+            let finished = await group.next() ?? false
+            group.cancelAll()
+            return finished
+        }
     }
 
     /// SIGKILL to the exec's process, whatever this task's own state.
