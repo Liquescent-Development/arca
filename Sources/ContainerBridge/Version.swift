@@ -17,6 +17,13 @@ public struct ArcaVersion {
         ArcaBuildInfo.gitCommit
     }
 
+    /// The full 40-character revision, for the capability gate. Distinct from
+    /// `gitCommit`, which is a 7-character display value ArcaDaemon puts in a
+    /// header: a prefix is not an identity and must not be used as one.
+    public static var buildRevision: String {
+        ArcaBuildInfo.buildRevision
+    }
+
     /// Build time - injected by Makefile, see BuildInfo.generated.swift
     public static var buildTime: String {
         ArcaBuildInfo.buildTime

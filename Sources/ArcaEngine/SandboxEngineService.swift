@@ -178,7 +178,8 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         return Arca_Engine_V1_CapabilitiesResponse.with { response in
             response.capabilities = Arca_Engine_V1_Capabilities.with { capabilities in
                 capabilities.engineVersion = version
-                capabilities.contractMinor = 0
+                capabilities.contractMinor = 1
+                capabilities.buildRevision = ArcaVersion.buildRevision
                 capabilities.projectMount = true
                 capabilities.namedVolumes = true
                 capabilities.tty = true

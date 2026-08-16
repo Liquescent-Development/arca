@@ -347,6 +347,13 @@ public nonisolated struct Arca_Engine_V1_Capabilities: Sendable {
   /// Whether an offline sandbox can be proven to have no egress.
   public var offline: Arca_Engine_V1_Isolation = .unspecified
 
+  /// The engine's own build revision, as a full 40-character lowercase hex Git
+  /// object id. A consumer certifies an engine BY REVISION, because an engine
+  /// that asserted its own certification would be deciding the question the
+  /// certification exists to answer. So this field carries identity and nothing
+  /// else: never a tag, never a short hash. A prefix is not an identity.
+  public var buildRevision: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -613,6 +620,12 @@ public nonisolated struct Arca_Engine_V1_Network: Sendable {
   public var mode: Arca_Engine_V1_Network.OneOf_Mode? = nil
 
   /// No egress. The engine must be able to report ISOLATION_PROVEN for this.
+  /// OFFLINE AND PORTS ARE MUTUALLY EXCLUSIVE, AND OFFLINE WINS BY REFUSAL:
+  /// an engine that receives `offline` together with a non-empty
+  /// CreateRequest.ports MUST refuse the request with unsupported_capability
+  /// rather than publish, silently drop the ports, or pick a winner of its
+  /// own. Three implementations already behave this way and none of them
+  /// said so here, which is one refactor away from losing the rule.
   public var offline: Arca_Engine_V1_Offline {
     get {
       if case .offline(let v)? = mode {return v}
@@ -634,6 +647,12 @@ public nonisolated struct Arca_Engine_V1_Network: Sendable {
 
   public nonisolated enum OneOf_Mode: Equatable, Sendable {
     /// No egress. The engine must be able to report ISOLATION_PROVEN for this.
+    /// OFFLINE AND PORTS ARE MUTUALLY EXCLUSIVE, AND OFFLINE WINS BY REFUSAL:
+    /// an engine that receives `offline` together with a non-empty
+    /// CreateRequest.ports MUST refuse the request with unsupported_capability
+    /// rather than publish, silently drop the ports, or pick a winner of its
+    /// own. Three implementations already behave this way and none of them
+    /// said so here, which is one refactor away from losing the rule.
     case offline(Arca_Engine_V1_Offline)
     /// Name of an engine-managed network resource, created with the sandbox.
     case networkedName(String)
@@ -676,6 +695,7 @@ public nonisolated struct Arca_Engine_V1_CreateRequest: @unchecked Sendable {
     set {_uniqueStorage()._volumes = newValue}
   }
 
+  /// Refused when the network is `offline`; see the rule on Network.offline.
   public var ports: [Arca_Engine_V1_PortMapping] {
     get {_storage._ports}
     set {_uniqueStorage()._ports = newValue}
@@ -1555,7 +1575,7 @@ nonisolated extension Arca_Engine_V1_CapabilitiesRequest: SwiftProtobuf.Message,
 
 nonisolated extension Arca_Engine_V1_Capabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Capabilities"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}engine_version\0\u{3}contract_minor\0\u{3}project_mount\0\u{3}named_volumes\0\u{1}tty\0\u{1}signals\0\u{3}loopback_publish\0\u{3}resource_limits\0\u{1}offline\0\u{c}\u{a}\u{a}")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}engine_version\0\u{3}contract_minor\0\u{3}project_mount\0\u{3}named_volumes\0\u{1}tty\0\u{1}signals\0\u{3}loopback_publish\0\u{3}resource_limits\0\u{1}offline\0\u{4}\u{b}build_revision\0\u{c}\u{a}\u{a}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1572,6 +1592,7 @@ nonisolated extension Arca_Engine_V1_Capabilities: SwiftProtobuf.Message, SwiftP
       case 7: try { try decoder.decodeSingularBoolField(value: &self.loopbackPublish) }()
       case 8: try { try decoder.decodeSingularBoolField(value: &self.resourceLimits) }()
       case 9: try { try decoder.decodeSingularEnumField(value: &self.offline) }()
+      case 20: try { try decoder.decodeSingularStringField(value: &self.buildRevision) }()
       default: break
       }
     }
@@ -1609,6 +1630,9 @@ nonisolated extension Arca_Engine_V1_Capabilities: SwiftProtobuf.Message, SwiftP
     if self.offline != .unspecified {
       try visitor.visitSingularEnumField(value: self.offline, fieldNumber: 9)
     }
+    if !self.buildRevision.isEmpty {
+      try visitor.visitSingularStringField(value: self.buildRevision, fieldNumber: 20)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1622,6 +1646,7 @@ nonisolated extension Arca_Engine_V1_Capabilities: SwiftProtobuf.Message, SwiftP
     if lhs.loopbackPublish != rhs.loopbackPublish {return false}
     if lhs.resourceLimits != rhs.resourceLimits {return false}
     if lhs.offline != rhs.offline {return false}
+    if lhs.buildRevision != rhs.buildRevision {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
