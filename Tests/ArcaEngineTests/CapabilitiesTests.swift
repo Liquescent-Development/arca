@@ -18,20 +18,22 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertNil(engineVersion(from: "0.2.x"))
     }
 
-    /// **This asserts the false flags as hard as the true ones, and that is the
-    /// point.** A capability that is true before its code exists is how a
-    /// consumer is induced to send a request the engine cannot honour, so the
-    /// `XCTAssertFalse`s below are not leftovers from an emptier build: `tty`
-    /// and `signals` are false because `Exec` is not implemented, and `offline`
+    /// **This asserts the one remaining negative as hard as the positives, and
+    /// that is the point.** A capability that is true before its code exists is
+    /// how a consumer is induced to send a request the engine cannot honour, so
+    /// the `offline` assertion below is not a leftover from an emptier build: it
     /// is `.unverified` because nothing has proven isolation. See the note on
-    /// `capabilities(request:)` for what earned each of the four that are true.
+    /// `capabilities(request:)` for what earned each of the six that are true.
     ///
     /// `namedVolumes` was one of the falses until vminitd stopped identifying
     /// its OverlayFS block devices by counting `/dev/vd` letters -- which
     /// swallowed the volume devices -- and started reading a role out of each
-    /// image's ext4 volume label. This assertion flipping is a deliberate part
-    /// of that change; it failing on its own would mean the flag moved without
-    /// one.
+    /// image's ext4 volume label. `tty` and `signals` were the last two, and
+    /// they moved when milestone 3's `Exec` landed. **Neither moved on the
+    /// strength of the code existing:** each names a live test in gascan's tier
+    /// that fails against a one-line mutation of this engine, and both mutations
+    /// were run. An assertion flipping here is a deliberate part of such a
+    /// change; it failing on its own would mean a flag moved without one.
     ///
     /// **This test cannot corroborate any of them.** It reads the same literals
     /// the source holds; what makes those literals honest is gascan's live
@@ -51,8 +53,8 @@ final class CapabilitiesTests: XCTestCase {
         }
         XCTAssertTrue(capabilities.projectMount)
         XCTAssertTrue(capabilities.namedVolumes)
-        XCTAssertFalse(capabilities.tty)
-        XCTAssertFalse(capabilities.signals)
+        XCTAssertTrue(capabilities.tty)
+        XCTAssertTrue(capabilities.signals)
         XCTAssertTrue(capabilities.loopbackPublish)
         XCTAssertTrue(capabilities.resourceLimits)
         XCTAssertEqual(capabilities.offline, .unverified)

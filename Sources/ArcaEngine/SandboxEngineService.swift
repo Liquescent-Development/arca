@@ -10,21 +10,22 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, ten of the eleven are implemented: `Capabilities`,
-/// `Inspect`, `ListResources`, `PrepareImage`, `Create`, `CreateContainer`,
-/// `Start`, `Stop`, `Remove` and `Logs`.** The one that remains -- `Exec` --
-/// answers `unsupported_capability`, and sends it inside a stream frame rather
-/// than a response `oneof`: `ExecServerFrame.frame.error`. That is why it is
-/// not reachable from a test in this target, which cannot construct a
-/// `GRPCAsyncResponseStreamWriter`, and why gascan's live tier is what asserts
-/// it answers at all.
+/// **All eleven are implemented, and none answers `unsupported_capability`.**
+/// `Exec` was the last, and with it the contract's whole surface answers for
+/// real.
 ///
-/// `Logs` streams too and has the same problem, which is why its logic lives in
-/// `streamLogs(request:into:)` and the protocol method only supplies the writer
-/// -- the same test seam the unary methods use, so the frames are asserted here
-/// rather than only over the wire. It takes a sink rather than returning the
+/// **The two streaming methods share one problem and therefore one shape.** A
+/// test target cannot construct a `GRPCAsyncResponseStreamWriter`, so a method
+/// whose body wrote to one would be unreachable from every test in this
+/// repository. Both keep their logic one level in -- `streamLogs(request:into:)`
+/// and `runExec(frames:into:)` -- taking a **sink** rather than returning their
 /// frames, because a seam that returned them would make a streaming method
-/// buffer its whole answer before sending any of it.
+/// buffer its whole answer before sending any of it. The protocol methods below
+/// supply the writer and nothing else.
+///
+/// What that seam does **not** buy is worth stating in the same breath: `Exec`
+/// end to end needs a booted guest, so what these tests reach is its refusals
+/// and its adapters. Gascan's live `exec.rs` is what says a byte ever crossed.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -37,18 +38,19 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
 
     // `containerManager` is read by `inspect(request:)` and, with
     // `volumeManager` and `networkManager`, by `listResources(request:)` below.
-    // `imageManager` is read by `prepareImage(request:)`. `execManager` is held
-    // and, in this build, unread. Deliberate on both counts.
+    // `imageManager` is read by `prepareImage(request:)`, and `execManager` by
+    // `runExec(frames:into:)`.
     //
-    // Unread because the method that would consult it -- `Exec` -- is among the
-    // seven this build does not implement. Held because
-    // the dependency edge is itself a shipped property: gascan's
-    // tests/release/engine-targets-check.sh asserts that `arca-engine` and
-    // `ArcaEngine` reach neither `DockerAPI` nor `ArcaDaemon`, and that
-    // assertion measures something only while this target genuinely depends on
-    // ContainerBridge. Dropping the two to silence an unused-property reading
-    // would make the release gate pass for a reason that has nothing to do with
-    // what it exists to prove.
+    // **`execManager` was held and unread until milestone 3's task 6**, because
+    // the method that consults it -- `Exec` -- was the last one this build did
+    // not implement. It was kept rather than dropped, and that reasoning still
+    // applies to anything else that looks unused here: the dependency edge is
+    // itself a shipped property. Gascan's tests/release/engine-targets-check.sh
+    // asserts that `arca-engine` and `ArcaEngine` reach neither `DockerAPI` nor
+    // `ArcaDaemon`, and that assertion measures something only while this target
+    // genuinely depends on ContainerBridge. Dropping a property to silence an
+    // unused-property reading would make the release gate pass for a reason that
+    // has nothing to do with what it exists to prove.
     let containerManager: ContainerManager
     let volumeManager: VolumeManager
     let networkManager: NetworkManager
@@ -90,7 +92,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// is true before its code exists induces a consumer to send a request the
     /// engine cannot honour.
     ///
-    /// **Four flags are true, and each one names a live test that drove the
+    /// **Six flags are true, and each one names a live test that drove the
     /// capability from outside this engine's own store.** `Inspect` reports what
     /// the store holds, deliberately, so it can corroborate none of them; every
     /// flag below that is true was earned by an observation of the guest or of
@@ -137,8 +139,28 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     ///   not the assertion that carries the claim: the targets exist in the
     ///   image, so the write landed in the container's own overlay.
     ///
-    /// `tty` and `signals` are milestone 3's, with `Exec`. `offline` stays
-    /// `.unverified` until milestone 4 proves it.
+    /// - `tty`: the guest process itself answers `test -t 1`, and its stderr
+    ///   arrives **merged into stdout** -- which happens only because a terminal
+    ///   puts both descriptors on one pty. Earned by
+    ///   `exec::a_tty_exec_gives_the_guest_a_terminal_and_merges_stderr_into_stdout`.
+    ///   SEEN TO FAIL, and isolated: with `processConfig.terminal` in
+    ///   `ExecManager.startExec` forced to `false`, the same request came back
+    ///   `stdout: "notatty\n", stderr: "err\n"` -- the guest reporting no
+    ///   terminal, and the two streams no longer merged. The control arm of that
+    ///   test, `tty` unset, asserts the opposite pair, so a build that always
+    ///   allocated a terminal fails too.
+    /// - `signals`: a signal sent mid-exec reaches the guest process and decides
+    ///   how it exits -- SIGTERM gives 143 and SIGKILL 137, so the number the
+    ///   client sent is the number that arrived. Earned by
+    ///   `exec::a_signal_reaches_the_guest_process_and_decides_how_it_exits`.
+    ///   SEEN TO FAIL, and this one is the reason the flag waited for a live
+    ///   test at all: with `try await process.kill(resolved)` deleted from
+    ///   `ExecManager.signalExec`, **`swift test --filter ArcaEngineTests` stays
+    ///   at `Executed 221 tests, with 0 failures`** and the live test fails at
+    ///   its 60-second bound with `no Exit frame`. The VM-free suite pins the
+    ///   guards; only the tier sees the send.
+    ///
+    /// `offline` stays `.unverified` until milestone 4 proves it.
     func capabilities(request: Arca_Engine_V1_CapabilitiesRequest) async -> Arca_Engine_V1_CapabilitiesResponse {
         guard let version = engineVersion(from: ArcaVersion.version) else {
             return Arca_Engine_V1_CapabilitiesResponse.with {
@@ -154,8 +176,8 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
                 capabilities.contractMinor = 0
                 capabilities.projectMount = true
                 capabilities.namedVolumes = true
-                capabilities.tty = false
-                capabilities.signals = false
+                capabilities.tty = true
+                capabilities.signals = true
                 capabilities.loopbackPublish = true
                 capabilities.resourceLimits = true
                 capabilities.offline = .unverified
@@ -1181,14 +1203,45 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         await remove(request: request)
     }
 
+    /// The thin half of `Exec`: it accepts the RPC, supplies the writer, and
+    /// does nothing else.
+    ///
+    /// Everything this method could get wrong lives in `runExec` above it, for
+    /// the reason `logs` records one method down -- a test target cannot
+    /// construct a `GRPCAsyncResponseStreamWriter`, so anything written here is
+    /// untestable in this repository by construction.
+    ///
+    /// **`acceptRPC` is the one line here that is not plumbing, and without it
+    /// every interactive exec deadlocks.** grpc-swift accepts an RPC implicitly
+    /// when the first response message is sent, so an engine that says nothing
+    /// sends no response headers -- and tonic's bidirectional call does not
+    /// return a stream to its caller until those headers arrive
+    /// (`gascan-arca/src/channel.rs:177-182`). A consumer that must write before
+    /// the guest will speak is therefore stuck inside `exec()`, unable to send
+    /// the stdin that would produce the output that would release it. That is a
+    /// deadlock in the case `Exec` most exists for: a shell, a REPL, anything
+    /// waiting on input.
+    ///
+    /// MEASURED, and it is how this was found. Against the engine without this
+    /// line, gascan's live
+    /// `exec::exec_carries_both_streams_and_the_commands_own_exit_status` ran
+    /// its first exec -- `sh -c 'echo out; echo err 1>&2; exit 3'` -- to a
+    /// correct exit status of 3, because that command writes before it is asked
+    /// for anything, and then hung on its second, `cat`. The engine's own log
+    /// shows `Exec instance started pid=792` and nothing further for nine
+    /// minutes, while every await on the client side had a bound and none of
+    /// them fired: the test was still inside `backend.exec()`. **The RPC that
+    /// works is the one that happens to speak first, which is exactly the shape
+    /// of defect that ships.**
     public func exec(
         requestStream: GRPCAsyncRequestStream<Arca_Engine_V1_ExecClientFrame>,
         responseStream: GRPCAsyncResponseStreamWriter<Arca_Engine_V1_ExecServerFrame>,
         context: GRPCAsyncServerCallContext
     ) async throws {
-        try await responseStream.send(
-            Arca_Engine_V1_ExecServerFrame.with { $0.error = Self.notImplemented("Exec") }
-        )
+        await context.acceptRPC(headers: [:])
+        try await runExec(frames: requestStream) { frame in
+            try await responseStream.send(frame)
+        }
     }
 
     /// `Logs`, with the writer it sends through supplied by the caller.
