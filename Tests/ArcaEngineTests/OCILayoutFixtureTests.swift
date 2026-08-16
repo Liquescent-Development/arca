@@ -81,9 +81,12 @@ final class OCILayoutFixtureTests: XCTestCase {
     /// config's bytes changes this value.
     ///
     /// **Deriving it, if it ever fails legitimately** -- a changed fixture structure, a changed
-    /// payload, a submodule bump that alters how `ContainerizationOCI` encodes: the failure
-    /// message carries the value actually produced, and it is `shasum -a 256 index.json` of a
-    /// layout written with these constants. Update it deliberately; do not relax the assertion.
+    /// payload, a submodule bump that alters how `ContainerizationOCI` encodes, or **a toolchain
+    /// or libarchive change**, which is the likeliest of the four in practice and the one a
+    /// reader hitting this after an Xcode upgrade needs to see named: these bytes come from
+    /// Foundation's `JSONEncoder`, its `\/` escaping included. The failure message carries the
+    /// value actually produced, and it is `shasum -a 256 index.json` of a layout written with
+    /// these constants. Update it deliberately; do not relax the assertion.
     private static let pinnedIndexDigest =
         "3bf2571174665527b5c9107e798e3e0f7b9d84d82a64643bb628d7d4875a928a"
 
