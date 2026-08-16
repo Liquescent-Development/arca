@@ -1258,28 +1258,26 @@ public struct ContainerHandlers: Sendable {
         try fileHandle.seek(toOffset: position)
         let data = fileHandle.readDataToEndOfFile()
 
-        guard let content = String(data: data, encoding: .utf8) else {
-            return Data()
-        }
-
-        let lines = content.components(separatedBy: .newlines)
+        // Split and parse with ContainerBridge's own codec, over the bytes.
+        // Both halves matter. The parse must be the writer's, because a
+        // default-options ISO8601DateFormatter returns nil for the
+        // fractional-seconds stamps it emits and would drop every line. The
+        // SPLIT must be the writer's too: `components(separatedBy: .newlines)`
+        // stood here and covers U+2028, U+2029 and U+0085, which `JSONEncoder`
+        // leaves raw inside a JSON string because all three are legal there --
+        // so a container that printed one had its entry cut in half, both
+        // halves failed to parse, and the line vanished from `docker logs` with
+        // no error. `ContainerLogCodec.lines` is `0x0A` and nothing else.
         var logEntries: [LogEntry] = []
 
-        for line in lines {
-            guard !line.isEmpty else { continue }
-
-            guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let logStream = json["stream"] as? String,
-                  let logMessage = json["log"] as? String,
-                  let timeString = json["time"] as? String else {
+        for lineData in ContainerBridge.ContainerLogCodec.allLines(of: data) {
+            guard let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
+                  let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
+                  let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                 continue
             }
-
-            let formatter = ISO8601DateFormatter()
-            guard let timestamp = formatter.date(from: timeString) else {
-                continue
-            }
+            let logStream = entry.stream
+            let logMessage = String(decoding: payload, as: UTF8.self)
 
             if logStream == streamType {
                 logEntries.append(LogEntry(
@@ -1313,30 +1311,21 @@ public struct ContainerHandlers: Sendable {
                 return
             }
 
-            let content = try String(contentsOf: path, encoding: .utf8)
-            let lines = content.components(separatedBy: .newlines)
+            // Split and parse with the writer's own codec; see the note in
+            // `readNewLogData` for what each half of that costs when it is a
+            // second spelling instead.
+            let content = try Data(contentsOf: path)
 
-            for line in lines {
-                guard !line.isEmpty else { continue }
-
-                // Parse JSON log entry
-                guard let data = line.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let logStream = json["stream"] as? String,
-                      let logMessage = json["log"] as? String,
-                      let timeString = json["time"] as? String else {
-                    continue
-                }
-
-                // Parse timestamp
-                let formatter = ISO8601DateFormatter()
-                guard let timestamp = formatter.date(from: timeString) else {
+            for lineData in ContainerBridge.ContainerLogCodec.allLines(of: content) {
+                guard let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
+                      let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
+                      let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                     continue
                 }
 
                 allLogs.append(LogEntry(
-                    stream: logStream,
-                    message: logMessage,
+                    stream: entry.stream,
+                    message: String(decoding: payload, as: UTF8.self),
                     timestamp: timestamp,
                     includeTimestamp: timestamps
                 ))

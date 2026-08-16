@@ -136,6 +136,20 @@ enum RemovableKind {
         }
     }
 
+    /// The wire kind, for matching a parsed kind back against a `Resource` the
+    /// caller sent.
+    ///
+    /// The reverse of `removableKind(_:)` and deliberately total, so that adding
+    /// a fourth contract kind breaks this switch rather than silently failing to
+    /// match one.
+    var resourceKind: Arca_Engine_V1_ResourceKind {
+        switch self {
+        case .container: return .container
+        case .volume: return .volume
+        case .network: return .network
+        }
+    }
+
     /// The order `Remove` deletes in: containers, then volumes, then networks.
     ///
     /// **This is a dependency order and it is load-bearing, not tidiness.**
@@ -237,6 +251,59 @@ func removalRefusal(
     storedLabels: [String: String]?,
     owner: Arca_Engine_V1_OwnerLabels
 ) -> Arca_Engine_V1_EngineError? {
+    ownershipRefusal(
+        kind: kind, name: name, storedLabels: storedLabels, owner: owner, action: .remove
+    )
+}
+
+/// What the engine is about to do with the resource, which is the only thing the
+/// three-tier rule above needs to know beyond the labels.
+///
+/// **The rule is shared; the sentence is not.** `Remove` is about to delete the
+/// resource and `CreateContainer` is about to mount it into a rebuilt container,
+/// and a refusal that told an operator the wrong one would send them looking in
+/// the wrong place. What must NOT differ is the decision -- two copies of a
+/// three-tier ownership comparison are two chances to compare one label, or
+/// neither, on one of them.
+enum OwnershipAction {
+    case remove
+    case reuse
+
+    /// What the engine declines to do with a resource it cannot establish is the
+    /// caller's.
+    var refusedConsequence: String {
+        switch self {
+        case .remove: return "will not delete it"
+        case .reuse: return "will not mount it into a rebuilt container"
+        }
+    }
+
+    /// How the operation names itself when reporting whose authority it ran under.
+    var madeUnder: String {
+        switch self {
+        case .remove: return "this remove is made under"
+        case .reuse: return "this recreate is made under"
+        }
+    }
+}
+
+/// Absent, unlabelled, or labelled to someone else -- the one comparison, for
+/// every operation that acts on a resource the caller claims is theirs.
+///
+/// Extracted from `removalRefusal` when `CreateContainer` needed the same three
+/// tiers to decide whether a retained resource may be reused. **Mounting another
+/// consumer's volume is the read-side of the hazard `engine.proto:381-383`
+/// describes on the write side** -- the field exists "so one consumer cannot be
+/// induced to delete another's resource", and being induced to *mount* one hands
+/// the caller data it was never entitled to see. The same rule answers both, and
+/// sharing it is what stops the two drifting into comparing different label sets.
+func ownershipRefusal(
+    kind: RemovableKind,
+    name: String,
+    storedLabels: [String: String]?,
+    owner: Arca_Engine_V1_OwnerLabels,
+    action: OwnershipAction
+) -> Arca_Engine_V1_EngineError? {
     guard let labels = storedLabels else {
         return engineError(
             .notFound,
@@ -249,7 +316,7 @@ func removalRefusal(
             .foreignResourceRefused,
             resource: name,
             message: "\(kind.noun) \(name) carries no gascan owner labels, so this engine "
-                + "cannot establish it is the caller's and will not delete it"
+                + "cannot establish it is the caller's and \(action.refusedConsequence)"
         )
     }
     guard stored == owner else {
@@ -257,7 +324,7 @@ func removalRefusal(
             .ownershipMismatch,
             resource: name,
             message: "\(kind.noun) \(name) is labelled managed_by '\(stored.managedBy)' "
-                + "sandbox_id '\(stored.sandboxID)', and this remove is made under "
+                + "sandbox_id '\(stored.sandboxID)', and \(action.madeUnder) "
                 + "managed_by '\(owner.managedBy)' sandbox_id '\(owner.sandboxID)'"
         )
     }

@@ -471,9 +471,38 @@ public actor ContainerManager {
             let stderrPath = logDir.appendingPathComponent("stderr.log")
             let combinedPath = logDir.appendingPathComponent("combined.log")
 
-            // Only register if log files exist
+            // Only register if log files exist. All three are checked, and
+            // `combined.log` is in the guard for the same reason the other two
+            // are: registering a path makes `getLogPaths` answer non-nil, and
+            // `Logs` reads the combined file, so registering one that is not
+            // there turns "this container has no log" into a `command_io`
+            // failure. A container restored from a state store written before
+            // that file had a writer is exactly the case.
+            //
+            // **THE TRADE, NAMED.** All-or-nothing costs `docker logs` a real
+            // log. `DockerAPI/Handlers/ContainerHandlers.swift` answers 404 when
+            // `getLogPaths` is nil, so a container carrying `stdout.log` and
+            // `stderr.log` from a build that had no combined writer now gets
+            // that 404 instead of its output, which is still on disk. It is a
+            // trade across two surfaces, not a pure fix.
+            //
+            // Taken deliberately. The alternative -- register the two that
+            // exist and let `Logs` answer for a combined file that is not there
+            // -- can only answer "no log" for a container that HAS one, or
+            // `command_io`, which is what this guard was changed to stop. The
+            // third option, making `combinedPath` optional so the fact is in the
+            // type rather than inferred from a missing file, is the only one
+            // that serves both surfaces honestly and is a public-API change to
+            // `LogPaths` for a population that disappears the next time each
+            // container starts: `createLogWriters` creates all three.
+            //
+            // The `else` arm below says which files were found, so an operator
+            // whose `docker logs` stopped answering is told why rather than left
+            // with a 404. It used to say "No existing log files found", which
+            // would have been false for exactly this case.
             if FileManager.default.fileExists(atPath: stdoutPath.path) &&
-               FileManager.default.fileExists(atPath: stderrPath.path) {
+               FileManager.default.fileExists(atPath: stderrPath.path) &&
+               FileManager.default.fileExists(atPath: combinedPath.path) {
                 // Register log paths in logManager (internal method call needed)
                 // We can't use createLogWriters() because it would truncate existing logs
                 // Instead, we directly register the paths using the LogPaths struct
@@ -491,10 +520,30 @@ public actor ContainerManager {
                     "log_dir": "\(logDir.path)"
                 ])
             } else {
-                logger.debug("No existing log files found for container", metadata: [
-                    "docker_id": "\(containerData.id)",
-                    "log_dir": "\(logDir.path)"
-                ])
+                let present = [stdoutPath, stderrPath, combinedPath]
+                    .filter { FileManager.default.fileExists(atPath: $0.path) }
+                    .map { $0.lastPathComponent }
+                if present.isEmpty {
+                    logger.debug("No existing log files found for container", metadata: [
+                        "docker_id": "\(containerData.id)",
+                        "log_dir": "\(logDir.path)"
+                    ])
+                } else {
+                    // Some but not all: the container has a log this build
+                    // cannot serve, and both `docker logs` and `Logs` will
+                    // report it as having none. At `warning` because the output
+                    // is on disk and unreachable, which is not a thing to find
+                    // out from a 404.
+                    logger.warning(
+                        "Container log is incomplete; no log paths registered for it",
+                        metadata: [
+                            "docker_id": "\(containerData.id)",
+                            "log_dir": "\(logDir.path)",
+                            "found": "\(present.joined(separator: ","))",
+                            "required": "stdout.log,stderr.log,combined.log"
+                        ]
+                    )
+                }
             }
 
             logger.debug("Restored container from state", metadata: [

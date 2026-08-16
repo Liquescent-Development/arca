@@ -1,5 +1,6 @@
 import Foundation
 import GRPC
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 #if canImport(Darwin)
@@ -20,10 +21,32 @@ public struct EngineServer: Sendable {
 
     private let socketPath: String
     private let lock: SocketPathLock
+    private let drain: Drain
 
     /// Completes when the server has finished closing, however that was
     /// initiated.
     public var onClose: EventLoopFuture<Void> { server.onClose }
+
+    // **There is deliberately no `drained` property, and it is not an oversight.**
+    // One existed for a single round and it was loaded: reading it MINTED the
+    // promise, because its getter was `drain.promise().futureResult` and `Drain`
+    // creates on first ask. A caller that observed the drain and then shut the
+    // engine down by any other path -- the second-signal escalation, the
+    // `onClose` guard, or a bare `shutDown()` -- left a promise nothing would
+    // ever complete. MEASURED: a probe that did nothing but `_ = engine.drained`
+    // and then `shutDown()` normally gave `EngineServer.swift:443: Fatal error:
+    // leaking promise` and `exited with unexpected signal code 5` -- a dead test
+    // binary, no results for any test in the class.
+    //
+    // It justified itself as how `arca-engine` bounds the drain, and
+    // `arca-engine` never read it: the grace period is scheduled against the
+    // LOCAL future `beginGracefulShutdown()` returns. Its only reader was
+    // `runUntilQuiesced`, inside this type.
+    //
+    // **The affordance is gone rather than documented**, because a hazard on a
+    // public surface that is safe only while nobody uses it is not safe --
+    // especially one whose own doc invited the use that arms it. Anything
+    // needing the future gets it by initiating the shutdown it means to observe.
 
     /// Starts the engine on `socketPath`.
     ///
@@ -93,7 +116,189 @@ public struct EngineServer: Sendable {
             throw error
         }
 
-        return EngineServer(server: server, socketPath: socketPath, lock: lock)
+        return EngineServer(
+            server: server,
+            socketPath: socketPath,
+            lock: lock,
+            drain: Drain(eventLoop: group.next())
+        )
+    }
+
+    /// Asks the accepted connections to quiesce, and hands back the future that
+    /// completes when they have drained.
+    ///
+    /// **This exists so that `runUntilQuiesced` has no caller-supplied future to
+    /// get wrong, and that is the whole reason for the shape.** While the wait
+    /// took an `EventLoopFuture<Void>` parameter, `arca-engine` could pass
+    /// `engine.onClose` -- a public property of that exact type on that exact
+    /// object, one identifier away -- and reinstate the pre-fix defect at the
+    /// CALL SITE with the entire suite green. MEASURED at `723875a`, by a
+    /// reviewer rather than by me:
+    /// `runUntilQuiesced(connectionsDrained: engine.onClose)` gave `Executed 168
+    /// tests, with 0 failures`.
+    ///
+    /// **That mutation is now a compile error rather than a caught failure**,
+    /// which is the stronger of the two outcomes -- there is no argument to get
+    /// wrong. Re-applied against this shape it gives
+    /// `ArcaEngineCommand.swift:284:70: error: argument passed to call that
+    /// takes no arguments`. Initiating and waiting are two halves of one object
+    /// and neither takes a future from anyone.
+    ///
+    /// **Call this at most once**, which `arca-engine` guarantees structurally:
+    /// the call sits inside `if asked.recordAndReportFirst()`, and a second
+    /// signal takes the escalation branch instead, closing the listener rather
+    /// than draining. A second call would re-enter `initiateGracefulShutdown` on
+    /// an already-quiescing server, which is not a thing to ask for.
+    ///
+    /// **It is a rule, not a hazard, and an earlier revision of this paragraph
+    /// claimed otherwise.** It said handing the same promise over twice "would
+    /// complete it twice" -- stated as a consequence, never run. MEASURED: a
+    /// probe calling this twice and then `runUntilQuiesced()` passes cleanly, in
+    /// 0.016s, with no trap, no leak and no diagnostic. NIO's
+    /// `EventLoopFuture._setValue` is `if self._value == nil { ... }` and
+    /// silently drops a second completion, with no `precondition` on the success
+    /// path (swift-nio's `EventLoopFuture.swift:906-916`). The rule stands on the
+    /// server, not on the promise.
+    @discardableResult
+    public func beginGracefulShutdown() -> EventLoopFuture<Void> {
+        let promise = drain.promise()
+        server.initiateGracefulShutdown(promise: promise)
+        return promise.futureResult
+    }
+
+    /// Serves until every accepted connection has drained, then closes and gives
+    /// up the socket path.
+    ///
+    /// It waits on the drain `beginGracefulShutdown` starts, and takes no
+    /// argument on purpose -- see that method for the measurement that removed
+    /// the parameter.
+    ///
+    /// **This is not a pure wait.** It calls `shutDown()`, so it returns with the
+    /// server closed, the socket unlinked and the path lock released. A caller
+    /// that wants to observe the drain without ending the engine needs a
+    /// different method, not a flag on this one.
+    /// `testRunUntilQuiescedReleasesThePathItServedOn` is what holds that half:
+    /// with `shutDown()` deleted the lock is never released, and the successor
+    /// that test starts on the same path is refused.
+    ///
+    /// **Do not create the drain promise in `start()`, and that bound is
+    /// measured rather than reasoned about.** Storing `quiesced` as a `let` made
+    /// in `start()` is the obvious tidier refactor and it is unbuildable: every
+    /// `EngineServerTests` case starts an engine and never quiesces it, so every
+    /// one of them would deallocate an uncompleted promise. MEASURED with
+    /// exactly that change applied -- `ArcaEngine/EngineServer.swift:101: Fatal
+    /// error: leaking promise created at ...` (line 101 of the MUTATED tree,
+    /// where the `makePromise` sat; not an anchor into this one), and the test
+    /// binary died on the FIRST test to run with `unexpected signal code 5`. Not
+    /// a failing test: no results at all for any test in the class. The check is
+    /// `EventLoopFuture.deinit`, which under `debugOnly` calls `fatalError` when
+    /// a future deallocates with no value (swift-nio's
+    /// `EventLoopFuture.swift:479`).
+    ///
+    /// **A promise created when a shutdown is INITIATED is not that hazard, and
+    /// an earlier revision of this paragraph wrongly said it was.** It headlined
+    /// "do not move the promise onto `EngineServer`" full stop, which
+    /// generalised a measurement about `start()` into a verdict on the whole
+    /// design family -- and would have foreclosed `beginGracefulShutdown`, the
+    /// fix for a defect this comment sits above. `Drain` makes the promise on
+    /// first ask by either half, so an engine nothing shuts down never creates
+    /// one and has nothing to leak.
+    ///
+    /// **What this waits for is every ACCEPTED connection to have gone, and
+    /// that is a different event from the listening socket closing.** It used to
+    /// wait for `onClose`, which is the LISTENING channel's `closeFuture`, and
+    /// `ServerQuiescingHelper` closes that immediately -- before the connections
+    /// it has just asked to quiesce have finished doing so. So
+    /// `ServeCommand.run()` shut the event-loop group down underneath live
+    /// channels: each one's `closeFuture` callback then tried to schedule
+    /// `ChannelCollector.channelRemoved` on a loop that had gone, which NIO
+    /// reports as `Cannot schedule tasks on an EventLoop that has already shut
+    /// down`; the collector therefore never reached `shutdownCompleted()`, and
+    /// deallocated still holding the promise it makes at
+    /// `QuiescingHelper.swift:141` -- `Fatal error: leaking promise`,
+    /// `Trace/BPT trap: 5`, exit 133.
+    ///
+    /// **Every rate below was measured against binaries whose
+    /// `ServeCommand.serve` performed this wait inline, not against this
+    /// method.** They are evidence about waiting on the drain rather than on
+    /// `onClose`; they are not evidence that this method is protected, and what
+    /// protects it is named at the end of this comment.
+    ///
+    /// MEASURED with Gas Can's `shutdown.rs`, which stops 32 engines per figure
+    /// because at this rate a single clean shutdown is worth nothing. Two
+    /// binaries built from the code this replaces, run interleaved rather than
+    /// A-then-B: awaiting `onClose`, **6 crashes in 192**; awaiting the drain,
+    /// **0 in 192**. The container case, 32 engines each: **12/32 (38%)**
+    /// against `onClose`.
+    ///
+    /// **The defect never needed a container.** `docs/status/START-HERE.md`
+    /// recorded it as happening "once containers have been created", and that
+    /// was a correlate: an engine that never created one still crashed 1 time in
+    /// 96. A container widens the window -- more accepted traffic, more to tear
+    /// down -- it does not change the bug.
+    ///
+    /// **Handing `initiateGracefulShutdown` a promise rather than `nil` is a
+    /// consequence of the wait and NOT the fix**, and that was measured rather
+    /// than argued. A third binary that passes the promise in and still awaits
+    /// `onClose` -- the promise made, never waited on -- runs at **22/32 (69%)**,
+    /// WORSE than the original. The crash does not go quiet, it changes address:
+    /// the leaked promise stops being the collector's at
+    /// `QuiescingHelper.swift:141` and becomes the one `ServeCommand.serve`
+    /// makes, which the trace names as `ArcaEngineCommand.swift`. The `Cannot
+    /// schedule tasks` line is unchanged throughout, and that is the tell -- the
+    /// group is still going down under live channels, and only the bookkeeping
+    /// moved.
+    ///
+    /// **AN EARLIER VERSION OF THIS COMMENT, WHILE IT LIVED IN
+    /// `ArcaEngineCommand.swift`, SAID "NOTHING IN THIS REPOSITORY CAN PROVE ANY
+    /// OF IT". THAT WAS FALSE AND A REVIEWER DISPROVED IT BY WRITING THE TEST.**
+    /// The argument given was that a raw socket cannot be observed to have been
+    /// accepted, so the fixture would decide the assertion by a race. The race is
+    /// real but it is SETUP, not assertion, and it fails safe: an unaccepted
+    /// connection lets the close drain immediately, so the pending assertion goes
+    /// red rather than falsely green. Measured 20 runs, 20 passes, on a
+    /// single-threaded loop with `EngineServer.start` and
+    /// `SandboxEngineService.forTesting()`.
+    ///
+    /// **The PREMISE is pinned now, and pinning it is why this function exists.**
+    /// That the listener closes while an accepted connection is still open -- so
+    /// `onClose` completes and the drain does not -- is what
+    /// `EngineServerTests.testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener`
+    /// drives, against a real `EngineServer` and a raw peer holding the drain
+    /// open.
+    ///
+    /// **THE CALL SITE'S WRONG-ARGUMENT HALF IS CLOSED BY CONSTRUCTION AND THE
+    /// REST OF IT IS STILL NOT PINNED.** While this took a future,
+    /// `arca-engine` could pass `engine.onClose` and restore the defect at the
+    /// call site with the suite green -- MEASURED at `723875a` by a reviewer,
+    /// `Executed 168 tests, with 0 failures`. There is now no argument to get
+    /// wrong. What no test still reaches is that `ServeCommand.serve` calls this
+    /// at all: privacy is not what stops it -- `EngineProcess.swift` already
+    /// spawns the binary to prove call sites -- but `ServeCommand.run()` reaches
+    /// `networkManager.initialize()`, which constructs a real `VmnetNetwork`, so
+    /// it needs an entitlement and a host vmnet.
+    ///
+    /// **The mutation that matters -- awaiting `onClose` below instead of the
+    /// drain -- is what moving the wait here made visible, and both halves
+    /// of that were measured rather than argued.** Applied where the wait used
+    /// to live, to `try await quiesced.futureResult.get()` in
+    /// `ServeCommand.serve` at `fa1d707`, `swift test --filter ArcaEngineTests`
+    /// reported `Executed 167 tests, with 0 failures`: the defect fully restored
+    /// and the suite entirely green, with Gas Can's live tier the only
+    /// instrument that caught it. Applied to the first line below instead:
+    /// `Executed 169 tests, with 1 failure` --
+    /// `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener`'s
+    /// `XCTAssertNil failed: "returned"`, and no other test moved.
+    ///
+    /// **Deleting the second line was green until fix round 1, and half of what
+    /// moved here had no test.** It now gives `Executed 169 tests, with 1
+    /// failure`: `testRunUntilQuiescedReleasesThePathItServedOn` catches
+    /// `refusing to serve on ...: the engine with pid ... already holds it`,
+    /// because nothing released the lock. Restored, `Executed 169 tests, with 0
+    /// failures`.
+    public func runUntilQuiesced() async throws {
+        try await drain.promise().futureResult.get()
+        try await shutDown()
     }
 
     /// Closes the server, makes sure the socket is gone, and releases the path.
@@ -225,6 +430,74 @@ public struct EngineServer: Sendable {
                 base[index] = CChar(bitPattern: byte)
             }
             base[bytes.count] = 0
+        }
+    }
+}
+
+/// The one promise a graceful shutdown completes, shared by the half that
+/// starts the drain and the half that waits for it.
+///
+/// **A class because `EngineServer` is a value type and both halves must reach
+/// the same promise**, whichever runs first: `arca-engine` calls
+/// `runUntilQuiesced` from `serve()` and `beginGracefulShutdown` from a signal
+/// handler minutes later, and a test calls them in the opposite order. Creating
+/// the promise on first ask rather than in `init` is what makes that order
+/// irrelevant.
+///
+/// **It is also what keeps the promise out of `start()`.** A promise made for
+/// every engine is leaked by every engine nothing shuts down, which is every
+/// case in `EngineServerTests` -- and NIO turns that into a dead test binary
+/// rather than a failing test. The measurement is on `runUntilQuiesced`.
+///
+/// **What that buys is bounded, and an earlier revision of this paragraph
+/// overstated it.** It said "an engine that is never asked to quiesce never
+/// creates a promise at all", which was true only while nothing read the
+/// `drained` property this type published -- and reading it minted one, then
+/// killed the binary. Minting is reachable only through `beginGracefulShutdown`
+/// and `runUntilQuiesced`, both explicit calls that mean a shutdown is
+/// happening. Nothing arms it by reading any more.
+///
+/// **The two are NOT symmetric about completing what they mint, and the revision
+/// that corrected the sentence above introduced a second wrong one.** It said
+/// "the caller that makes either is the caller that completes it", which is
+/// false for one of the two and contradicts this type's own first paragraph --
+/// the whole reason `Drain` exists is that either half may run first.
+///
+/// - `beginGracefulShutdown` **completes what it mints**, handing the promise to
+///   the server in the same expression.
+/// - `runUntilQuiesced` **completes nothing.** It mints only if nothing has yet,
+///   and waits. With no shutdown ever initiated it waits forever, on a promise
+///   whose only completer never comes.
+///
+/// **That second case is inert rather than a leak, and it is measured -- by the
+/// re-review against `7aeee3c`, not here.** A probe calling `runUntilQuiesced()`
+/// with the shutdown never initiated passes: the `get()` blocked on the promise
+/// retains it, so the future never deallocates and `EventLoopFuture.deinit`'s
+/// `debugOnly` check never runs, and shutting the group down with it still
+/// pending produced no diagnostic. What is left is a task that waits forever,
+/// which is precisely the case `ArcaEngineCommand`'s `onClose` guard exists for.
+/// The same review measured the other order -- `shutDown()` first, then
+/// `beginGracefulShutdown` -- and a closed server still completes the promise,
+/// so the escalation path cannot strand one either.
+final class Drain: Sendable {
+    private let eventLoop: EventLoop
+    private let made = NIOLockedValueBox<EventLoopPromise<Void>?>(nil)
+
+    init(eventLoop: EventLoop) {
+        self.eventLoop = eventLoop
+    }
+
+    /// The promise, created on the first call and returned unchanged after.
+    ///
+    /// The check and the store are one critical section, so two callers racing
+    /// cannot end up holding different promises -- which would have the waiter
+    /// waiting on one that nothing will ever complete.
+    func promise() -> EventLoopPromise<Void> {
+        made.withLockedValue { made in
+            if let made { return made }
+            let promise = eventLoop.makePromise(of: Void.self)
+            made = promise
+            return promise
         }
     }
 }

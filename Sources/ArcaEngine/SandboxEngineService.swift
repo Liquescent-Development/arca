@@ -10,10 +10,22 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, eight of the eleven are implemented: `Capabilities`,
-/// `Inspect`, `ListResources`, `PrepareImage`, `Create`, `Start`, `Stop` and
-/// `Remove`.** The other three -- `CreateContainer`, `Exec` and `Logs` -- answer
-/// `unsupported_capability` inside their response `oneof`.
+/// **All eleven are implemented, and none answers `unsupported_capability`.**
+/// `Exec` was the last, and with it the contract's whole surface answers for
+/// real.
+///
+/// **The two streaming methods share one problem and therefore one shape.** A
+/// test target cannot construct a `GRPCAsyncResponseStreamWriter`, so a method
+/// whose body wrote to one would be unreachable from every test in this
+/// repository. Both keep their logic one level in -- `streamLogs(request:into:)`
+/// and `runExec(frames:into:)` -- taking a **sink** rather than returning their
+/// frames, because a seam that returned them would make a streaming method
+/// buffer its whole answer before sending any of it. The protocol methods below
+/// supply the writer and nothing else.
+///
+/// What that seam does **not** buy is worth stating in the same breath: `Exec`
+/// end to end needs a booted guest, so what these tests reach is its refusals
+/// and its adapters. Gascan's live `exec.rs` is what says a byte ever crossed.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -26,31 +38,37 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
 
     // `containerManager` is read by `inspect(request:)` and, with
     // `volumeManager` and `networkManager`, by `listResources(request:)` below.
-    // `imageManager` is read by `prepareImage(request:)`. `execManager` is held
-    // and, in this build, unread. Deliberate on both counts.
+    // `imageManager` is read by `prepareImage(request:)`, and `execManager` by
+    // `runExec(frames:into:)`.
     //
-    // Unread because the method that would consult it -- `Exec` -- is among the
-    // seven this build does not implement. Held because
-    // the dependency edge is itself a shipped property: gascan's
-    // tests/release/engine-targets-check.sh asserts that `arca-engine` and
-    // `ArcaEngine` reach neither `DockerAPI` nor `ArcaDaemon`, and that
-    // assertion measures something only while this target genuinely depends on
-    // ContainerBridge. Dropping the two to silence an unused-property reading
-    // would make the release gate pass for a reason that has nothing to do with
-    // what it exists to prove.
+    // **`execManager` was held and unread until milestone 3's task 6**, because
+    // the method that consults it -- `Exec` -- was the last one this build did
+    // not implement. It was kept rather than dropped, and that reasoning still
+    // applies to anything else that looks unused here: the dependency edge is
+    // itself a shipped property. Gascan's tests/release/engine-targets-check.sh
+    // asserts that `arca-engine` and `ArcaEngine` reach neither `DockerAPI` nor
+    // `ArcaDaemon`, and that assertion measures something only while this target
+    // genuinely depends on ContainerBridge. Dropping a property to silence an
+    // unused-property reading would make the release gate pass for a reason that
+    // has nothing to do with what it exists to prove.
     let containerManager: ContainerManager
     let volumeManager: VolumeManager
     let networkManager: NetworkManager
     let imageManager: ImageManager
-    let execManager: ExecManager
+    /// `any ExecInstanceSource` rather than `ExecManager`, for the reason
+    /// recorded on that protocol: the concrete actor cannot be made to hang, and
+    /// a teardown that cannot be made to hang is a teardown nothing tests.
+    let execManager: any ExecInstanceSource
     let logger: Logger
 
-    public init(
+    /// `package` rather than `public` because `ExecInstanceSource` is, and
+    /// because the only caller is `EngineManagers.makeService(execManager:)`.
+    package init(
         containerManager: ContainerManager,
         volumeManager: VolumeManager,
         networkManager: NetworkManager,
         imageManager: ImageManager,
-        execManager: ExecManager,
+        execManager: any ExecInstanceSource,
         logger: Logger
     ) {
         self.containerManager = containerManager
@@ -79,7 +97,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// is true before its code exists induces a consumer to send a request the
     /// engine cannot honour.
     ///
-    /// **Four flags are true, and each one names a live test that drove the
+    /// **Six flags are true, and each one names a live test that drove the
     /// capability from outside this engine's own store.** `Inspect` reports what
     /// the store holds, deliberately, so it can corroborate none of them; every
     /// flag below that is true was earned by an observation of the guest or of
@@ -126,8 +144,28 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     ///   not the assertion that carries the claim: the targets exist in the
     ///   image, so the write landed in the container's own overlay.
     ///
-    /// `tty` and `signals` are milestone 3's, with `Exec`. `offline` stays
-    /// `.unverified` until milestone 4 proves it.
+    /// - `tty`: the guest process itself answers `test -t 1`, and its stderr
+    ///   arrives **merged into stdout** -- which happens only because a terminal
+    ///   puts both descriptors on one pty. Earned by
+    ///   `exec::a_tty_exec_gives_the_guest_a_terminal_and_merges_stderr_into_stdout`.
+    ///   SEEN TO FAIL, and isolated: with `processConfig.terminal` in
+    ///   `ExecManager.startExec` forced to `false`, the same request came back
+    ///   `stdout: "notatty\n", stderr: "err\n"` -- the guest reporting no
+    ///   terminal, and the two streams no longer merged. The control arm of that
+    ///   test, `tty` unset, asserts the opposite pair, so a build that always
+    ///   allocated a terminal fails too.
+    /// - `signals`: a signal sent mid-exec reaches the guest process and decides
+    ///   how it exits -- SIGTERM gives 143 and SIGKILL 137, so the number the
+    ///   client sent is the number that arrived. Earned by
+    ///   `exec::a_signal_reaches_the_guest_process_and_decides_how_it_exits`.
+    ///   SEEN TO FAIL, and this one is the reason the flag waited for a live
+    ///   test at all: with `try await process.kill(resolved)` deleted from
+    ///   `ExecManager.signalExec`, **`swift test --filter ArcaEngineTests` stays
+    ///   at `Executed 221 tests, with 0 failures`** and the live test fails at
+    ///   its 60-second bound with `no Exit frame`. The VM-free suite pins the
+    ///   guards; only the tier sees the send.
+    ///
+    /// `offline` stays `.unverified` until milestone 4 proves it.
     func capabilities(request: Arca_Engine_V1_CapabilitiesRequest) async -> Arca_Engine_V1_CapabilitiesResponse {
         guard let version = engineVersion(from: ArcaVersion.version) else {
             return Arca_Engine_V1_CapabilitiesResponse.with {
@@ -143,8 +181,8 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
                 capabilities.contractMinor = 0
                 capabilities.projectMount = true
                 capabilities.namedVolumes = true
-                capabilities.tty = false
-                capabilities.signals = false
+                capabilities.tty = true
+                capabilities.signals = true
                 capabilities.loopbackPublish = true
                 capabilities.resourceLimits = true
                 capabilities.offline = .unverified
@@ -390,6 +428,22 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
             )
         }
 
+        return await buildContainer(spec: spec, created: created)
+    }
+
+    /// The container phase of a create, shared by `Create` and `CreateContainer`.
+    ///
+    /// **Extracted rather than duplicated, and the reason is a mutation that
+    /// survived.** `createSpec`'s comment records that a review replaced the one
+    /// line deciding the image reference with `references.first ?? …` and the whole
+    /// suite stayed green -- every sandbox would have recorded a tag and every
+    /// `Inspect` would have answered `invalid_output`. Two independent container
+    /// build paths would let exactly that drift back in on one of them.
+    private func buildContainer(
+        spec: SandboxContainerSpec,
+        created: [Arca_Engine_V1_Resource]
+    ) async -> Arca_Engine_V1_CreateResponse {
+        var created = created
         let container = await Self.createCatching(resource: spec.name) {
             try await self.containerManager.createContainer(
                 image: spec.image,
@@ -671,12 +725,146 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     }
 
     /// See the note on the `create(request:)` overload above.
-    func createContainer(request: Arca_Engine_V1_CreateContainerRequest) async -> Arca_Engine_V1_CreateResponse {
-        Arca_Engine_V1_CreateResponse.with {
-            $0.failed = Arca_Engine_V1_CreateFailed.with {
-                $0.error = Self.notImplemented("CreateContainer")
+    ///
+    /// **The container only.** `engine.proto:296-302` states it: everything named
+    /// in `retained` already exists and is reused, so this creates no volume and no
+    /// network. Gas Can already enforces the other half --
+    /// `CreateOutcome::for_recreate` refuses an answer carrying the whole topology
+    /// (`crates/gascan-arca/tests/backend_unary.rs:740`) -- so an engine that
+    /// rebuilt a retained resource would be caught there rather than here.
+    func createContainer(
+        request: Arca_Engine_V1_CreateContainerRequest
+    ) async -> Arca_Engine_V1_CreateResponse {
+        if let refusal = await reusedTopologyRefusal(request) {
+            return Self.createFailed([], refusal)
+        }
+
+        let spec: SandboxContainerSpec
+        switch await createSpec(for: request.create) {
+        case .failure(let error):
+            return Self.createFailed([], error)
+        case .success(let translated):
+            spec = translated
+        }
+
+        return await buildContainer(spec: spec, created: [])
+    }
+
+    /// Why this recreate may not reuse the topology it names, or nil.
+    ///
+    /// **It verifies what the container will actually mount, and the first version
+    /// of this guard did not.** It checked `request.retained` -- a list the caller
+    /// supplies -- while the binds are built from `request.create.volumes`
+    /// (`EngineCreate.swift:106-123`) and the attachment from
+    /// `request.create.network`. Those are independent fields, so a request with
+    /// `retained: []` and populated `create.volumes` passed the guard untouched and
+    /// built the container: **the exact silent failure the guard exists to prevent,
+    /// reachable with the guard fully intact.** MEASURED by Task 1's review, which
+    /// also found that the test written to prove the guard asserted that bypass as
+    /// intended behaviour.
+    ///
+    /// So the topology is the subject and `retained` is an assertion the caller must
+    /// match, rather than the sole source of truth. Each volume the container will
+    /// mount, and the network it will attach to, must be:
+    ///
+    /// 1. named in `retained` -- the caller has to have declared it is reusing this,
+    ///    because a topology entry the caller never claimed is one nobody has said
+    ///    already exists;
+    /// 2. held by this engine, and
+    /// 3. owned by the caller, on the same three-tier comparison `Remove` uses.
+    ///
+    /// **This is not a contract change.** The wire format is untouched and
+    /// `engine.proto` does not forbid an engine refusing more than the minimum.
+    ///
+    /// **The reverse direction is deliberately not checked**: a `retained` entry
+    /// naming something outside the topology is ignored rather than refused. The
+    /// engine's business here is the mount, and Gas Can's
+    /// `validate_retained_resources` (`crates/gascan-core/src/runtime.rs:893-918`)
+    /// already requires exact count equality client-side, so refusing extras would
+    /// add a refusal no client can trigger and no test could keep honest.
+    ///
+    /// Containers are not in the topology this walks: the container is what this RPC
+    /// builds, so one appearing in `retained` is the caller's error and
+    /// `containerManager.createContainer` refuses it as a name conflict with a
+    /// better message than this could give.
+    private func reusedTopologyRefusal(
+        _ request: Arca_Engine_V1_CreateContainerRequest
+    ) async -> Arca_Engine_V1_EngineError? {
+        for resource in Self.reusedTopology(of: request.create) {
+            // `createSpec` refuses an unnamed volume with `invalid_resource_identity`
+            // (`EngineCreate.swift:106-113`), and this guard now runs in front of it
+            // -- so without this the same request answers `not_found` carrying an
+            // EMPTY `resource` field and the message "this engine holds no volume
+            // named ". "The `resource` field names the offender" is a stated rule of
+            // this contract and an empty string names nothing. This preserves the
+            // answer the caller used to get rather than inventing a new one.
+            guard !resource.name.isEmpty else {
+                return engineError(
+                    .invalidResourceIdentity,
+                    resource: SandboxIdentity.containerName(forSandboxId: request.create.sandboxID),
+                    message: "a \(resource.kind.noun) in this request carries no name"
+                )
+            }
+
+            // The KIND half of this comparison is as load-bearing as the name half:
+            // without it a `retained` entry naming a volume would satisfy the
+            // network's requirement, and vice versa. Gas Can's names make that
+            // collision unlikely rather than impossible, and `resourceKind` exists
+            // precisely so the comparison can be total.
+            guard request.retained.contains(where: {
+                $0.identity.kind == resource.kind.resourceKind && $0.identity.name == resource.name
+            }) else {
+                return engineError(
+                    .invalidState,
+                    resource: resource.name,
+                    message: "this recreate mounts \(resource.kind.noun) \(resource.name) but "
+                        + "does not retain it; every resource the container reuses must be named "
+                        + "in retained"
+                )
+            }
+
+            // `storedLabels` rather than a lookup written here, because it is the
+            // one place that already distinguishes "this engine does not hold it"
+            // from "I could not tell" -- it catches `VolumeError.notFound` alone
+            // and turns any other throw into `command_io`. A blanket catch would
+            // report a failed store read as `not_found`, which instructs a
+            // reconciler to rebuild a volume that exists; that is the confusion
+            // `NetworkManager.swift:707-714` records as having made prune delete
+            // an in-use network.
+            let stored: [String: String]?
+            switch await storedLabels(kind: resource.kind, name: resource.name) {
+            case .failure(let error): return error
+            case .success(let labels): stored = labels
+            }
+
+            if let refusal = ownershipRefusal(
+                kind: resource.kind,
+                name: resource.name,
+                storedLabels: stored,
+                owner: request.create.owner,
+                action: .reuse
+            ) {
+                return refusal
             }
         }
+        return nil
+    }
+
+    /// The resources a recreate reuses: exactly what the rebuilt container mounts
+    /// and attaches to, read from the same fields the spec is built from.
+    ///
+    /// Derived from `create` rather than from `retained` so that the guard and the
+    /// container cannot come to disagree about what the topology is. An offline
+    /// sandbox contributes no network, which is why the network is a `case` and not
+    /// an unconditional append.
+    private static func reusedTopology(
+        of request: Arca_Engine_V1_CreateRequest
+    ) -> [(kind: RemovableKind, name: String)] {
+        var topology = request.volumes.map { (kind: RemovableKind.volume, name: $0.name) }
+        if case .networkedName(let networkName) = request.network.mode {
+            topology.append((kind: .network, name: networkName))
+        }
+        return topology
     }
 
     public func createContainer(
@@ -1020,24 +1208,208 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         await remove(request: request)
     }
 
+    /// The thin half of `Exec`: it accepts the RPC, supplies the writer, and
+    /// does nothing else.
+    ///
+    /// Everything this method could get wrong lives in `runExec` above it, for
+    /// the reason `logs` records one method down -- a test target cannot
+    /// construct a `GRPCAsyncResponseStreamWriter`, so anything written here is
+    /// untestable in this repository by construction.
+    ///
+    /// **`acceptRPC` is the one line here that is not plumbing, and without it
+    /// every interactive exec deadlocks.** grpc-swift accepts an RPC implicitly
+    /// when the first response message is sent, so an engine that says nothing
+    /// sends no response headers -- and tonic's bidirectional call does not
+    /// return a stream to its caller until those headers arrive
+    /// (`gascan-arca/src/channel.rs:177-182`). A consumer that must write before
+    /// the guest will speak is therefore stuck inside `exec()`, unable to send
+    /// the stdin that would produce the output that would release it. That is a
+    /// deadlock in the case `Exec` most exists for: a shell, a REPL, anything
+    /// waiting on input.
+    ///
+    /// MEASURED, and it is how this was found. Against the engine without this
+    /// line, gascan's live
+    /// `exec::exec_carries_both_streams_and_the_commands_own_exit_status` ran
+    /// its first exec -- `sh -c 'echo out; echo err 1>&2; exit 3'` -- to a
+    /// correct exit status of 3, because that command writes before it is asked
+    /// for anything, and then hung on its second, `cat`. The engine's own log
+    /// shows `Exec instance started pid=792` and nothing further for nine
+    /// minutes, while every await on the client side had a bound and none of
+    /// them fired: the test was still inside `backend.exec()`. **The RPC that
+    /// works is the one that happens to speak first, which is exactly the shape
+    /// of defect that ships.**
     public func exec(
         requestStream: GRPCAsyncRequestStream<Arca_Engine_V1_ExecClientFrame>,
         responseStream: GRPCAsyncResponseStreamWriter<Arca_Engine_V1_ExecServerFrame>,
         context: GRPCAsyncServerCallContext
     ) async throws {
-        try await responseStream.send(
-            Arca_Engine_V1_ExecServerFrame.with { $0.error = Self.notImplemented("Exec") }
-        )
+        await context.acceptRPC(headers: [:])
+        try await runExec(frames: requestStream) { frame in
+            try await responseStream.send(frame)
+        }
     }
 
+    /// `Logs`, with the writer it sends through supplied by the caller.
+    ///
+    /// **A sink and not a returned array, and the difference is the method's
+    /// whole reason for streaming.** A test target cannot construct a
+    /// `GRPCAsyncResponseStreamWriter`, so this carries the logic and the
+    /// protocol method below only supplies the writer -- the same test seam
+    /// `inspect(request:)` and the rest use one method up. Those methods return
+    /// one message; this one returns a stream, and an earlier version of this
+    /// seam returned `[LogsChunk]`, which turned the streaming method into a
+    /// buffering one: the client got no bytes at all until the whole log had
+    /// been read, filtered, concatenated and cut, and a client timeout inside
+    /// that window looks like an unreachable engine rather than a slow log. The
+    /// sink keeps the frames assertable in this target and holds none of them.
+    ///
+    /// **An unlabelled or foreign container is refused before anything is
+    /// read, by the rule and the codes `Inspect` uses**, and for `Inspect`'s
+    /// reason: a container name is a flat namespace this engine does not own,
+    /// so a sandbox id can resolve to something that is not this engine's, and
+    /// handing back its output would be handing back a stranger's. The engine
+    /// is not deciding whether a labelled container is the caller's -- that
+    /// judgment stays with the consumer, as `engine.proto:143-148` requires --
+    /// it is declining to assert that an unlabelled one **is** the sandbox that
+    /// was asked for.
+    ///
+    /// **A sandbox that is not there is `not_found`, where `Inspect` answers
+    /// `absent`.** `LogsChunk` has two arms and no absent one, and the
+    /// distinction `InspectResponse` draws between "not there" and "I could not
+    /// tell" is drawn here between `not_found` and `command_io`.
+    ///
+    /// **A sandbox that exists but has never run is an empty stream, not an
+    /// error.** `getLogPaths` answers nil until `createLogWriters` has run for
+    /// that container, which is what a created-but-never-started sandbox looks
+    /// like, and an empty log is the honest report of one. A container whose
+    /// paths ARE registered but whose file is missing is a different fact and
+    /// arrives as `command_io`: that is a log that was there and is not.
+    ///
+    /// **Zero frames is a complete answer.** The consumer concatenates data
+    /// frames, so an empty log is an empty concatenation
+    /// (`gascan-arca/src/backend.rs:365-377`). Every frame this does send sets
+    /// its `oneof`; an unset outcome reaches gascan as `invalid_output`.
+    ///
+    /// **`containerNameRefusal` runs first, and `Logs` is why the argument that
+    /// excused `Inspect` from it does not carry.** That gate exists because
+    /// `ContainerManager.resolveContainerID` prefix-matches any pure-hex string
+    /// of four or more characters against every Docker id it holds. The note on
+    /// `SandboxIdentity.refusalReason(forSandboxId:)` records that this was
+    /// harmless while every implemented method was read-only, because "the worst
+    /// outcome was an `Inspect` reporting the wrong container, which the
+    /// consumer's own ownership check catches". `Logs` is read-only and that
+    /// reasoning still fails for it: a `LogsChunk` carries bytes and no labels,
+    /// so the consumer has nothing to check. Without this gate a sandbox id of
+    /// `beef` returns an unrelated container's output, and when that container
+    /// is itself gascan-labelled the ownership guard below passes it through.
+    /// The refusal is `invalid_resource_identity`, as it is on `Create`,
+    /// `Start`, `Stop` and `Remove`.
+    ///
+    /// **A failure of `sink` is not a failure of `Logs`**, and `LogSinkFailure`
+    /// below is what tells them apart. See it for why.
+    func streamLogs(
+        request: Arca_Engine_V1_LogsRequest,
+        into sink: (Arca_Engine_V1_LogsChunk) async throws -> Void
+    ) async throws {
+        let name = SandboxIdentity.containerName(forSandboxId: request.sandboxID)
+        if let refusal = containerNameRefusal(name) {
+            return try await sink(Self.logsFailed(refusal))
+        }
+        let found = await engineErrorCatching(.commandIo, resource: name) {
+            try await self.containerManager.getContainer(id: name)
+        }
+        let container: Container
+        switch found {
+        case .failure(let error):
+            return try await sink(Self.logsFailed(error))
+        case .success(nil):
+            return try await sink(Self.logsFailed(engineError(
+                .notFound,
+                resource: name,
+                message: "no container named \(name) exists, so it has no log"
+            )))
+        case .success(.some(let resolved)):
+            container = resolved
+        }
+        guard SandboxIdentity.owner(from: container.config.labels) != nil else {
+            return try await sink(Self.logsFailed(engineError(
+                .foreignResourceRefused,
+                resource: name,
+                message: "container \(name) carries no gascan owner labels, so this engine "
+                    + "cannot assert it is the sandbox that was asked for"
+            )))
+        }
+        // Reached without awaiting the actor: `logManager` is a
+        // `nonisolated let` on `ContainerManager` and says so.
+        guard let paths = containerManager.logManager.getLogPaths(dockerID: container.id) else {
+            return
+        }
+        do {
+            try await LogReader.stream(
+                combinedPath: paths.combinedPath,
+                sinceUnixMillis: request.hasSinceUnixMillis ? request.sinceUnixMillis : nil
+            ) { chunk in
+                do {
+                    try await sink(Arca_Engine_V1_LogsChunk.with { $0.data = chunk })
+                } catch {
+                    throw LogSinkFailure(underlying: error)
+                }
+            }
+        } catch let failure as LogSinkFailure {
+            // Nothing to report and nowhere to report it: the writer is what
+            // broke. It leaves this method as a status, which is what
+            // `engine.proto:52-58` reserves statuses for.
+            throw failure.underlying
+        } catch {
+            // The read failed, possibly after frames have already gone. Saying
+            // so is the point: `gascan-arca/src/backend.rs:346-352` discards
+            // what arrived on an error frame, "because the signature has no way
+            // to say 'here is some of it, and also it broke'".
+            try await sink(Self.logsFailed(
+                engineError(.commandIo, resource: name, message: "\(error)")
+            ))
+        }
+    }
+
+    /// **A failure of `sink` is not a failure of `Logs`.** The two are told
+    /// apart because they demand opposite answers: a log that could not be read
+    /// is reported to the consumer through an error frame, and a consumer that
+    /// has gone away cannot be reported anything. Merging them would either
+    /// describe a broken connection as `command_io` -- putting a transport
+    /// message inside an engine error's prose -- or swallow a real read failure
+    /// because the send after it also failed.
+    ///
+    /// Declared **after** `streamLogs` on purpose. It sat between that method
+    /// and its doc comment, which attached the whole contract -- the refusal
+    /// rules, the `not_found`-where-`Inspect`-says-`absent` distinction, and the
+    /// resolver-hazard rationale that stops a cross-sandbox disclosure -- to
+    /// this two-field error wrapper, leaving `streamLogs` with no documentation
+    /// at all on hover, in Xcode and in `swift-docc`. Nothing behaved
+    /// differently, which is exactly why it would have survived.
+    private struct LogSinkFailure: Error {
+        let underlying: Error
+    }
+
+    /// The failure arm of a `LogsChunk`, in one place, for `ackFailed`'s reason.
+    private static func logsFailed(
+        _ error: Arca_Engine_V1_EngineError
+    ) -> Arca_Engine_V1_LogsChunk {
+        Arca_Engine_V1_LogsChunk.with { $0.error = error }
+    }
+
+    /// **No follow mode, and none is to be added.** `engine.proto:474-476` says
+    /// so in bold and gives the reason: a follow mode is the first step back
+    /// toward a general container API, and this contract has a size budget for
+    /// exactly that. The stream ends when the log the request asked for has
+    /// been sent.
     public func logs(
         request: Arca_Engine_V1_LogsRequest,
         responseStream: GRPCAsyncResponseStreamWriter<Arca_Engine_V1_LogsChunk>,
         context: GRPCAsyncServerCallContext
     ) async throws {
-        try await responseStream.send(
-            Arca_Engine_V1_LogsChunk.with { $0.error = Self.notImplemented("Logs") }
-        )
+        try await streamLogs(request: request) { chunk in
+            try await responseStream.send(chunk)
+        }
     }
 
     /// See the note on the `create(request:)` overload above.
