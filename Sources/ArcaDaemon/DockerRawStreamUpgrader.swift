@@ -720,19 +720,19 @@ final class DockerRawStreamUpgrader: HTTPServerProtocolUpgrader, Sendable {
                 return
             }
 
-            let content = try String(contentsOf: path, encoding: .utf8)
-            let lines = content.components(separatedBy: .newlines)
+            // Split and parse with ContainerBridge's own codec, both halves.
+            // The parse must be the writer's, because a default-options
+            // ISO8601DateFormatter returns nil for the fractional-seconds
+            // stamps it emits and would leave this an empty log rather than an
+            // error. The SPLIT must be the writer's too: this line read
+            // `components(separatedBy: .newlines)`, a CharacterSet covering
+            // U+2028, U+2029 and U+0085, which `JSONEncoder` leaves raw inside
+            // a JSON string -- so an entry containing one was cut in half and
+            // both halves were skipped.
+            let content = try Data(contentsOf: path)
 
-            for line in lines {
-                guard !line.isEmpty else { continue }
-
-                // Parse the JSON log entry with ContainerBridge's own codec.
-                // A default-options ISO8601DateFormatter cannot read the
-                // fractional-seconds stamps the writer emits and returns nil
-                // for every one, which would leave this an empty log rather
-                // than an error.
-                guard let data = line.data(using: .utf8),
-                      let entry = try? ContainerBridge.ContainerLogCodec.decode(line: data),
+            for lineData in ContainerBridge.ContainerLogCodec.allLines(of: content) {
+                guard let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
                       let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
                       let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                     continue

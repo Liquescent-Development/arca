@@ -471,9 +471,16 @@ public actor ContainerManager {
             let stderrPath = logDir.appendingPathComponent("stderr.log")
             let combinedPath = logDir.appendingPathComponent("combined.log")
 
-            // Only register if log files exist
+            // Only register if log files exist. All three are checked, and
+            // `combined.log` is in the guard for the same reason the other two
+            // are: registering a path makes `getLogPaths` answer non-nil, and
+            // `Logs` reads the combined file, so registering one that is not
+            // there turns "this container has no log" into a `command_io`
+            // failure. A container restored from a state store written before
+            // that file had a writer is exactly the case.
             if FileManager.default.fileExists(atPath: stdoutPath.path) &&
-               FileManager.default.fileExists(atPath: stderrPath.path) {
+               FileManager.default.fileExists(atPath: stderrPath.path) &&
+               FileManager.default.fileExists(atPath: combinedPath.path) {
                 // Register log paths in logManager (internal method call needed)
                 // We can't use createLogWriters() because it would truncate existing logs
                 // Instead, we directly register the paths using the LogPaths struct

@@ -17,11 +17,12 @@ import Logging
 /// default-options `ISO8601DateFormatter` cannot *parse* a fractional-seconds
 /// stamp -- `date(from:)` returns nil for it -- so two spellings here would not
 /// be a rounding difference between writer and reader, they would be a reader
-/// that discards every line the writer produced. Both readers of these files in
-/// this repository skip an entry whose `time` will not parse
-/// (`DockerAPI/Handlers/ContainerHandlers.swift`,
-/// `ArcaDaemon/DockerRawStreamUpgrader.swift`), so the failure would arrive as
-/// an empty log rather than as an error.
+/// that discards every line the writer produced. Four readers parse these files
+/// -- `ArcaEngine/LogReader.swift`, two in
+/// `DockerAPI/Handlers/ContainerHandlers.swift` and one in
+/// `ArcaDaemon/DockerRawStreamUpgrader.swift` -- and the three on the Docker
+/// surface skip an entry whose `time` will not parse, so the failure would
+/// arrive there as an empty log rather than as an error.
 public enum LogEntryTimestamp {
     /// A fresh formatter per call, matching what this file did before: a
     /// `static let` would share one `ISO8601DateFormatter` across the two
@@ -129,6 +130,48 @@ public enum ContainerLogCodec {
         var line = try encoder.encode(entry)
         line.append(UInt8(ascii: "\n"))
         return line
+    }
+
+    /// **The one definition of "a line" in a log file, for every reader of one.**
+    ///
+    /// `0x0A` and nothing else. That is not a stylistic choice, it is the
+    /// difference between an entry reaching a consumer and vanishing without an
+    /// error. `JSONEncoder` escapes the C0 controls but emits U+2028, U+2029 and
+    /// U+0085 raw, because all three are legal inside a JSON string; Foundation's
+    /// `CharacterSet.newlines` covers all three. MEASURED, encoding
+    /// `"a\u{2028}b\n"`: the line holds no `0x0A` byte at all, splits into **two**
+    /// pieces under `.newlines` and **one** under `"\n"`. A reader splitting on
+    /// `.newlines` therefore cuts that entry in half, fails to parse either half,
+    /// and skips both -- the container's output disappears from its log.
+    ///
+    /// Every reader of these files goes through this function so that there is
+    /// no second spelling for the mistake to live in.
+    ///
+    /// - Returns: the complete lines, and the trailing bytes after the last
+    ///   terminator. The remainder is returned rather than swallowed because an
+    ///   incremental reader needs to carry it into the next window, and a
+    ///   whole-file reader needs to see that a torn write left one.
+    public static func lines(of data: Data) -> (lines: [Data], remainder: Data) {
+        var lines: [Data] = []
+        var start = data.startIndex
+        while let terminator = data[start...].firstIndex(of: UInt8(ascii: "\n")) {
+            if terminator > start {
+                lines.append(Data(data[start..<terminator]))
+            }
+            start = data.index(after: terminator)
+        }
+        return (lines, Data(data[start...]))
+    }
+
+    /// The same split, for a reader that holds the whole file.
+    ///
+    /// A trailing partial line is a line. The writer terminates every entry, so
+    /// one can only come from a torn write, and reporting it as an unreadable
+    /// entry is what `LogReader` does with it; silently dropping it would make a
+    /// truncated log read as a complete one.
+    public static func allLines(of data: Data) -> [Data] {
+        let split = lines(of: data)
+        return split.remainder.isEmpty ? split.lines : split.lines + [split.remainder]
     }
 
     public static func decode(line: Data) throws -> ContainerLogEntry {
@@ -245,8 +288,17 @@ public final class FileLogWriter: Writer, @unchecked Sendable {
             let line = try ContainerLogCodec.encode(
                 ContainerLogCodec.entry(stream: stream, payload: payload, at: Date())
             )
-            try file.append(line)
+            // Combined first, deliberately. These are two fallible operations
+            // and nothing makes them one, so a disk failure between them leaves
+            // the line in one file and not the other -- and `BroadcastWriter`
+            // swallows a single subscriber's error unless every subscriber
+            // fails, so the divergence can arrive silently. Ordering it this
+            // way means the file `Logs` reads is the one that gets the line,
+            // and the divergence costs the Docker surface an entry rather than
+            // costing the contract one. **Nothing here detects the divergence
+            // and no test can force it**; the ordering is the whole mitigation.
             try combined.append(line)
+            try file.append(line)
         }
     }
 
@@ -340,6 +392,21 @@ public final class ContainerLogManager: @unchecked Sendable {
     /// one file both writers append to, so this manager is its only owner and
     /// `removeLogs` its only closer; a second call for the same container
     /// reuses the open file rather than opening a second handle onto it.
+    ///
+    /// **Nothing is recorded until everything has been built.** Both
+    /// dictionaries are written after the last fallible step, so a writer that
+    /// fails to open cannot leave behind a combined handle that only
+    /// `removeLogs` would ever close, or registered `logPaths` for writers that
+    /// do not exist. A handle opened by this call and then orphaned by a
+    /// failure is closed here, and a failure to close it is reported rather
+    /// than swallowed -- but the original error is what leaves, because it is
+    /// the one that says why the writers were not created.
+    ///
+    /// The manager lock is held across this file I/O. That is intentional: the
+    /// open-or-reuse decision and the two registrations have to be one step, or
+    /// two concurrent calls open two handles onto one file. It cannot deadlock
+    /// -- the only lock order here is manager then `LogFile`, and no
+    /// `FileLogWriter` ever takes the manager lock.
     public func createLogWriters(dockerID: String) throws -> (FileLogWriter, FileLogWriter) {
         let logDir = containerLogDir(dockerID: dockerID)
 
@@ -355,28 +422,38 @@ public final class ContainerLogManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        let combined: LogFile
-        if let existing = combinedFiles[dockerID] {
-            combined = existing
-        } else {
-            combined = try LogFile(path: combinedPath)
-            combinedFiles[dockerID] = combined
+        let held = combinedFiles[dockerID]
+        let combined = try held ?? LogFile(path: combinedPath)
+
+        let writers: (FileLogWriter, FileLogWriter)
+        do {
+            writers = (
+                try FileLogWriter(path: stdoutPath, stream: "stdout", combined: combined),
+                try FileLogWriter(path: stderrPath, stream: "stderr", combined: combined)
+            )
+        } catch {
+            if held == nil {
+                do {
+                    try combined.close()
+                } catch let closeError {
+                    logger.error("Could not close an orphaned combined log", metadata: [
+                        "docker_id": "\(dockerID)",
+                        "path": "\(combinedPath.path)",
+                        "error": "\(closeError)"
+                    ])
+                }
+            }
+            throw error
         }
 
-        let stdoutWriter = try FileLogWriter(
-            path: stdoutPath, stream: "stdout", combined: combined
-        )
-        let stderrWriter = try FileLogWriter(
-            path: stderrPath, stream: "stderr", combined: combined
-        )
-
+        combinedFiles[dockerID] = combined
         logPaths[dockerID] = LogPaths(
             stdoutPath: stdoutPath,
             stderrPath: stderrPath,
             combinedPath: combinedPath
         )
 
-        return (stdoutWriter, stderrWriter)
+        return writers
     }
 
     /// Get log paths for a container

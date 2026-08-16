@@ -1258,23 +1258,20 @@ public struct ContainerHandlers: Sendable {
         try fileHandle.seek(toOffset: position)
         let data = fileHandle.readDataToEndOfFile()
 
-        guard let content = String(data: data, encoding: .utf8) else {
-            return Data()
-        }
-
-        let lines = content.components(separatedBy: .newlines)
+        // Split and parse with ContainerBridge's own codec, over the bytes.
+        // Both halves matter. The parse must be the writer's, because a
+        // default-options ISO8601DateFormatter returns nil for the
+        // fractional-seconds stamps it emits and would drop every line. The
+        // SPLIT must be the writer's too: `components(separatedBy: .newlines)`
+        // stood here and covers U+2028, U+2029 and U+0085, which `JSONEncoder`
+        // leaves raw inside a JSON string because all three are legal there --
+        // so a container that printed one had its entry cut in half, both
+        // halves failed to parse, and the line vanished from `docker logs` with
+        // no error. `ContainerLogCodec.lines` is `0x0A` and nothing else.
         var logEntries: [LogEntry] = []
 
-        for line in lines {
-            guard !line.isEmpty else { continue }
-
-            // Through ContainerBridge's codec rather than a second hand-rolled
-            // parse: it is the writer's own, so a base64 entry decodes to its
-            // bytes and the timestamp is read with the fractional-seconds
-            // options the writer emits. A default-options ISO8601DateFormatter
-            // returns nil for those stamps, which would drop every line here.
-            guard let lineData = line.data(using: .utf8),
-                  let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
+        for lineData in ContainerBridge.ContainerLogCodec.allLines(of: data) {
+            guard let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
                   let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
                   let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                 continue
@@ -1314,17 +1311,13 @@ public struct ContainerHandlers: Sendable {
                 return
             }
 
-            let content = try String(contentsOf: path, encoding: .utf8)
-            let lines = content.components(separatedBy: .newlines)
+            // Split and parse with the writer's own codec; see the note in
+            // `readNewLogData` for what each half of that costs when it is a
+            // second spelling instead.
+            let content = try Data(contentsOf: path)
 
-            for line in lines {
-                guard !line.isEmpty else { continue }
-
-                // Parse the JSON log entry with the writer's own codec; see the
-                // note in `readNewLogData` for why a second parse here would
-                // read nothing.
-                guard let data = line.data(using: .utf8),
-                      let entry = try? ContainerBridge.ContainerLogCodec.decode(line: data),
+            for lineData in ContainerBridge.ContainerLogCodec.allLines(of: content) {
+                guard let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
                       let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
                       let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                     continue

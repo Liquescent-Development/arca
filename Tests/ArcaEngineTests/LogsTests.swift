@@ -19,8 +19,8 @@ final class LogsTests: XCTestCase {
     ///
     /// This is the test the format never had. `FileLogWriter` built its entries
     /// by string interpolation with five `replacingOccurrences` calls, and
-    /// nothing read them back with any expectation of exactness: both existing
-    /// readers `continue` past a line they cannot parse, so a payload that
+    /// nothing read them back with any expectation of exactness: every reader
+    /// that existed `continue`d past a line it could not parse, so a payload that
     /// destroyed its line vanished and looked like a container that had said
     /// nothing.
     ///
@@ -42,7 +42,7 @@ final class LogsTests: XCTestCase {
     /// A CRLF line was mangled too: `components(separatedBy: .newlines)` splits
     /// on `\r` as well as `\n`, so `dos\r\n` became two entries with an empty
     /// one between and the `\r` was rewritten as `\n`.
-    func testEveryAdversarialPayloadSurvivesTheWriterAndComesBackByteExact() throws {
+    func testEveryAdversarialPayloadSurvivesTheWriterAndComesBackByteExact() async throws {
         let root = Self.throwawayRoot()
         let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
         let (stdout, _) = try manager.createLogWriters(dockerID: Self.dockerID)
@@ -54,7 +54,7 @@ final class LogsTests: XCTestCase {
         }
 
         let paths = try XCTUnwrap(manager.getLogPaths(dockerID: Self.dockerID))
-        let read = try LogReader.payload(combinedPath: paths.combinedPath, sinceUnixMillis: nil)
+        let read = try await Self.read(paths.combinedPath)
 
         XCTAssertEqual(
             read, expected,
@@ -76,7 +76,7 @@ final class LogsTests: XCTestCase {
     /// rest. That is not hypothetical: under the writer this replaced, the C0
     /// payload produced invalid JSON, and a rethrow ended the loop before the
     /// non-UTF-8 payloads were reached at all.
-    func testEachAdversarialPayloadSurvivesOnItsOwn() throws {
+    func testEachAdversarialPayloadSurvivesOnItsOwn() async throws {
         for payload in Self.adversarialPayloads {
             let root = Self.throwawayRoot()
             let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
@@ -85,9 +85,7 @@ final class LogsTests: XCTestCase {
 
             let paths = try XCTUnwrap(manager.getLogPaths(dockerID: Self.dockerID))
             do {
-                let read = try LogReader.payload(
-                    combinedPath: paths.combinedPath, sinceUnixMillis: nil
-                )
+                let read = try await Self.read(paths.combinedPath)
                 XCTAssertEqual(
                     read, payload.bytes,
                     "\(payload.name) did not survive: \(Self.readable(read)) "
@@ -104,7 +102,7 @@ final class LogsTests: XCTestCase {
     ///
     /// Asserted independently of `LogReader`, because a codec that encoded and
     /// decoded its own private format would pass every round-trip above while
-    /// writing something the two Docker-surface readers -- which reach for
+    /// writing something the three Docker-surface readers -- which reach for
     /// `stream`, `log` and `time` by name -- cannot use.
     func testEveryLineIsValidJSONWithDockersThreeFields() throws {
         let root = Self.throwawayRoot()
@@ -128,6 +126,66 @@ final class LogsTests: XCTestCase {
         }
     }
 
+    /// **One entry is one line to every reader of these files, and U+2028 is
+    /// the payload that proves it has to be.**
+    ///
+    /// `JSONEncoder` escapes the C0 controls but leaves U+2028, U+2029 and
+    /// U+0085 raw, because all three are legal inside a JSON string.
+    /// Foundation's `CharacterSet.newlines` covers all three, and the three
+    /// Docker-surface readers each split file content with
+    /// `components(separatedBy: .newlines)` -- so a container that printed one of
+    /// them had its entry cut in half, both halves failed to parse, and both
+    /// were skipped. **The line vanished from `docker logs` with no error**, and
+    /// the round-trip tests above could not see it because `LogReader` splits on
+    /// `0x0A` and was unaffected.
+    ///
+    /// That is now impossible to reintroduce in one place and not the other:
+    /// `ContainerLogCodec.lines` is the only definition of "a line" and all four
+    /// readers call it. This test drives the three characters through a real
+    /// writer and asserts the shared splitter sees one line each.
+    ///
+    /// The `.newlines` comparison is the reason, kept executable. It asserts a
+    /// property of Foundation rather than of this code, and it is here so that
+    /// the trap is visible at the assertion rather than only in this comment.
+    func testTheSharedSplitterSeesOneLineWhereNewlinesWouldSeeTwo() throws {
+        for (name, scalar) in [
+            ("U+2028 LINE SEPARATOR", "\u{2028}"),
+            ("U+2029 PARAGRAPH SEPARATOR", "\u{2029}"),
+            ("U+0085 NEL", "\u{0085}"),
+        ] {
+            let root = Self.throwawayRoot()
+            let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
+            let (stdout, _) = try manager.createLogWriters(dockerID: Self.dockerID)
+            try stdout.write(Data("before\(scalar)after\n".utf8))
+
+            let paths = try XCTUnwrap(manager.getLogPaths(dockerID: Self.dockerID))
+            let contents = try Data(contentsOf: paths.combinedPath)
+
+            XCTAssertEqual(
+                ContainerLogCodec.allLines(of: contents).count, 1,
+                "\(name) must leave one entry on one line"
+            )
+            XCTAssertEqual(
+                try ContainerLogCodec.payload(
+                    of: ContainerLogCodec.decode(
+                        line: try XCTUnwrap(ContainerLogCodec.allLines(of: contents).first)
+                    )
+                ),
+                Data("before\(scalar)after\n".utf8),
+                "\(name) must survive the entry it is in"
+            )
+            XCTAssertEqual(
+                String(decoding: contents, as: UTF8.self)
+                    .components(separatedBy: .newlines)
+                    .filter { !$0.isEmpty }
+                    .count,
+                2,
+                "the reason this test exists: `.newlines` cuts \(name) in half, and a "
+                    + "reader that used it would skip both halves"
+            )
+        }
+    }
+
     // MARK: - combined.log
 
     /// **`combined.log` is the file `Logs` reads, and until this change nothing
@@ -141,7 +199,7 @@ final class LogsTests: XCTestCase {
     /// burst to the merge. Here the writes alternate, and the combined file must
     /// hold them in that order with each entry still saying which stream it came
     /// from.
-    func testCombinedLogHoldsBothStreamsInTheOrderTheyWereWritten() throws {
+    func testCombinedLogHoldsBothStreamsInTheOrderTheyWereWritten() async throws {
         let root = Self.throwawayRoot()
         let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
         let (stdout, stderr) = try manager.createLogWriters(dockerID: Self.dockerID)
@@ -164,9 +222,72 @@ final class LogsTests: XCTestCase {
             ],
             "combined.log must interleave the two streams in write order"
         )
+        let combined = try await Self.read(paths.combinedPath)
+        XCTAssertEqual(combined, Data("one\ntwo\nthree\nfour\n".utf8))
+    }
+
+    /// **The restore path registers all three paths or none.**
+    ///
+    /// `loadPersistedState` gates registration on the log files existing, and
+    /// `combined.log` was not in that guard -- it could not have been, since
+    /// nothing wrote the file. Now that `Logs` reads it, a container restored
+    /// from a state store written before it had a writer would have its paths
+    /// registered, `getLogPaths` would answer non-nil, and the read would fail
+    /// `command_io` on a file that was never there. "This container has no log"
+    /// and "this container's log is gone" are different facts and this is the
+    /// boundary between them.
+    func testARestoredContainerWithNoCombinedLogRegistersNoPathsAtAll() async throws {
+        let managers = try Self.managers()
+
+        // The two files a pre-change engine left behind, and not the third.
+        let logDir = managers.containerManager.logManager.containerLogDir(dockerID: Self.dockerID)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        for name in ["stdout.log", "stderr.log"] {
+            try Data().write(to: logDir.appendingPathComponent(name))
+        }
+
+        try await Self.seed(managers, labels: SandboxIdentity.labels(from: Self.ownerLabels))
+
+        XCTAssertNil(
+            managers.containerManager.logManager.getLogPaths(dockerID: Self.dockerID),
+            "a container whose combined.log is absent must register no paths"
+        )
+        let frames = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        )
         XCTAssertEqual(
-            try LogReader.payload(combinedPath: paths.combinedPath, sinceUnixMillis: nil),
-            Data("one\ntwo\nthree\nfour\n".utf8)
+            frames, [],
+            "and must therefore answer an empty log rather than a read failure"
+        )
+    }
+
+    /// A `createLogWriters` that cannot open a stream file registers nothing.
+    ///
+    /// The combined handle is opened before either writer, so a writer that
+    /// fails leaves a handle only `removeLogs` would ever close and, if the
+    /// registration ran first, `logPaths` naming writers that do not exist.
+    /// Both dictionaries are now written after the last fallible step.
+    ///
+    /// **The closing half of that is not falsifiable from here.** A retained
+    /// handle and a closed one differ only in a file descriptor; the observable
+    /// half is that nothing is registered, which is what this asserts.
+    func testAFailedCreateLogWritersRegistersNothing() throws {
+        let root = Self.throwawayRoot()
+        let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
+
+        // A directory where `stdout.log` belongs, so opening it for writing
+        // fails while the combined file opens fine.
+        try FileManager.default.createDirectory(
+            at: manager.containerLogDir(dockerID: Self.dockerID)
+                .appendingPathComponent("stdout.log"),
+            withIntermediateDirectories: true
+        )
+
+        XCTAssertThrowsError(try manager.createLogWriters(dockerID: Self.dockerID))
+        XCTAssertNil(
+            manager.getLogPaths(dockerID: Self.dockerID),
+            "a failed creation must not leave paths registered for writers that do not exist"
         )
     }
 
@@ -249,7 +370,7 @@ final class LogsTests: XCTestCase {
     ///
     /// The dates are chosen here rather than taken from `Date()` so the boundary
     /// is exact and the test cannot race.
-    func testSinceMillisSeparatesEntriesInsideOneSecond() throws {
+    func testSinceMillisSeparatesEntriesInsideOneSecond() async throws {
         let root = Self.throwawayRoot()
         let combinedPath = root.appendingPathComponent("combined.log")
         let second = Date(timeIntervalSince1970: 1_755_300_000)
@@ -266,29 +387,30 @@ final class LogsTests: XCTestCase {
         let middle = LogEntryTimestamp.unixMillis(from: second.addingTimeInterval(0.200))
         XCTAssertEqual(middle, 1_755_300_000_200)
 
+        let atBoundary = try await Self.read(combinedPath, since: middle)
         XCTAssertEqual(
-            try LogReader.payload(combinedPath: combinedPath, sinceUnixMillis: middle),
-            Data("second\nthird\n".utf8),
+            atBoundary, Data("second\nthird\n".utf8),
             "since is inclusive of the entry stamped exactly at it"
         )
+        let pastBoundary = try await Self.read(combinedPath, since: middle + 1)
         XCTAssertEqual(
-            try LogReader.payload(combinedPath: combinedPath, sinceUnixMillis: middle + 1),
-            Data("third\n".utf8),
+            pastBoundary, Data("third\n".utf8),
             "one millisecond later excludes the entry at the boundary"
         )
+        let unfiltered = try await Self.read(combinedPath)
         XCTAssertEqual(
-            try LogReader.payload(combinedPath: combinedPath, sinceUnixMillis: nil),
-            Data("first\nsecond\nthird\n".utf8),
+            unfiltered, Data("first\nsecond\nthird\n".utf8),
             "an absent filter is from the beginning"
         )
     }
 
     /// A line the codec cannot read is an error, not a skipped line.
     ///
-    /// Both of the repository's other readers `continue` past one, which turns a
-    /// truncated write or a foreign file into a short log indistinguishable from
-    /// a complete one. `LogsChunk` has an error arm and `Logs` uses it.
-    func testAnUnreadableLineIsAnErrorRatherThanASkippedLine() throws {
+    /// All three of the repository's Docker-surface readers `continue` past one,
+    /// which turns a truncated write or a foreign file into a short log
+    /// indistinguishable from a complete one. `LogsChunk` has an error arm and
+    /// `Logs` uses it.
+    func testAnUnreadableLineIsAnErrorRatherThanASkippedLine() async throws {
         let root = Self.throwawayRoot()
         let combinedPath = root.appendingPathComponent("combined.log")
         try FileManager.default.createDirectory(
@@ -297,9 +419,12 @@ final class LogsTests: XCTestCase {
         try Data("{\"stream\":\"stdout\",\"log\":\"good\\n\",\"time\":\"2026-08-15T00:00:00.000Z\"}\nnot an entry\n".utf8)
             .write(to: combinedPath)
 
-        XCTAssertThrowsError(
-            try LogReader.payload(combinedPath: combinedPath, sinceUnixMillis: nil)
-        )
+        do {
+            _ = try await Self.read(combinedPath)
+            XCTFail("an unreadable line must fail the call, not be skipped")
+        } catch {
+            // The arm this test exists for.
+        }
     }
 
     // MARK: - Chunking
@@ -312,7 +437,7 @@ final class LogsTests: XCTestCase {
     /// one that followed the limit produces eleven whose last is short. The
     /// concatenation is the same either way, which is the point -- so the frame
     /// sizes are what is asserted.
-    func testChunksAreCutOnTheByteLimitAndNotOnEntryBoundaries() throws {
+    func testChunksAreCutOnTheByteLimitAndNotOnEntryBoundaries() async throws {
         let root = Self.throwawayRoot()
         let combinedPath = root.appendingPathComponent("combined.log")
         let second = Date(timeIntervalSince1970: 1_755_300_000)
@@ -321,9 +446,7 @@ final class LogsTests: XCTestCase {
         }
         try Self.write(lines, to: combinedPath)
 
-        let chunks = try LogReader.chunks(
-            combinedPath: combinedPath, sinceUnixMillis: nil, chunkByteLimit: 17
-        )
+        let chunks = try await Self.chunks(combinedPath, limit: 17)
 
         XCTAssertEqual(
             chunks.map(\.count), Array(repeating: 17, count: 11) + [13],
@@ -336,16 +459,176 @@ final class LogsTests: XCTestCase {
         )
     }
 
+    /// **The shipped `chunkByteLimit`, pinned on both sides by its own reason.**
+    ///
+    /// The constant was unfalsifiable when it landed: a review changed it to
+    /// `7` and `swift test --filter ArcaEngineTests` stayed at 194 tests with 0
+    /// failures, because the only chunking test passed its own limit through the
+    /// seam parameter and never touched the value production uses.
+    ///
+    /// Both bounds are the constant's own doc comment turned into assertions,
+    /// and neither is arbitrary. **Above:** past grpc-swift's 4MiB default
+    /// receive limit, a frame becomes the size error the streaming contract
+    /// exists to avoid -- streaming would then have bought nothing. **Below:** a
+    /// small limit turns an ordinary log into thousands of frames, each with its
+    /// own proto and its own `send`; 4KiB is a page, and a limit under one is
+    /// not a chunk size, it is a bug.
+    func testTheShippedChunkLimitStaysInsideTheBoundsItsReasonGives() {
+        XCTAssertLessThan(
+            LogReader.chunkByteLimit, 4 * 1024 * 1024,
+            "a frame at or past grpc-swift's 4MiB default receive limit is the size "
+                + "error the streaming contract exists to avoid"
+        )
+        XCTAssertGreaterThanOrEqual(
+            LogReader.chunkByteLimit, 4 * 1024,
+            "a limit under a page turns an ordinary log into thousands of frames"
+        )
+    }
+
+    /// The same limit, **through the whole handler**, which is the only place
+    /// that says what the engine actually cuts on.
+    ///
+    /// The bounds above pin the value. This pins that `Logs` uses it: the
+    /// handler calls `LogReader.stream` with no `chunkByteLimit` argument, and a
+    /// handler that passed its own would satisfy every other test in this file,
+    /// because every other log here fits in one frame either way.
+    ///
+    /// Two and a half frames' worth of payload: enough that both the count and
+    /// the sizes are decided by the limit, and small enough to stay fast.
+    func testTheHandlerCutsAnOrdinaryLogOnTheShippedLimit() async throws {
+        let managers = try Self.managers()
+        try await Self.seed(managers, labels: SandboxIdentity.labels(from: Self.ownerLabels))
+        let (stdout, _) = try managers.containerManager.logManager
+            .createLogWriters(dockerID: Self.dockerID)
+
+        let line = String(repeating: "x", count: 99) + "\n"
+        let lineCount = (LogReader.chunkByteLimit * 5 / 2) / line.utf8.count
+        for _ in 0..<lineCount {
+            try stdout.write(Data(line.utf8))
+        }
+        let written = lineCount * line.utf8.count
+
+        let frames = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        )
+        let sizes = try Self.dataSizes(frames)
+
+        XCTAssertEqual(
+            sizes.count,
+            written / LogReader.chunkByteLimit + (written % LogReader.chunkByteLimit == 0 ? 0 : 1),
+            "the frame count must follow the shipped limit; the log was \(written) bytes"
+        )
+        XCTAssertTrue(
+            sizes.dropLast().allSatisfy { $0 == LogReader.chunkByteLimit },
+            "every frame but the last is exactly the limit; they were \(sizes)"
+        )
+        XCTAssertEqual(
+            sizes.reduce(0, +), written,
+            "the frames must concatenate back to the whole log"
+        )
+    }
+
+    /// **Frames go out as they are cut, not after the whole log has been read.**
+    ///
+    /// This is the one observable difference between the streaming reader and
+    /// the buffering one it replaced, and it is why the test is shaped like
+    /// this. The log holds more than one frame of good entries and then a line
+    /// that cannot be parsed. A reader that emits as it goes sends its data
+    /// frames first and only then meets the corruption; a reader that read,
+    /// filtered, concatenated and cut the whole log before handing anything
+    /// back would meet the corruption first and the consumer would receive the
+    /// error frame **and nothing else**. Both are "an error frame arrives", and
+    /// only the position of the data frames tells them apart.
+    ///
+    /// It also states plainly what `Logs` does with a log that breaks partway:
+    /// the readable prefix has already gone, and the error follows it.
+    /// `gascan-arca/src/backend.rs` discards the prefix on the error arm, which
+    /// is the consumer's decision and not this engine's.
+    func testFramesGoOutBeforeALaterCorruptionIsReached() async throws {
+        let managers = try Self.managers()
+        try await Self.seed(managers, labels: SandboxIdentity.labels(from: Self.ownerLabels))
+        let (stdout, _) = try managers.containerManager.logManager
+            .createLogWriters(dockerID: Self.dockerID)
+
+        let line = String(repeating: "x", count: 99) + "\n"
+        for _ in 0..<((LogReader.chunkByteLimit * 3 / 2) / line.utf8.count) {
+            try stdout.write(Data(line.utf8))
+        }
+        let paths = try XCTUnwrap(
+            managers.containerManager.logManager.getLogPaths(dockerID: Self.dockerID)
+        )
+        let handle = try FileHandle(forWritingTo: paths.combinedPath)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("not an entry\n".utf8))
+        try handle.close()
+
+        let frames = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        )
+
+        XCTAssertGreaterThanOrEqual(
+            frames.count, 2,
+            "the readable prefix must have gone out before the corruption was reached; "
+                + "one frame alone means the whole log was read before anything was sent"
+        )
+        for (index, frame) in frames.dropLast().enumerated() {
+            guard case .data = frame.outcome else {
+                return XCTFail("frame \(index) must be data: \(String(describing: frame.outcome))")
+            }
+        }
+        guard case .error(let error) = frames.last?.outcome else {
+            return XCTFail("the last frame must be the error: \(String(describing: frames.last))")
+        }
+        XCTAssertEqual(error.code, EngineErrorCode.commandIo.rawValue)
+        XCTAssertEqual(error.resource, Self.sandboxID)
+    }
+
+    /// **A sink that fails leaves as itself, and never as an engine error.**
+    ///
+    /// The two failures the handler can meet demand opposite answers: a log it
+    /// could not read is reported to the consumer in an error frame, and a
+    /// consumer that has gone away cannot be reported anything. A `catch` that
+    /// did not tell them apart would either describe a broken connection as
+    /// `command_io` -- putting a transport message inside an engine error's
+    /// prose -- or swallow a genuine read failure because the send after it
+    /// failed too.
+    func testASendFailureLeavesAsItselfRatherThanAsAnEngineError() async throws {
+        struct WriterGone: Error {}
+
+        let managers = try Self.managers()
+        try await Self.seed(managers, labels: SandboxIdentity.labels(from: Self.ownerLabels))
+        let (stdout, _) = try managers.containerManager.logManager
+            .createLogWriters(dockerID: Self.dockerID)
+        try stdout.write(Data("something\n".utf8))
+
+        var delivered = 0
+        do {
+            try await managers.makeService().streamLogs(
+                request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+            ) { _ in
+                delivered += 1
+                throw WriterGone()
+            }
+            XCTFail("a sink that throws must carry its own error out of streamLogs")
+        } catch is WriterGone {
+            // The arm this test exists for.
+        } catch {
+            XCTFail("the sink's own error must arrive unchanged, not as \(error)")
+        }
+        XCTAssertEqual(delivered, 1, "the sink must not be called again after it failed")
+    }
+
     /// An empty log is an empty stream, not one empty frame.
-    func testAnEmptyLogIsNoChunksAtAll() throws {
+    func testAnEmptyLogIsNoChunksAtAll() async throws {
         let root = Self.throwawayRoot()
         let manager = ContainerLogManager(logRoot: root, logger: Self.logger)
         _ = try manager.createLogWriters(dockerID: Self.dockerID)
         let paths = try XCTUnwrap(manager.getLogPaths(dockerID: Self.dockerID))
 
-        XCTAssertEqual(
-            try LogReader.chunks(combinedPath: paths.combinedPath, sinceUnixMillis: nil), []
-        )
+        let chunks = try await Self.chunks(paths.combinedPath)
+        XCTAssertEqual(chunks, [])
     }
 
     // MARK: - The handler
@@ -361,8 +644,9 @@ final class LogsTests: XCTestCase {
         try stderr.write(Data("warned\n".utf8))
         try stdout.write(Data("bye\n".utf8))
 
-        let chunks = await managers.makeService().logChunks(
-            request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        let chunks = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
         )
 
         XCTAssertEqual(
@@ -383,8 +667,9 @@ final class LogsTests: XCTestCase {
             .createLogWriters(dockerID: Self.dockerID)
         try stdout.write(Data("a secret\n".utf8))
 
-        let chunks = await managers.makeService().logChunks(
-            request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        let chunks = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
         )
 
         XCTAssertEqual(chunks.count, 1)
@@ -421,8 +706,9 @@ final class LogsTests: XCTestCase {
         try stdout.write(Data("another sandbox's output\n".utf8))
 
         // Self.dockerID is 64 `a`s, so this is a prefix of it.
-        let chunks = await managers.makeService().logChunks(
-            request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = "aaaa" }
+        let chunks = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = "aaaa" }
         )
 
         XCTAssertEqual(chunks.count, 1)
@@ -444,8 +730,9 @@ final class LogsTests: XCTestCase {
         let managers = try Self.managers()
         try await managers.containerManager.loadPersistedState()
 
-        let chunks = await managers.makeService().logChunks(
-            request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        let chunks = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
         )
 
         XCTAssertEqual(chunks.count, 1)
@@ -464,8 +751,9 @@ final class LogsTests: XCTestCase {
         let managers = try Self.managers()
         try await Self.seed(managers, labels: SandboxIdentity.labels(from: Self.ownerLabels))
 
-        let chunks = await managers.makeService().logChunks(
-            request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        let chunks = try await Self.frames(
+            managers.makeService(),
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
         )
 
         XCTAssertEqual(chunks, [], "a sandbox that has never run has an empty log, not an error")
@@ -488,14 +776,16 @@ final class LogsTests: XCTestCase {
         try stdout.write(Data("now\n".utf8))
 
         let service = managers.makeService()
-        let unfiltered = await service.logChunks(
-            request: Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
+        let unfiltered = try await Self.frames(
+            service,
+            Arca_Engine_V1_LogsRequest.with { $0.sandboxID = Self.sandboxID }
         )
         XCTAssertEqual(try Self.concatenated(unfiltered), Data("now\n".utf8))
 
         let future = LogEntryTimestamp.unixMillis(from: Date().addingTimeInterval(3600))
-        let filtered = await service.logChunks(
-            request: Arca_Engine_V1_LogsRequest.with {
+        let filtered = try await Self.frames(
+            service,
+            Arca_Engine_V1_LogsRequest.with {
                 $0.sandboxID = Self.sandboxID
                 $0.sinceUnixMillis = future
             }
@@ -532,6 +822,13 @@ final class LogsTests: XCTestCase {
             name: "C0 control bytes",
             bytes: Data("bell\u{07}vtab\u{0B}nul\u{00}esc\u{1B}\n".utf8)
         ),
+        // The three Unicode separators `JSONEncoder` leaves raw and
+        // `CharacterSet.newlines` cuts on. See
+        // `testTheSharedSplitterSeesOneLineWhereNewlinesWouldSeeTwo`.
+        Payload(
+            name: "the Unicode line separators",
+            bytes: Data("ls\u{2028}ps\u{2029}nel\u{0085}\n".utf8)
+        ),
         Payload(name: "non-UTF-8 bytes", bytes: Data([0xFF, 0xFE, 0x00, 0x80, 0xC3, 0x28])),
         // The three bytes of `€` split across two writes, which is what an
         // ordinary text log looks like when a chunk boundary falls inside a
@@ -549,6 +846,43 @@ final class LogsTests: XCTestCase {
     private static let ownerLabels = Arca_Engine_V1_OwnerLabels.with {
         $0.managedBy = "gascan"
         $0.sandboxID = sandboxID
+    }
+
+    /// Every frame the streaming reader produces, in order.
+    ///
+    /// `limit` omitted calls the **production overload**, so a test that omits
+    /// it exercises the shipped `chunkByteLimit` rather than one the test chose.
+    /// That distinction is the whole of `testAnOrdinaryLogIsCutByTheShippedLimit`.
+    private static func chunks(
+        _ combinedPath: URL, since: Int64? = nil, limit: Int? = nil
+    ) async throws -> [Data] {
+        var collected: [Data] = []
+        if let limit {
+            try await LogReader.stream(
+                combinedPath: combinedPath, sinceUnixMillis: since, chunkByteLimit: limit
+            ) { collected.append($0) }
+        } else {
+            try await LogReader.stream(
+                combinedPath: combinedPath, sinceUnixMillis: since
+            ) { collected.append($0) }
+        }
+        return collected
+    }
+
+    /// Those frames concatenated, which is what the consumer receives.
+    private static func read(_ combinedPath: URL, since: Int64? = nil) async throws -> Data {
+        try await chunks(combinedPath, since: since)
+            .reduce(into: Data()) { $0.append($1) }
+    }
+
+    /// The frames the service sends, collected. The service holds none of them;
+    /// this helper does, and only because a test's log is a few lines long.
+    private static func frames(
+        _ service: SandboxEngineService, _ request: Arca_Engine_V1_LogsRequest
+    ) async throws -> [Arca_Engine_V1_LogsChunk] {
+        var collected: [Arca_Engine_V1_LogsChunk] = []
+        try await service.streamLogs(request: request) { collected.append($0) }
+        return collected
     }
 
     private static func throwawayRoot() -> URL {
@@ -643,6 +977,24 @@ final class LogsTests: XCTestCase {
             buffer.append(data)
         }
         return buffer
+    }
+
+    /// Every frame's payload size, failing on any frame that is not data.
+    private static func dataSizes(
+        _ frames: [Arca_Engine_V1_LogsChunk],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [Int] {
+        try frames.map { frame in
+            guard case .data(let data) = frame.outcome else {
+                XCTFail(
+                    "expected a data frame: \(String(describing: frame.outcome))",
+                    file: file, line: line
+                )
+                throw XCTSkip("no data frame to measure")
+            }
+            return data.count
+        }
     }
 
     /// Bytes as something a failure message can be read from.

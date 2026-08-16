@@ -15,20 +15,46 @@ import Foundation
 /// line came from; nothing is lost by reading the one file.
 ///
 /// **The result is bytes, not entries.** `LogsChunk.data` is "one logical
-/// buffer, chunked", so this concatenates the entries' payloads and splits the
+/// buffer, chunked", so this concatenates the entries' payloads and cuts the
 /// result on a byte count. A consumer concatenates the frames back and must not
-/// have to know where the split fell; splitting on entry boundaries would make
-/// the chunk count a function of the log's content, which is exactly the
-/// coupling the contract's wording rules out.
+/// have to know where the cut fell; cutting on entry boundaries would make the
+/// frame count a function of the log's content, which is exactly the coupling
+/// the contract's wording rules out.
+///
+/// **Nothing here holds the log.** An earlier version read the file with
+/// `Data(contentsOf:)`, built a second `Data` by concatenation, copied that into
+/// an array of frames and handed the array back -- four copies of the whole log
+/// alive at once, before a single byte reached the wire. The proto streams this
+/// method because "a log larger than the default message limit would otherwise
+/// fail as a size error rather than as a log", and nothing rotates
+/// `combined.log`: `ContainerBridge` has no rotation at all, so a long-lived
+/// chatty sandbox's log is bounded only by the disk. That made one `Logs` call
+/// able to allocate the whole file several times over inside the process that
+/// hosts every sandbox. Peak memory is now `O(readWindow + chunkByteLimit)`
+/// regardless of the log's size, and the first frame goes out as soon as one
+/// frame's worth of payload exists.
 package enum LogReader {
-    /// The default split size.
+    /// The default cut size.
     ///
-    /// Well under grpc-swift's 4MiB default receive limit, which is the size
-    /// error the streaming contract exists to avoid, and large enough that an
-    /// ordinary log is one or two frames.
+    /// Bounded on both sides and both bounds are asserted, because the reason
+    /// for the value is the only thing that makes it right. **Above:** it must
+    /// stay well under grpc-swift's 4MiB default receive limit, which is the
+    /// size error the streaming contract exists to avoid -- a value past that
+    /// reintroduces exactly the failure streaming was designed around.
+    /// **Below:** a small value turns an ordinary log into thousands of frames,
+    /// each with its own proto and its own `send`.
     package static let chunkByteLimit = 64 * 1024
 
-    /// The log at `combinedPath`, filtered and chunked.
+    /// How much of the file is held while looking for the next terminator.
+    ///
+    /// Independent of `chunkByteLimit`: one bounds the frame, this bounds the
+    /// read. A single log entry longer than this is still handled -- the
+    /// remainder carries across windows -- so this is a buffer size and not a
+    /// limit on anything.
+    package static let readWindowBytes = 64 * 1024
+
+    /// The log at `combinedPath`, filtered, cut, and handed to `sink` one frame
+    /// at a time in order.
     ///
     /// - Parameter sinceUnixMillis: Keep entries stamped at or after this many
     ///   Unix milliseconds. Inclusive, and nil means from the beginning, which
@@ -39,60 +65,71 @@ package enum LogReader {
     ///   up to a second of log the caller excluded.
     ///
     /// Throws rather than skipping on a line it cannot read. Both of this
-    /// repository's other readers skip, which turns a truncated or foreign log
-    /// file into a short log that reads exactly like a complete one; `Logs` has
-    /// an error arm and uses it.
-    package static func chunks(
+    /// repository's Docker-surface readers skip, which turns a truncated or
+    /// foreign log file into a short log that reads exactly like a complete
+    /// one; `Logs` has an error arm and uses it. A consequence worth stating:
+    /// one corrupt line fails the whole call rather than returning the readable
+    /// prefix, which is the right trade for a consumer that must not mistake a
+    /// partial log for a complete one -- but frames already handed to `sink`
+    /// have already gone, and `gascan-arca/src/backend.rs` discards them on the
+    /// error arm for exactly that reason.
+    package static func stream(
         combinedPath: URL,
         sinceUnixMillis: Int64?,
-        chunkByteLimit: Int = LogReader.chunkByteLimit
-    ) throws -> [Data] {
-        split(
-            try payload(combinedPath: combinedPath, sinceUnixMillis: sinceUnixMillis),
-            into: chunkByteLimit
-        )
-    }
+        chunkByteLimit: Int = LogReader.chunkByteLimit,
+        into sink: (Data) async throws -> Void
+    ) async throws {
+        precondition(chunkByteLimit > 0, "a chunk limit of \(chunkByteLimit) would not terminate")
 
-    /// The concatenated payload of every entry that passes the filter.
-    ///
-    /// Split on `0x0A` over the bytes rather than over a `String`: an entry is
-    /// JSON, which carries no raw newline, so the byte split is exact, and it
-    /// avoids decoding the whole file to UTF-16 to find line breaks.
-    package static func payload(combinedPath: URL, sinceUnixMillis: Int64?) throws -> Data {
-        let contents = try Data(contentsOf: combinedPath)
-        var payload = Data()
-        for line in contents.split(
-            separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true
-        ) {
-            let entry = try ContainerLogCodec.decode(line: Data(line))
-            if let since = sinceUnixMillis {
-                guard let stamped = LogEntryTimestamp.date(from: entry.time) else {
-                    throw LogReaderError.unreadableTimestamp(entry.time)
-                }
-                if LogEntryTimestamp.unixMillis(from: stamped) < since {
-                    continue
-                }
+        let handle = try FileHandle(forReadingFrom: combinedPath)
+        defer { try? handle.close() }
+
+        var carried = Data()
+        var frame = Data()
+
+        /// Appends one entry's payload and hands out whole frames as they fill.
+        func take(_ line: Data) async throws {
+            guard let payload = try payload(ofLine: line, sinceUnixMillis: sinceUnixMillis) else {
+                return
             }
-            payload.append(try ContainerLogCodec.payload(of: entry))
+            frame.append(payload)
+            while frame.count >= chunkByteLimit {
+                let cut = frame.index(frame.startIndex, offsetBy: chunkByteLimit)
+                try await sink(Data(frame[frame.startIndex..<cut]))
+                frame = Data(frame[cut...])
+            }
         }
-        return payload
+
+        while let window = try handle.read(upToCount: readWindowBytes), !window.isEmpty {
+            carried.append(window)
+            let split = ContainerLogCodec.lines(of: carried)
+            carried = split.remainder
+            for line in split.lines {
+                try await take(line)
+            }
+        }
+        // A trailing partial line can only be a torn write, and `take` reports
+        // it as the unreadable entry it is rather than dropping it.
+        if !carried.isEmpty {
+            try await take(carried)
+        }
+        if !frame.isEmpty {
+            try await sink(frame)
+        }
     }
 
-    /// `payload` in order, in pieces of at most `limit` bytes.
-    ///
-    /// An empty payload is no chunks at all, not one empty chunk: the consumer
-    /// concatenates whatever arrives, so an empty log is an empty stream.
-    package static func split(_ payload: Data, into limit: Int) -> [Data] {
-        precondition(limit > 0, "a chunk limit of \(limit) would not terminate")
-        var chunks: [Data] = []
-        var start = payload.startIndex
-        while start < payload.endIndex {
-            let end = payload.index(start, offsetBy: limit, limitedBy: payload.endIndex)
-                ?? payload.endIndex
-            chunks.append(Data(payload[start..<end]))
-            start = end
+    /// One line's payload, or nil when the filter excludes it.
+    private static func payload(ofLine line: Data, sinceUnixMillis: Int64?) throws -> Data? {
+        let entry = try ContainerLogCodec.decode(line: line)
+        if let since = sinceUnixMillis {
+            guard let stamped = LogEntryTimestamp.date(from: entry.time) else {
+                throw LogReaderError.unreadableTimestamp(entry.time)
+            }
+            if LogEntryTimestamp.unixMillis(from: stamped) < since {
+                return nil
+            }
         }
-        return chunks
+        return try ContainerLogCodec.payload(of: entry)
     }
 }
 

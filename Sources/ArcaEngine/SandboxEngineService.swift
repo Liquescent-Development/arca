@@ -20,9 +20,11 @@ import SandboxEngineProto
 /// it answers at all.
 ///
 /// `Logs` streams too and has the same problem, which is why its logic lives in
-/// `logChunks(request:)` and the protocol method only writes what that returns
+/// `streamLogs(request:into:)` and the protocol method only supplies the writer
 /// -- the same test seam the unary methods use, so the frames are asserted here
-/// rather than only over the wire.
+/// rather than only over the wire. It takes a sink rather than returning the
+/// frames, because a seam that returned them would make a streaming method
+/// buffer its whole answer before sending any of it.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -1189,11 +1191,19 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         )
     }
 
-    /// The frames `Logs` sends, in order, so that a test can drive the whole
-    /// method: a test target cannot construct a
-    /// `GRPCAsyncResponseStreamWriter`, and this is the same test seam
-    /// `inspect(request:)` and the rest use one method up. It carries all of
-    /// the logic; the protocol method below only writes what it returns.
+    /// `Logs`, with the writer it sends through supplied by the caller.
+    ///
+    /// **A sink and not a returned array, and the difference is the method's
+    /// whole reason for streaming.** A test target cannot construct a
+    /// `GRPCAsyncResponseStreamWriter`, so this carries the logic and the
+    /// protocol method below only supplies the writer -- the same test seam
+    /// `inspect(request:)` and the rest use one method up. Those methods return
+    /// one message; this one returns a stream, and an earlier version of this
+    /// seam returned `[LogsChunk]`, which turned the streaming method into a
+    /// buffering one: the client got no bytes at all until the whole log had
+    /// been read, filtered, concatenated and cut, and a client timeout inside
+    /// that window looks like an unreachable engine rather than a slow log. The
+    /// sink keeps the frames assertable in this target and holds none of them.
     ///
     /// **An unlabelled or foreign container is refused before anything is
     /// read, by the rule and the codes `Inspect` uses**, and for `Inspect`'s
@@ -1236,10 +1246,24 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// is itself gascan-labelled the ownership guard below passes it through.
     /// The refusal is `invalid_resource_identity`, as it is on `Create`,
     /// `Start`, `Stop` and `Remove`.
-    func logChunks(request: Arca_Engine_V1_LogsRequest) async -> [Arca_Engine_V1_LogsChunk] {
+    /// **A failure of `sink` is not a failure of `Logs`.** The two are told
+    /// apart because they demand opposite answers: a log that could not be read
+    /// is reported to the consumer through an error frame, and a consumer that
+    /// has gone away cannot be reported anything. Merging them would either
+    /// describe a broken connection as `command_io` -- putting a transport
+    /// message inside an engine error's prose -- or swallow a real read failure
+    /// because the send after it also failed.
+    private struct LogSinkFailure: Error {
+        let underlying: Error
+    }
+
+    func streamLogs(
+        request: Arca_Engine_V1_LogsRequest,
+        into sink: (Arca_Engine_V1_LogsChunk) async throws -> Void
+    ) async throws {
         let name = SandboxIdentity.containerName(forSandboxId: request.sandboxID)
         if let refusal = containerNameRefusal(name) {
-            return [Self.logsFailed(refusal)]
+            return try await sink(Self.logsFailed(refusal))
         }
         let found = await engineErrorCatching(.commandIo, resource: name) {
             try await self.containerManager.getContainer(id: name)
@@ -1247,42 +1271,53 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         let container: Container
         switch found {
         case .failure(let error):
-            return [Self.logsFailed(error)]
+            return try await sink(Self.logsFailed(error))
         case .success(nil):
-            return [Self.logsFailed(engineError(
+            return try await sink(Self.logsFailed(engineError(
                 .notFound,
                 resource: name,
                 message: "no container named \(name) exists, so it has no log"
-            ))]
+            )))
         case .success(.some(let resolved)):
             container = resolved
         }
         guard SandboxIdentity.owner(from: container.config.labels) != nil else {
-            return [Self.logsFailed(engineError(
+            return try await sink(Self.logsFailed(engineError(
                 .foreignResourceRefused,
                 resource: name,
                 message: "container \(name) carries no gascan owner labels, so this engine "
                     + "cannot assert it is the sandbox that was asked for"
-            ))]
+            )))
         }
         // Reached without awaiting the actor: `logManager` is a
         // `nonisolated let` on `ContainerManager` and says so.
         guard let paths = containerManager.logManager.getLogPaths(dockerID: container.id) else {
-            return []
+            return
         }
-        let read = await engineErrorCatching(.commandIo, resource: name) {
-            try LogReader.chunks(
+        do {
+            try await LogReader.stream(
                 combinedPath: paths.combinedPath,
                 sinceUnixMillis: request.hasSinceUnixMillis ? request.sinceUnixMillis : nil
-            )
-        }
-        switch read {
-        case .failure(let error):
-            return [Self.logsFailed(error)]
-        case .success(let chunks):
-            return chunks.map { chunk in
-                Arca_Engine_V1_LogsChunk.with { $0.data = chunk }
+            ) { chunk in
+                do {
+                    try await sink(Arca_Engine_V1_LogsChunk.with { $0.data = chunk })
+                } catch {
+                    throw LogSinkFailure(underlying: error)
+                }
             }
+        } catch let failure as LogSinkFailure {
+            // Nothing to report and nowhere to report it: the writer is what
+            // broke. It leaves this method as a status, which is what
+            // `engine.proto:52-58` reserves statuses for.
+            throw failure.underlying
+        } catch {
+            // The read failed, possibly after frames have already gone. Saying
+            // so is the point: `gascan-arca/src/backend.rs:346-352` discards
+            // what arrived on an error frame, "because the signature has no way
+            // to say 'here is some of it, and also it broke'".
+            try await sink(Self.logsFailed(
+                engineError(.commandIo, resource: name, message: "\(error)")
+            ))
         }
     }
 
@@ -1303,7 +1338,7 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         responseStream: GRPCAsyncResponseStreamWriter<Arca_Engine_V1_LogsChunk>,
         context: GRPCAsyncServerCallContext
     ) async throws {
-        for chunk in await logChunks(request: request) {
+        try await streamLogs(request: request) { chunk in
             try await responseStream.send(chunk)
         }
     }
