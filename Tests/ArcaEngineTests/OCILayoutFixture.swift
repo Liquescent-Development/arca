@@ -25,15 +25,28 @@ import Foundation
 enum OCILayoutFixture {
     /// Builds a layout at `directory` holding one image under `reference`.
     ///
-    /// `payload` is the layer's content. Two layouts differing only in it get
-    /// different layer digests, and so different manifest and image digests --
-    /// which is how a test spells "the vminit changed".
+    /// `payload` is the layer's content, and the whole layout is a function of
+    /// it: two layouts differing only in `payload` get different layer digests
+    /// and so different manifest and image digests, and two written from the
+    /// same `payload` are byte-identical. Both halves are load-bearing -- the
+    /// first is how a test spells "the vminit changed", the second is what makes
+    /// the first mean anything.
     @discardableResult
     static func write(at directory: URL, reference: String, payload: String) throws -> URL {
         let blobs = directory.appendingPathComponent("blobs/sha256")
         try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
 
+        // Without `.sortedKeys` `JSONEncoder` emits the config's keys in a
+        // different order on every encode, so the config blob, the manifest and
+        // the image digest all differ between two writes of the SAME payload.
+        // That made `EngineStartupTests.swift:288` -- "a different vminit must
+        // load to a different digest" -- vacuous: it passed for two layouts
+        // holding identical payloads, so it could not tell "the vminit changed"
+        // from "the fixture was written twice".
+        // MEASURED both ways: four writes of one payload give four distinct
+        // `index.json` digests without this line and one with it.
         let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
         let layer = try writeBlob(
             try layerArchive(containing: payload), mediaType: MediaTypes.imageLayer, into: blobs
         )
@@ -69,20 +82,43 @@ enum OCILayoutFixture {
     /// rather than `payload`'s bytes laid down raw.
     ///
     /// **Raw bytes were enough for every test that only loads, and are not
-    /// enough for one that unpacks.** `ImportOperation` copies layer blobs by
-    /// digest and never opens one, so nothing before now noticed that the
-    /// fixture's "layer" was not an archive; `OverlayFSUnpacker` hands the blob
-    /// to `EXT4.Formatter.unpack`, which opens it, and a blob that is not an
-    /// archive fails there for a reason that has nothing to do with what such a
-    /// test asserts.
+    /// enough for one that unpacks -- but NOT because they fail.** `ImportOperation`
+    /// copies layer blobs by digest and never opens one, so nothing before now
+    /// noticed the fixture's "layer" was not an archive. `EXT4.Formatter.unpack`
+    /// does open it, and MEASURED, it accepts it silently: reverting this line to
+    /// `Data(payload.utf8)` under `MediaTypes.imageLayerGzip` logs `Layer cached
+    /// … size_mb=2048` with no error and leaves an ext4 image enumerating as
+    /// `["/", "/lost+found"]`. An empty filesystem, correctly labelled.
+    ///
+    /// That is why a real tar is required rather than merely tidier: a test
+    /// asserting only on the label cannot tell that apart from a layer that
+    /// holds its image, and a labelled empty layer is this milestone's own
+    /// defect signature -- a rootfs built from none of its image, with `Start`
+    /// succeeding. `testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt`
+    /// asserts on `/payload`, and the revert above is what makes it fail.
+    ///
+    /// **A defect in the unpacker is visible from here and is NOT this
+    /// fixture's to fix**: production turns a mis-typed or corrupt layer blob
+    /// into a valid, correctly labelled, empty `layer.ext4` rather than refusing
+    /// it. It is upstream, in the frozen submodule, and recorded for a follow-up.
     ///
     /// Uncompressed, with every entry field fixed, so the bytes are a function
     /// of `payload` alone. libarchive's gzip filter stamps the current time into
-    /// its header, which would make two layouts written from the same payload
-    /// carry different digests -- and `MediaTypes.imageLayer` is then honest
-    /// twice over: the unpacker reads the media type to pick its decompressor,
-    /// and an uncompressed layer's digest really is the `diffID` that `Rootfs`
-    /// below claims it is.
+    /// its header: MEASURED by a reviewer, two archives of byte-identical input
+    /// under `filter: .gzip` hash to `2716afac6428…` and `3c556546a081…`, while
+    /// under `filter: .none` both hash to `8d8ebad7804a…`. **That was one of two
+    /// nondeterminism sources and closing it alone was not enough** -- see the
+    /// `.sortedKeys` note in `write(at:reference:payload:)` for the other, which
+    /// left the layout nondeterministic until this same round.
+    ///
+    /// `MediaTypes.imageLayer` is then honest twice over: the unpacker reads the
+    /// media type to pick its decompressor, and an uncompressed layer's digest
+    /// really is the `diffID` that `Rootfs` below claims it is.
+    ///
+    /// The entry path is relative, which is the shape a real OCI layer tar has;
+    /// `/usr/bin/tar -tvf` prints `Removing leading '/' from member names` for
+    /// an absolute one. It lands as `/payload` in the unpacked filesystem either
+    /// way, which is what `LayerCacheRoleTests` asserts on.
     private static func layerArchive(containing payload: String) throws -> Data {
         let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("arca-oci-layer-\(UUID().uuidString).tar")
@@ -90,7 +126,7 @@ enum OCILayoutFixture {
 
         let content = Data(payload.utf8)
         let entry = WriteEntry()
-        entry.path = "/payload"
+        entry.path = "payload"
         entry.fileType = .regular
         entry.permissions = 0o644
         entry.owner = 0
