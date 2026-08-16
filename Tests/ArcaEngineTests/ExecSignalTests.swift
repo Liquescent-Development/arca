@@ -24,11 +24,13 @@ import XCTest
 /// Can's gate (`scripts/build-arca-engine.sh`) runs exactly two filters,
 /// `^ArcaEngineTests\.` and `^ArcaTests\.NetworkPruneGateTests/`, so a new class
 /// under `ArcaTests` is run by nobody but a developer typing `swift test`.
-/// MEASURED with this suite sitting in `ArcaTests`: `swift test
-/// --disable-swift-testing` under those two filters -> `Executed 175 tests`,
-/// which is 172 + 3 and none of these; moved here, the same command -> `Executed
-/// 179 tests`. The acceptance property below -- that a silently dropped signal
-/// cannot ship -- is only true in this target.
+///
+/// MEASURED at the time this suite was written, when it sat in `ArcaTests` and
+/// `ArcaEngineTests` stood at 172: `swift test --disable-swift-testing` under
+/// those two filters reported `Executed 175 tests` -- 172 + 3, and none of these
+/// four. Moving the file here was the whole of the fix; on the current tree the
+/// same command reports `Executed 180 tests`. The acceptance property below --
+/// that a silently dropped signal cannot ship -- is only true in this target.
 ///
 /// (`swift test list --filter` cannot be used to check that: it ignores the
 /// filter and prints the full listing, which the gate script documents and which
@@ -83,8 +85,8 @@ final class ExecSignalTests: XCTestCase {
     /// `guard let` itself cannot simply be deleted: `swift test --filter
     /// ExecSignalTests` -> `Executed 4 tests, with 1 failure`, this test alone,
     /// on `signalExec accepted an exec id that names nothing`, and `swift test
-    /// --filter ArcaEngineTests` -> `Executed 176 tests, with 1 failure` against
-    /// a baseline of 176 with 0.
+    /// --filter ArcaEngineTests` -> `Executed 177 tests, with 1 failure` against
+    /// a baseline of 177 with 0.
     func testAnUnknownExecIDIsRefused() async throws {
         let manager = makeExecManager()
         let unknown = String(repeating: "f", count: 64)
@@ -123,8 +125,8 @@ final class ExecSignalTests: XCTestCase {
     /// started`, and `testSignalNumbersInsideTheMapPassValidation` six more
     /// times, once per number it sweeps, on `signalExec silently accepted signal
     /// N for an unstarted exec`. The other two stayed green, and `swift test
-    /// --filter ArcaEngineTests` -> `Executed 176 tests, with 7 failures` against
-    /// a baseline of 176 with 0 -- which is what makes this the acceptance test:
+    /// --filter ArcaEngineTests` -> `Executed 177 tests, with 7 failures` against
+    /// a baseline of 177 with 0 -- which is what makes this the acceptance test:
     /// the mutation is visible to the suite the release gate runs, so a
     /// `signalExec` that swallows a signal cannot ship green.
     func testASignalToAnExecThatNeverStartedIsRefusedRatherThanDropped() async throws {
@@ -163,7 +165,7 @@ final class ExecSignalTests: XCTestCase {
     /// not surface as a delivered signal -- it surfaces as the wrong refusal, and
     /// only an assertion on which error was thrown catches it. The three other
     /// tests stayed green, and `swift test --filter ArcaEngineTests` -> `Executed
-    /// 176 tests, with 6 failures` against a baseline of 176 with 0.
+    /// 177 tests, with 6 failures` against a baseline of 177 with 0.
     func testSignalNumbersOutsideContainerizationsLinuxMapAreRefused() async throws {
         let manager = makeExecManager()
         let execID = try await makeCreatedExec(in: manager)

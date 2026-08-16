@@ -4,7 +4,14 @@ import Logging
 import XCTest
 @testable import ArcaEngine
 
-/// `EngineManagers.wireCollaborators()`, one test per line it contains.
+/// The engine's manager graph, one test per edge that nothing else asserts.
+///
+/// Two of the three cover `EngineManagers.wireCollaborators()`, one per line it
+/// contains. The third covers the `ExecManager(containerManager:)` edge in
+/// `EngineManagers.init`, which is not a `wireCollaborators()` line at all: it
+/// was guaranteed by the type system until `ExecManager.init` was widened to
+/// `any ExecContainerSource`, and it needs a test for exactly the reason the
+/// other two do -- the failure is silent and the release gate cannot see it.
 ///
 /// `ContainerManager` holds its `VolumeManager` and `NetworkManager` optionally,
 /// set after construction because `NetworkManager.init` already takes a
@@ -14,13 +21,15 @@ import XCTest
 /// both (`ArcaDaemon.swift:236`, `:262`); the engine set neither until Task 6's
 /// review found it.
 ///
-/// Both tests assert on **behaviour reachable through a public method**, never
-/// on the setter having been called. A test that read back the stored property
-/// would pass over a `wireCollaborators()` that assigned the right object to the
-/// wrong manager, and would prove nothing about what the omission costs.
+/// All three assert on **behaviour reachable through a public method**, never on
+/// the setter having been called or the property having been assigned. A test
+/// that read back the stored property would pass over a `wireCollaborators()`
+/// that assigned the right object to the wrong manager, and would prove nothing
+/// about what the omission costs.
 ///
-/// Both are VM-free by construction: they drive `loadPersistedState()`,
-/// `getContainer` and `removeContainer` over rows seeded into the StateStore.
+/// All three are VM-free by construction: they drive `loadPersistedState()`,
+/// `getContainer`, `removeContainer` and `createExec` over rows seeded into the
+/// StateStore.
 /// Nothing here calls `initialize()` on any manager other than `VolumeManager`,
 /// whose `initialize()` touches only the filesystem and the store --
 /// `ContainerManager.initialize()` constructs a real `VmnetNetwork` and no test
@@ -139,6 +148,75 @@ final class EngineManagerWiringTests: XCTestCase {
             networks["probe-none"]?.networkID, networkID,
             "and must name the network it resolved, not some other attachment"
         )
+    }
+
+    /// The `ExecManager(containerManager:)` line, which stopped being guaranteed
+    /// by the compiler.
+    ///
+    /// `ExecManager.init` used to take a concrete `ContainerManager`, so wiring
+    /// it to anything else was a compile error and no test was needed. It now
+    /// takes `any ExecContainerSource` (`ExecManager.swift:54-59`) so that
+    /// `signalExec`'s guards are reachable without a VM. That trade bought
+    /// testability by giving up a compile-time guarantee, and this test is what
+    /// replaces it -- the third line of engine wiring nothing else asserts.
+    ///
+    /// The assertion is `containerNotRunning` and **not** `containerNotFound`,
+    /// and that difference is the whole test. `containerNotRunning`
+    /// (`ExecManager.swift:132`) is reachable only by an `ExecManager` that
+    /// looked this id up and found the engine's own restored row;
+    /// `containerNotFound` (`:129`) is what an `ExecManager` wired to some other
+    /// source returns. A test asserting merely "createExec threw" would pass in
+    /// both worlds, which is the failure mode this suite exists to avoid.
+    ///
+    /// The seeded container is `exited`, so this stops one guard short of
+    /// success. That ceiling is not a weakness of the test but the same fact
+    /// that forced the seam: `loadPersistedState()` reconciles a stored
+    /// `running` to `exited` (`ContainerManager.swift:395-401`), so no VM-free
+    /// path yields a running container. Reaching the *second* guard already
+    /// proves the lookup crossed the wiring, which is the property under test.
+    ///
+    /// MEASURED, with `EngineManagers.swift:86` rewired to
+    /// `ExecManager(containerManager: ZZHollowExecSource(), logger: logger)`,
+    /// where the stub answers `nil` to both protocol members, and nothing else
+    /// changed: `swift test --filter EngineManagerWiringTests` -> `Executed 3
+    /// tests, with 1 failure`, this test alone, on `execManager does not see the
+    /// engine's own containers: expected containerNotRunning, got No such
+    /// container: aaaa...`; and `swift test --filter ArcaEngineTests` ->
+    /// `Executed 177 tests, with 1 failure` against a baseline of 177 with 0.
+    ///
+    /// The counterfactual is why this is worth thirty lines, and it was run
+    /// rather than reasoned: with that same rewiring in place and **this test
+    /// deleted**, `swift test --filter ArcaEngineTests` -> `Executed 176 tests,
+    /// with 0 failures`. A fully green release gate over an engine whose every
+    /// `exec` -- and every `docker exec` -- fails `No such container` against a
+    /// container it is holding.
+    func testTheExecManagerSeesTheEngineSOwnContainers() async throws {
+        let managers = try Self.managers()
+        try await Self.seedContainer(into: managers.stateStore, id: Self.containerID)
+        try await managers.containerManager.loadPersistedState()
+
+        do {
+            _ = try await managers.execManager.createExec(
+                containerID: Self.containerID,
+                cmd: ["/bin/sh"],
+                env: nil,
+                workingDir: nil,
+                user: nil,
+                tty: false,
+                attachStdin: false,
+                attachStdout: true,
+                attachStderr: true
+            )
+            XCTFail("createExec succeeded against a container restored as exited")
+        } catch let error as ExecManagerError {
+            guard case .containerNotRunning = error else {
+                XCTFail(
+                    "execManager does not see the engine's own containers: expected "
+                        + "containerNotRunning, got \(error)"
+                )
+                return
+            }
+        }
     }
 
     // MARK: - Fixtures

@@ -9,23 +9,44 @@ import ContainerizationOS
 /// else: the state of a container it is about to exec into, and the native
 /// container it execs through.
 ///
-/// It exists because `ContainerManager.getContainerState` reads the in-memory
-/// `containers` map (`ContainerManager.swift:3680-3685`), and only two places
-/// ever insert into that map: `initialize()` and `createContainer(...)`. Every
-/// other write updates a key that is already there. `initialize()` builds a real
-/// `Containerization.ContainerManager` and a real `VmnetNetwork`, so neither
-/// insertion point is reachable from a unit test -- the same wall recorded at
-/// `Tests/ArcaEngineTests/EngineCommandRefusalTests.swift:140-143`.
+/// It exists because **no VM-free path can produce a container in state
+/// `running`**, and `createExec` admits nothing else.
 ///
-/// MEASURED, before this protocol existed, with a throwaway test against the
-/// concrete `ContainerManager`: seeding a `status: "running"` row through
-/// `StateStore.saveContainer` and reading it straight back,
-/// `getContainerState` returned `nil` and `createExec` threw `No such container:
-/// bbbb...`. Seeding the store is not enough, because the store is not what
-/// `getContainerState` reads.
+/// The reachable part is stated first, because an earlier revision of this
+/// comment got it wrong and would have sent readers to the wrong place.
+/// `getContainerState` reads the in-memory `containers` map
+/// (`ContainerManager.swift:3680-3685`), and that map *is* populated without a
+/// VM: `package func loadPersistedState()` (`ContainerManager.swift:340`)
+/// restores it from the StateStore, is `package` precisely so tests can drive it
+/// -- its own comment at `ContainerManager.swift:319-327` says so -- and six
+/// suites in `ArcaEngineTests` already drive it.
 ///
-/// Without this seam every guard in `signalExec` below is unreachable without a
-/// VM, and an unreachable guard is one nothing stops from being deleted.
+/// What that restore cannot produce is a *running* container. It rewrites a
+/// stored `running` to `exited` with code 137 as crash recovery
+/// (`ContainerManager.swift:395-401`), on the reasoning that a daemon restoring
+/// state is one whose VMs are already gone. So `createExec`'s
+/// `guard containerState == "running"` below can never pass in a unit test.
+///
+/// MEASURED against the concrete `ContainerManager` with no stub anywhere,
+/// seeding one row through `StateStore.saveContainer`, calling
+/// `loadPersistedState()`, then `createExec`, once per stored status:
+///
+///     seeded=running -> getContainerState=exited  | createExec THREW: Container is not running
+///     seeded=created -> getContainerState=created | createExec THREW: Container is not running
+///     seeded=exited  -> getContainerState=exited  | createExec THREW: Container is not running
+///     seeded=paused  -> getContainerState=paused  | createExec THREW: Container is not running
+///
+/// `getContainerState` answers truthfully in every case and `createExec` refuses
+/// in every case. Without this seam every guard in `signalExec` below is
+/// therefore unreachable without a VM, and an unreachable guard is one nothing
+/// stops from being deleted.
+///
+/// The cost of the seam is that wiring `ExecManager` to the wrong source stopped
+/// being a compile error. That is paid for by
+/// `EngineManagerWiringTests.testTheExecManagerSeesTheEngineSOwnContainers`,
+/// which asserts the production wiring. It is not optional: without it, an
+/// engine whose every `exec` fails `No such container` against a container it is
+/// holding passes the release gate.
 ///
 /// `package` rather than `public`, and named for what it supplies rather than
 /// for the type that supplies it, matching `NetworkAttachmentSource`
@@ -354,7 +375,21 @@ public actor ExecManager {
     /// which is also what makes that validation reachable from a test.
     ///
     /// That a signal actually arrives at a guest process is **not** verified by
-    /// anything here; that needs a live VM and belongs to the live tier.
+    /// anything here; that needs a live VM and belongs to the live tier. Be
+    /// precise about what the VM-free tests do buy, because it is less than it
+    /// looks: **they pin the guards, not the send.** MEASURED, with
+    /// `try await process.kill(resolved)` below replaced by `_ = process`:
+    /// `swift test --filter ExecSignalTests` -> `Executed 4 tests, with 0
+    /// failures`. Every test stops at the `execNotStarted` guard, so none of them
+    /// reaches the line that does the work.
+    ///
+    /// **Consequence for whoever writes the live tier: it must assert an
+    /// observable effect on the guest process -- an exit status, a handler
+    /// running, a wait that returns -- and not merely that `signalExec` returned
+    /// without throwing.** A live test asserting only "no error" leaves the
+    /// deleted-`kill` mutation above green at every tier, and the `signals`
+    /// capability flag would then be raised over a signal path that sends
+    /// nothing.
     public func signalExec(execID: String, signal: Int32) async throws {
         guard let execInfo = execInstances[execID] else {
             throw ExecManagerError.execNotFound(execID)
