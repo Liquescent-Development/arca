@@ -1,8 +1,10 @@
 import Containerization
 import ContainerizationEXT4
 import Foundation
+import Logging
 import SystemPackage
 import XCTest
+@testable import ArcaEngine
 
 /// That an ext4 image formatted before roles existed is not mistaken for one that carries a
 /// role.
@@ -154,6 +156,127 @@ final class LayerCacheRoleTests: XCTestCase {
         )
     }
 
+    /// That `unpackLayerToCache` CONSULTS the reusability check, which nothing above proves.
+    ///
+    /// **The three predicate tests pin what the answer is and the two decision tests pin what
+    /// each answer means; none of them pins the CALL.** That is the gap milestone 2's re-review
+    /// recorded and deliberately left, because closing it needs a real `Image` rather than a
+    /// bare path: `unpackLayerToCache` is `private`
+    /// (`containerization/Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift:217`),
+    /// so `unpack` is the only way in.
+    ///
+    /// The assertion is on the entry's LABEL afterwards, not on a call count. A stale entry is a
+    /// perfectly valid ext4 filesystem and the only thing wrong with it is an absence, so "the
+    /// label is now there" is the same statement as "the check ran and the reformat followed" --
+    /// and it is the statement the guest's classifier actually acts on.
+    func testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt() async throws {
+        let image = try await loadedImage(
+            reference: "stale-cache-probe:latest", payload: "the layer this test unpacks"
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        // Awaited into a local first: `XCTUnwrap` takes an autoclosure, which
+        // cannot carry the `await`.
+        let layers = try await image.manifest(for: platform).layers
+        let digest = try XCTUnwrap(
+            layers.first?.digest,
+            "the fixture image must carry a layer for the unpacker to cache"
+        )
+
+        // Seeded the way a pre-label engine left it: correct layout, correct
+        // filename, valid ext4, no role label.
+        let cache = scratch.appendingPathComponent("layers")
+        let seeded = try cachedLayer(in: cache, digest: digest, label: nil)
+        XCTAssertNil(
+            ArcaBlockDeviceRole.role(ofImageAt: FilePath(seeded.path)),
+            "the seeded entry must start unlabelled or this test asserts nothing"
+        )
+
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+        let config = try await unpacker.unpack(
+            image, for: platform, at: scratch.appendingPathComponent("container")
+        )
+
+        XCTAssertEqual(
+            config.lowerLayers, [seeded],
+            "the reformatted entry must be the one handed to the guest, or this asserts on a "
+                + "file the container never mounts"
+        )
+        XCTAssertEqual(
+            ArcaBlockDeviceRole.role(ofImageAt: FilePath(seeded.path)),
+            .overlayLayer,
+            """
+            the unpacker reused a stale cache entry unexamined. The guest's classifier drops an \
+            unlabelled device with 'is not an Arca role, leaving it alone', so the rootfs is \
+            built from a subset of its image -- or from none of it, with Start still succeeding.
+            """
+        )
+    }
+
+    /// The control for the test above, and it is not optional.
+    ///
+    /// Without it an unpacker that ignored the cache entirely -- never calling the check,
+    /// reformatting on every pass -- would satisfy every assertion above, which is the
+    /// one-sided-assertion shape `testAnImageFormattedForALayerReportsThatRole` exists to close
+    /// for the predicate. This closes it for the call.
+    ///
+    /// It reads the entry's SIZE because that is what separates "reused" from "rebuilt" without
+    /// reaching into the unpacker: `cachedLayer` seeds with `minDiskSize: 2 * 1024 * 1024` and
+    /// `unpackLayerToCache` formats with `2 * 1024 * 1024 * 1024`
+    /// (`containerization/Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift:311`).
+    /// The two are not the requested numbers -- the formatter floors the seed at 128MB -- but
+    /// they are far apart, and that is all this needs. MEASURED: seeding this test unlabelled,
+    /// so the rebuild it is the control for actually happens, fails it with 2147483648 against
+    /// 134217728.
+    func testUnpackingOverALabelledCacheEntryLeavesItAlone() async throws {
+        let image = try await loadedImage(
+            reference: "fresh-cache-probe:latest", payload: "the layer this test does not unpack"
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let layers = try await image.manifest(for: platform).layers
+        let digest = try XCTUnwrap(
+            layers.first?.digest,
+            "the fixture image must carry a layer for the unpacker to cache"
+        )
+
+        let cache = scratch.appendingPathComponent("layers")
+        let seeded = try cachedLayer(
+            in: cache, digest: digest, label: ArcaBlockDeviceRole.overlayLayer.volumeLabel
+        )
+        let seededSize = try sizeOfFile(at: seeded)
+
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+        let config = try await unpacker.unpack(
+            image, for: platform, at: scratch.appendingPathComponent("container")
+        )
+
+        XCTAssertEqual(config.lowerLayers, [seeded])
+        XCTAssertEqual(
+            try sizeOfFile(at: seeded), seededSize,
+            "a labelled entry must be a cache HIT; rebuilding it would make the test above pass "
+                + "for an unpacker that never consults the check at all"
+        )
+    }
+
+    /// A real `Image`, loaded from a real OCI layout through the engine's own store.
+    ///
+    /// The load is `ImageManager.loadFromOCILayout`, which is what `arca-engine image load`
+    /// reaches (`EngineImageLoad.swift:82`); `loadWorkspaceImages` wraps that same call but
+    /// reports only references, and an `Image` is what the unpacker takes. The digest under test
+    /// is therefore Containerization's, not one this test invented.
+    private func loadedImage(reference: String, payload: String) async throws -> Image {
+        let layout = try OCILayoutFixture.write(
+            at: scratch.appendingPathComponent("layout"), reference: reference, payload: payload
+        )
+        let manager = try EngineManagers.makeImageManager(
+            paths: EnginePaths(stateRoot: scratch.appendingPathComponent("state")),
+            logger: Logger(label: "layer-cache-role-tests")
+        )
+        let loaded = try await manager.loadFromOCILayout(directory: layout)
+        return try XCTUnwrap(
+            loaded.first, "the layout must load exactly the image the unpack is driven over"
+        )
+    }
+
     /// `{cache}/{digest}/layer.ext4`, which is the layout `unpackLayerToCache` builds.
     private func cachedLayer(in cache: URL, digest: String, label: String?) throws -> URL {
         let directory = cache.appendingPathComponent(digest)
@@ -166,6 +289,14 @@ final class LayerCacheRoleTests: XCTestCase {
         )
         try formatter.close()
         return path
+    }
+
+    /// The on-disk size of `path`, which is how a reused cache entry is told from a rebuilt one.
+    private func sizeOfFile(at path: URL) throws -> Int64 {
+        try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: path.path)[.size] as? Int64,
+            "the cache entry must exist and report a size"
+        )
     }
 
     /// A path holding no filesystem at all answers `nil` rather than throwing.

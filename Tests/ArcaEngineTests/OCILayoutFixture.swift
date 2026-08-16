@@ -1,3 +1,4 @@
+import ContainerizationArchive
 import ContainerizationOCI
 import CryptoKit
 import Foundation
@@ -24,7 +25,7 @@ import Foundation
 enum OCILayoutFixture {
     /// Builds a layout at `directory` holding one image under `reference`.
     ///
-    /// `payload` is the layer's bytes. Two layouts differing only in it get
+    /// `payload` is the layer's content. Two layouts differing only in it get
     /// different layer digests, and so different manifest and image digests --
     /// which is how a test spells "the vminit changed".
     @discardableResult
@@ -34,7 +35,7 @@ enum OCILayoutFixture {
 
         let encoder = JSONEncoder()
         let layer = try writeBlob(
-            Data(payload.utf8), mediaType: MediaTypes.imageLayerGzip, into: blobs
+            try layerArchive(containing: payload), mediaType: MediaTypes.imageLayer, into: blobs
         )
 
         // architecture and os are read back by the loader, which refuses an
@@ -62,6 +63,48 @@ enum OCILayoutFixture {
         try Data(#"{"imageLayoutVersion":"1.0.0"}"#.utf8)
             .write(to: directory.appendingPathComponent("oci-layout"))
         return directory
+    }
+
+    /// The layer blob: a real tar holding `payload` as one file's content,
+    /// rather than `payload`'s bytes laid down raw.
+    ///
+    /// **Raw bytes were enough for every test that only loads, and are not
+    /// enough for one that unpacks.** `ImportOperation` copies layer blobs by
+    /// digest and never opens one, so nothing before now noticed that the
+    /// fixture's "layer" was not an archive; `OverlayFSUnpacker` hands the blob
+    /// to `EXT4.Formatter.unpack`, which opens it, and a blob that is not an
+    /// archive fails there for a reason that has nothing to do with what such a
+    /// test asserts.
+    ///
+    /// Uncompressed, with every entry field fixed, so the bytes are a function
+    /// of `payload` alone. libarchive's gzip filter stamps the current time into
+    /// its header, which would make two layouts written from the same payload
+    /// carry different digests -- and `MediaTypes.imageLayer` is then honest
+    /// twice over: the unpacker reads the media type to pick its decompressor,
+    /// and an uncompressed layer's digest really is the `diffID` that `Rootfs`
+    /// below claims it is.
+    private static func layerArchive(containing payload: String) throws -> Data {
+        let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("arca-oci-layer-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let content = Data(payload.utf8)
+        let entry = WriteEntry()
+        entry.path = "/payload"
+        entry.fileType = .regular
+        entry.permissions = 0o644
+        entry.owner = 0
+        entry.group = 0
+        entry.size = Int64(content.count)
+        entry.modificationDate = Date(timeIntervalSince1970: 0)
+
+        let writer = try ArchiveWriter(
+            configuration: ArchiveWriterConfiguration(format: .paxRestricted, filter: .none)
+        )
+        try writer.open(file: scratch)
+        try writer.writeEntry(entry: entry, data: content)
+        try writer.finishEncoding()
+        return try Data(contentsOf: scratch)
     }
 
     /// Writes one blob under its own digest and describes it.
