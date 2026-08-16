@@ -528,8 +528,9 @@ extension SandboxEngineService {
                     // status to a single number, returning `128 + N` for a
                     // signalled process
                     // (`ContainerizationOS/Command.swift:306-315`), and
-                    // `ExitStatus` has one field, `exitCode`
-                    // (`ExitStatus.swift:21-25`). Deriving `signal` from
+                    // `ExitStatus` carries no signal number at all -- only
+                    // `exitCode` and `exitedAt` (`ExitStatus.swift:23`, `:25`).
+                    // Deriving `signal` from
                     // `code - 128` would be a guess indistinguishable from a
                     // process that called `exit(143)`. gascan's other backend
                     // reports the same zero for the same reason
@@ -646,7 +647,15 @@ extension SandboxEngineService {
     /// quietly become an existing one. `SignalError` is here because
     /// `signalExec` deliberately lets Containerization's own refusal propagate
     /// rather than renaming it, and its description names the number the client
-    /// sent -- which `engine.proto:437` requires of this refusal.
+    /// sent.
+    ///
+    /// CORRECTED: that last clause used to read "which `engine.proto:437`
+    /// requires of this refusal". It requires nothing of the kind --
+    /// `engine.proto:436-437` is a comment and `int32 signal = 4;`, and says only
+    /// that the field is a signal number to forward. **Naming the number is the
+    /// milestone-3 design's requirement (§2.7), not the contract's**, and citing
+    /// the stronger source is the over-citation this project keeps writing traps
+    /// about.
     static func execError(
         for error: Error,
         resource: String
