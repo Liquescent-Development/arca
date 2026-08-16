@@ -155,18 +155,30 @@ final class EngineManagerWiringTests: XCTestCase {
     ///
     /// `ExecManager.init` used to take a concrete `ContainerManager`, so wiring
     /// it to anything else was a compile error and no test was needed. It now
-    /// takes `any ExecContainerSource` (`ExecManager.swift:54-59`) so that
+    /// takes `any ExecContainerSource` (`ExecManager.swift:99`) so that
     /// `signalExec`'s guards are reachable without a VM. That trade bought
     /// testability by giving up a compile-time guarantee, and this test is what
     /// replaces it -- the third line of engine wiring nothing else asserts.
     ///
     /// The assertion is `containerNotRunning` and **not** `containerNotFound`,
-    /// and that difference is the whole test. `containerNotRunning`
-    /// (`ExecManager.swift:132`) is reachable only by an `ExecManager` that
-    /// looked this id up and found the engine's own restored row;
-    /// `containerNotFound` (`:129`) is what an `ExecManager` wired to some other
-    /// source returns. A test asserting merely "createExec threw" would pass in
-    /// both worlds, which is the failure mode this suite exists to avoid.
+    /// and that difference is the whole test. `containerNotFound` (`:129`) is
+    /// what an `ExecManager` returns when its source holds no row for this id --
+    /// which is what every mis-wiring reachable by construction produces, since a
+    /// source that is not the engine's `ContainerManager` does not have the
+    /// engine's rows. `containerNotRunning` (`ExecManager.swift:132`) means the
+    /// lookup came back with a state at all, so it crossed the wiring. A test
+    /// asserting merely "createExec threw" would pass in both worlds, which is
+    /// the failure mode this suite exists to avoid.
+    ///
+    /// Be exact about the limit, because the obvious stronger sentence is false
+    /// and an earlier revision of this comment made it. This does **not** prove
+    /// the answer came from the engine's own restored row. MEASURED, with the
+    /// wiring pointed at a stub returning `"exited"` for any id whatsoever:
+    /// `swift test --filter EngineManagerWiringTests` -> `Executed 3 tests, with
+    /// 0 failures`. A source that fabricates a plausible state for every id
+    /// passes this test. Nothing in production resembles that; the mis-wiring
+    /// that is actually reachable is a source that knows nothing, and that one is
+    /// caught -- see the mutation below.
     ///
     /// The seeded container is `exited`, so this stops one guard short of
     /// success. That ceiling is not a weakness of the test but the same fact
