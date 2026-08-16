@@ -43,10 +43,12 @@ enum OCILayoutFixture {
         // load to a different digest" -- vacuous: it passed for two layouts
         // holding identical payloads, so it could not tell "the vminit changed"
         // from "the fixture was written twice".
-        // MEASURED with this line deleted: 500 writes of one payload gave 13
-        // distinct layouts, one of them 57% of the time. `OCILayoutFixtureTests`
-        // is the guard, and that distribution is why it takes 32 samples rather
-        // than 2 -- at 2 it missed the regression about 40% of the time.
+        // `OCILayoutFixtureTests` is the guard. It samples 32 writes rather than
+        // 2 because a two-write version was observed passing with this line
+        // deleted -- and because what the ordering does between writes varies by
+        // process: two 500-write runs of that mutation on one machine gave 13
+        // distinct layouts with one at 57%, and 8 in a strict period-8 rotation.
+        // See that file for why no miss probability is quoted from either.
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let layer = try writeBlob(
@@ -112,10 +114,16 @@ enum OCILayoutFixture {
     /// is reproducible from here, being the layer blob's own filename in a
     /// layout written with `payload: "the layer this test unpacks"`.
     ///
-    /// **The stamp has one-second resolution, so this would have been an
-    /// intermittent flake rather than a constant one**: two gzip writes inside
-    /// the same second hash identically (measured, `282a67e774c6…` twice), which
-    /// is why nothing ever caught it.
+    /// **The stamp has one-second resolution**: two gzip writes inside the same
+    /// second hash identically (measured, `282a67e774c6…` twice). So HAD this
+    /// fixture ever written gzip, the flake would have been intermittent rather
+    /// than constant -- a counterfactual, and stated as one. **It never did**:
+    /// before `36e0fc7` the blob was `Data(payload.utf8)` under a gzip *media
+    /// type* with no libarchive involved, and `ArchiveWriterConfiguration` first
+    /// enters this file in `36e0fc7` already at `filter: .none` (`git log -S`
+    /// over this path confirms both). The reason both nondeterminism sources
+    /// went unnoticed is simpler and covers them together: **no test compared
+    /// two same-payload layouts until `OCILayoutFixtureTests` existed.**
     ///
     /// **It was one of two nondeterminism sources and closing it alone was not
     /// enough** -- see the `.sortedKeys` note in `write(at:reference:payload:)`

@@ -21,20 +21,34 @@ import XCTest
 /// engine suite green and fails this file.
 ///
 /// **The repetition count is the load-bearing part of this test, and two writes were not
-/// enough.** `JSONEncoder` without `.sortedKeys` does not emit a uniformly random order: MEASURED
-/// over 500 writes of one payload with the line deleted, the layout took only **13** distinct
-/// forms, one of them **57%** of the time, and **199 of 499 adjacent pairs were equal**. A
-/// two-write version of this test therefore passed roughly two runs in five with the defect
-/// present -- observed, not predicted: it passed inside `swift test --filter ArcaEngineTests` and
-/// failed on the next run of the same file alone.
+/// enough.** A two-write version passed inside `swift test --filter ArcaEngineTests` with the
+/// defect present and failed on the next run of the same file alone -- observed, not predicted.
 ///
-/// There is no single-sample assertion that avoids this, because the defect is the absence of a
-/// guarantee and any one layout is one sample of it. So the guard is sized instead: at the
-/// measured 57% dominant order, `writes` = 32 leaves a miss probability of 0.57^31, about 1 in
-/// 10^8, while costing a few tens of milliseconds.
+/// **What the ordering does between writes is a property of the process, not of the system, and
+/// two independent 500-write runs of the same mutation on the same machine disagree about it:**
+///
+/// - one saw **13** distinct layouts, one of them **57%** of the time, with **199 of 499**
+///   adjacent pairs equal;
+/// - the other saw **8**, in a strict period-8 rotation -- each about **12.5%**, with **0 of
+///   499** adjacent pairs equal, where a two-write guard would have caught the defect every time.
+///
+/// Both are real. Neither is *the* distribution, because the key order comes from per-allocation
+/// object identity inside the encoder and so depends on the process's allocation history. **No
+/// miss probability is quoted here for that reason** -- a figure derived from either run would be
+/// one process's heap behaviour dressed as a bound, and it is the number a later reader would
+/// most likely reuse.
+///
+/// What survives both runs is the shape of the argument: there is no single-sample assertion that
+/// avoids this, because the defect is the absence of a guarantee and any one layout is one sample
+/// of it. Note that the same sentence still applies at 32 -- no sample count protects against a
+/// process whose ordering happens to be constant throughout. `writes` is sized to sit comfortably
+/// above both observed regimes rather than to bound a risk.
 final class OCILayoutFixtureTests: XCTestCase {
-    /// Enough samples that the measured 57% dominant ordering cannot carry all of them. See the
-    /// type doc: at two writes this guard missed the regression about 40% of the time.
+    /// Comfortably above both observed orderings, and cheap: 32 writes cost around 60ms.
+    ///
+    /// In the period-8 run every 32-sample window held all 8 orderings; in the 57%-dominant run
+    /// three separate executions failed at 5, 3 and 7 distinct layouts. See the type doc for why
+    /// this is stated as "above both observations" rather than as a probability.
     private static let writes = 32
 
     private var scratch: URL!
@@ -81,10 +95,12 @@ final class OCILayoutFixtureTests: XCTestCase {
     /// reaches the index -- but reading only the index would leave a reader guessing whether that
     /// is by construction or by luck, and the blob filenames ARE their digests.
     ///
-    /// Sorted into a string rather than returned as a `[String: String]` because this test
-    /// compares readings for equality, and `Dictionary`'s own iteration and `description` order
-    /// is per-instance -- a comparison built on it would have carried the exact defect it exists
-    /// to catch.
+    /// Sorted into a string rather than returned as a `[String: String]` for a legible failure
+    /// and a stable printed form -- **not** because a dictionary would have compared wrongly.
+    /// `Dictionary` equality and hashing are order-independent, so `Set(sampled)` over
+    /// dictionaries would have been correct; only its *iteration* and `description` order vary
+    /// per instance, which would have made the failure message shuffle between runs while the
+    /// comparison stayed sound.
     private func layout(named name: String, payload: String) throws -> String {
         let directory = try OCILayoutFixture.write(
             at: scratch.appendingPathComponent(name),
