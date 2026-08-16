@@ -5,9 +5,41 @@ import ContainerizationExtras
 import ContainerizationOCI
 import ContainerizationOS
 
+/// The two things `ExecManager` needs from a `ContainerManager`, and nothing
+/// else: the state of a container it is about to exec into, and the native
+/// container it execs through.
+///
+/// It exists because `ContainerManager.getContainerState` reads the in-memory
+/// `containers` map (`ContainerManager.swift:3680-3685`), and only two places
+/// ever insert into that map: `initialize()` and `createContainer(...)`. Every
+/// other write updates a key that is already there. `initialize()` builds a real
+/// `Containerization.ContainerManager` and a real `VmnetNetwork`, so neither
+/// insertion point is reachable from a unit test -- the same wall recorded at
+/// `Tests/ArcaEngineTests/EngineCommandRefusalTests.swift:140-143`.
+///
+/// MEASURED, before this protocol existed, with a throwaway test against the
+/// concrete `ContainerManager`: seeding a `status: "running"` row through
+/// `StateStore.saveContainer` and reading it straight back,
+/// `getContainerState` returned `nil` and `createExec` threw `No such container:
+/// bbbb...`. Seeding the store is not enough, because the store is not what
+/// `getContainerState` reads.
+///
+/// Without this seam every guard in `signalExec` below is unreachable without a
+/// VM, and an unreachable guard is one nothing stops from being deleted.
+///
+/// `package` rather than `public`, and named for what it supplies rather than
+/// for the type that supplies it, matching `NetworkAttachmentSource`
+/// (`NetworkManager.swift:46-49`).
+package protocol ExecContainerSource: Sendable {
+    func getContainerState(id: String) async -> String?
+    func getNativeContainer(id: String) async -> LinuxContainer?
+}
+
+extension ContainerManager: ExecContainerSource {}
+
 /// Manages exec instances for running containers
 public actor ExecManager {
-    private let containerManager: ContainerManager
+    private let containerManager: any ExecContainerSource
     private let logger: Logger
 
     /// Information about an exec instance
@@ -38,7 +70,12 @@ public actor ExecManager {
     /// Tracked exec instances by exec ID
     private var execInstances: [String: ExecInfo] = [:]
 
-    public init(containerManager: ContainerManager, logger: Logger) {
+    /// `package` rather than `public` because `ExecContainerSource` is, and
+    /// because every caller -- `ArcaDaemon.swift:209`, `EngineManagers.swift:86`
+    /// -- is in this package. There is deliberately only this one initializer:
+    /// a second one taking the concrete `ContainerManager` would be a way to
+    /// build an `ExecManager` that the tests below cannot build.
+    package init(containerManager: any ExecContainerSource, logger: Logger) {
         self.containerManager = containerManager
         self.logger = logger
     }
@@ -283,6 +320,60 @@ public actor ExecManager {
         try await process.resize(to: size)
     }
 
+    /// Forward a signal to an exec instance's process.
+    ///
+    /// `signal` is the raw number, not a `Containerization.Signal`, and that is
+    /// the point. `Signal.init(rawValue:)` is not failable
+    /// (`Signal.swift:31-33`) and `Signal` is `ExpressibleByIntegerLiteral`, so a
+    /// `Signal` parameter would carry no validation whatsoever while looking as
+    /// though it did -- the caller would reach the same unchecked number through
+    /// a type that reads as checked. The wire agrees: `ExecClientFrame`'s signal
+    /// arm is `int32 signal = 4` (`proto/arca/engine/v1/engine.proto:437`). So
+    /// the number arrives raw and is validated here, once.
+    ///
+    /// Validation is Containerization's own `Signal.init(_:from:)`
+    /// (`Signal.swift:36-50`), reached by handing it the number as a string:
+    /// that initializer's numeric branch rejects anything absent from
+    /// `Signal.linux`, which is the right map because `LinuxProcess.kill` sends
+    /// to a Linux guest. It admits 1...31 and 34...64 and throws
+    /// `SignalError.invalidSignal` for everything else -- including 0, which is
+    /// an existence probe rather than a signal to forward. That error is left to
+    /// propagate rather than rewrapped: the fact already has a name in this
+    /// repository and a second one for it would be a second vocabulary.
+    ///
+    /// **Unlike `resizeExec` above, a process that has not started is an error
+    /// here, not a silent return.** That difference is deliberate and it is the
+    /// reason this method exists in this shape. A window size that arrives
+    /// before the process does is genuinely unimportant, so `resizeExec` drops
+    /// it. A signal is not: dropping one while telling the caller nothing is the
+    /// same defect as an engine that publishes no ports and reports success. The
+    /// caller is told.
+    ///
+    /// The signal check precedes the process check so that a bad signal number
+    /// is reported as a bad signal number even for an exec that never started,
+    /// which is also what makes that validation reachable from a test.
+    ///
+    /// That a signal actually arrives at a guest process is **not** verified by
+    /// anything here; that needs a live VM and belongs to the live tier.
+    public func signalExec(execID: String, signal: Int32) async throws {
+        guard let execInfo = execInstances[execID] else {
+            throw ExecManagerError.execNotFound(execID)
+        }
+
+        let resolved = try Signal(String(signal))
+
+        guard let process = execInfo.process else {
+            throw ExecManagerError.execNotStarted(execID)
+        }
+
+        logger.info("Signalling exec instance", metadata: [
+            "exec_id": "\(execID)",
+            "signal": "\(resolved.rawValue)"
+        ])
+
+        try await process.kill(resolved)
+    }
+
     /// Delete an exec instance
     public func deleteExec(execID: String) async throws {
         logger.info("Deleting exec instance", metadata: ["exec_id": "\(execID)"])
@@ -359,6 +450,10 @@ public actor ExecManager {
 public enum ExecManagerError: Error, CustomStringConvertible {
     case execNotFound(String)
     case execAlreadyRunning(String)
+    /// The exec instance exists but `startExec` has not run, so it has no
+    /// process to act on. Distinct from `containerNotRunning`, which is about the
+    /// container: the container here may be running perfectly well.
+    case execNotStarted(String)
     case containerNotFound(String)
     case containerNotRunning(String)
     case invalidCommand(String)
@@ -370,6 +465,8 @@ public enum ExecManagerError: Error, CustomStringConvertible {
             return "No such exec instance: \(id)"
         case .execAlreadyRunning(let id):
             return "Exec instance already running: \(id)"
+        case .execNotStarted(let id):
+            return "Exec instance has not been started: \(id)"
         case .containerNotFound(let id):
             return "No such container: \(id)"
         case .containerNotRunning(let id):
