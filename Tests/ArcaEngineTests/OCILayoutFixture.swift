@@ -43,12 +43,13 @@ enum OCILayoutFixture {
         // load to a different digest" -- vacuous: it passed for two layouts
         // holding identical payloads, so it could not tell "the vminit changed"
         // from "the fixture was written twice".
-        // `OCILayoutFixtureTests` is the guard. It samples 32 writes rather than
-        // 2 because a two-write version was observed passing with this line
-        // deleted -- and because what the ordering does between writes varies by
-        // process: two 500-write runs of that mutation on one machine gave 13
-        // distinct layouts with one at 57%, and 8 in a strict period-8 rotation.
-        // See that file for why no miss probability is quoted from either.
+        // `OCILayoutFixtureTests` is the guard, and it holds this two ways: by
+        // sampling 32 writes, and by pinning the resulting `index.json` digest.
+        // The pin is the half that does not depend on how the encoder happens to
+        // order keys in the running process -- which two 500-write runs of the
+        // deletion measured differently, 13 distinct layouts with one at 57%
+        // against 8 in a strict period-8 rotation. See that file; no miss
+        // probability is quoted from either run.
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let layer = try writeBlob(
