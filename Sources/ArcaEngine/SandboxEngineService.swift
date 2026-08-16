@@ -10,15 +10,19 @@ import SandboxEngineProto
 /// in EngineTranslation, so that this file stays readable as a list of the
 /// contract's eleven methods.
 ///
-/// **In this build, nine of the eleven are implemented: `Capabilities`,
+/// **In this build, ten of the eleven are implemented: `Capabilities`,
 /// `Inspect`, `ListResources`, `PrepareImage`, `Create`, `CreateContainer`,
-/// `Start`, `Stop` and `Remove`.** The other two -- `Exec` and `Logs` -- answer
-/// `unsupported_capability`, and both send it inside a stream frame rather than
-/// a response `oneof`: `ExecServerFrame.frame.error` (`:1099`) and
-/// `LogsChunk.outcome.error` (`:1109`). That is why neither is reachable from a
-/// test in this target, which cannot construct a
+/// `Start`, `Stop`, `Remove` and `Logs`.** The one that remains -- `Exec` --
+/// answers `unsupported_capability`, and sends it inside a stream frame rather
+/// than a response `oneof`: `ExecServerFrame.frame.error`. That is why it is
+/// not reachable from a test in this target, which cannot construct a
 /// `GRPCAsyncResponseStreamWriter`, and why gascan's live tier is what asserts
-/// they answer at all.
+/// it answers at all.
+///
+/// `Logs` streams too and has the same problem, which is why its logic lives in
+/// `logChunks(request:)` and the protocol method only writes what that returns
+/// -- the same test seam the unary methods use, so the frames are asserted here
+/// rather than only over the wire.
 ///
 /// `Inspect` and `ListResources` were both on that list because, when they were
 /// written, this process called `initialize()` on no manager, and an
@@ -1185,14 +1189,123 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
         )
     }
 
+    /// The frames `Logs` sends, in order, so that a test can drive the whole
+    /// method: a test target cannot construct a
+    /// `GRPCAsyncResponseStreamWriter`, and this is the same test seam
+    /// `inspect(request:)` and the rest use one method up. It carries all of
+    /// the logic; the protocol method below only writes what it returns.
+    ///
+    /// **An unlabelled or foreign container is refused before anything is
+    /// read, by the rule and the codes `Inspect` uses**, and for `Inspect`'s
+    /// reason: a container name is a flat namespace this engine does not own,
+    /// so a sandbox id can resolve to something that is not this engine's, and
+    /// handing back its output would be handing back a stranger's. The engine
+    /// is not deciding whether a labelled container is the caller's -- that
+    /// judgment stays with the consumer, as `engine.proto:143-148` requires --
+    /// it is declining to assert that an unlabelled one **is** the sandbox that
+    /// was asked for.
+    ///
+    /// **A sandbox that is not there is `not_found`, where `Inspect` answers
+    /// `absent`.** `LogsChunk` has two arms and no absent one, and the
+    /// distinction `InspectResponse` draws between "not there" and "I could not
+    /// tell" is drawn here between `not_found` and `command_io`.
+    ///
+    /// **A sandbox that exists but has never run is an empty stream, not an
+    /// error.** `getLogPaths` answers nil until `createLogWriters` has run for
+    /// that container, which is what a created-but-never-started sandbox looks
+    /// like, and an empty log is the honest report of one. A container whose
+    /// paths ARE registered but whose file is missing is a different fact and
+    /// arrives as `command_io`: that is a log that was there and is not.
+    ///
+    /// **Zero frames is a complete answer.** The consumer concatenates data
+    /// frames, so an empty log is an empty concatenation
+    /// (`gascan-arca/src/backend.rs:365-377`). Every frame this does send sets
+    /// its `oneof`; an unset outcome reaches gascan as `invalid_output`.
+    ///
+    /// **`containerNameRefusal` runs first, and `Logs` is why the argument that
+    /// excused `Inspect` from it does not carry.** That gate exists because
+    /// `ContainerManager.resolveContainerID` prefix-matches any pure-hex string
+    /// of four or more characters against every Docker id it holds. The note on
+    /// `SandboxIdentity.refusalReason(forSandboxId:)` records that this was
+    /// harmless while every implemented method was read-only, because "the worst
+    /// outcome was an `Inspect` reporting the wrong container, which the
+    /// consumer's own ownership check catches". `Logs` is read-only and that
+    /// reasoning still fails for it: a `LogsChunk` carries bytes and no labels,
+    /// so the consumer has nothing to check. Without this gate a sandbox id of
+    /// `beef` returns an unrelated container's output, and when that container
+    /// is itself gascan-labelled the ownership guard below passes it through.
+    /// The refusal is `invalid_resource_identity`, as it is on `Create`,
+    /// `Start`, `Stop` and `Remove`.
+    func logChunks(request: Arca_Engine_V1_LogsRequest) async -> [Arca_Engine_V1_LogsChunk] {
+        let name = SandboxIdentity.containerName(forSandboxId: request.sandboxID)
+        if let refusal = containerNameRefusal(name) {
+            return [Self.logsFailed(refusal)]
+        }
+        let found = await engineErrorCatching(.commandIo, resource: name) {
+            try await self.containerManager.getContainer(id: name)
+        }
+        let container: Container
+        switch found {
+        case .failure(let error):
+            return [Self.logsFailed(error)]
+        case .success(nil):
+            return [Self.logsFailed(engineError(
+                .notFound,
+                resource: name,
+                message: "no container named \(name) exists, so it has no log"
+            ))]
+        case .success(.some(let resolved)):
+            container = resolved
+        }
+        guard SandboxIdentity.owner(from: container.config.labels) != nil else {
+            return [Self.logsFailed(engineError(
+                .foreignResourceRefused,
+                resource: name,
+                message: "container \(name) carries no gascan owner labels, so this engine "
+                    + "cannot assert it is the sandbox that was asked for"
+            ))]
+        }
+        // Reached without awaiting the actor: `logManager` is a
+        // `nonisolated let` on `ContainerManager` and says so.
+        guard let paths = containerManager.logManager.getLogPaths(dockerID: container.id) else {
+            return []
+        }
+        let read = await engineErrorCatching(.commandIo, resource: name) {
+            try LogReader.chunks(
+                combinedPath: paths.combinedPath,
+                sinceUnixMillis: request.hasSinceUnixMillis ? request.sinceUnixMillis : nil
+            )
+        }
+        switch read {
+        case .failure(let error):
+            return [Self.logsFailed(error)]
+        case .success(let chunks):
+            return chunks.map { chunk in
+                Arca_Engine_V1_LogsChunk.with { $0.data = chunk }
+            }
+        }
+    }
+
+    /// The failure arm of a `LogsChunk`, in one place, for `ackFailed`'s reason.
+    private static func logsFailed(
+        _ error: Arca_Engine_V1_EngineError
+    ) -> Arca_Engine_V1_LogsChunk {
+        Arca_Engine_V1_LogsChunk.with { $0.error = error }
+    }
+
+    /// **No follow mode, and none is to be added.** `engine.proto:474-476` says
+    /// so in bold and gives the reason: a follow mode is the first step back
+    /// toward a general container API, and this contract has a size budget for
+    /// exactly that. The stream ends when the log the request asked for has
+    /// been sent.
     public func logs(
         request: Arca_Engine_V1_LogsRequest,
         responseStream: GRPCAsyncResponseStreamWriter<Arca_Engine_V1_LogsChunk>,
         context: GRPCAsyncServerCallContext
     ) async throws {
-        try await responseStream.send(
-            Arca_Engine_V1_LogsChunk.with { $0.error = Self.notImplemented("Logs") }
-        )
+        for chunk in await logChunks(request: request) {
+            try await responseStream.send(chunk)
+        }
     }
 
     /// See the note on the `create(request:)` overload above.

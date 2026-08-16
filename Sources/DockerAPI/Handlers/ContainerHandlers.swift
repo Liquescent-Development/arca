@@ -1268,18 +1268,19 @@ public struct ContainerHandlers: Sendable {
         for line in lines {
             guard !line.isEmpty else { continue }
 
+            // Through ContainerBridge's codec rather than a second hand-rolled
+            // parse: it is the writer's own, so a base64 entry decodes to its
+            // bytes and the timestamp is read with the fractional-seconds
+            // options the writer emits. A default-options ISO8601DateFormatter
+            // returns nil for those stamps, which would drop every line here.
             guard let lineData = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let logStream = json["stream"] as? String,
-                  let logMessage = json["log"] as? String,
-                  let timeString = json["time"] as? String else {
+                  let entry = try? ContainerBridge.ContainerLogCodec.decode(line: lineData),
+                  let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
+                  let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                 continue
             }
-
-            let formatter = ISO8601DateFormatter()
-            guard let timestamp = formatter.date(from: timeString) else {
-                continue
-            }
+            let logStream = entry.stream
+            let logMessage = String(decoding: payload, as: UTF8.self)
 
             if logStream == streamType {
                 logEntries.append(LogEntry(
@@ -1319,24 +1320,19 @@ public struct ContainerHandlers: Sendable {
             for line in lines {
                 guard !line.isEmpty else { continue }
 
-                // Parse JSON log entry
+                // Parse the JSON log entry with the writer's own codec; see the
+                // note in `readNewLogData` for why a second parse here would
+                // read nothing.
                 guard let data = line.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let logStream = json["stream"] as? String,
-                      let logMessage = json["log"] as? String,
-                      let timeString = json["time"] as? String else {
-                    continue
-                }
-
-                // Parse timestamp
-                let formatter = ISO8601DateFormatter()
-                guard let timestamp = formatter.date(from: timeString) else {
+                      let entry = try? ContainerBridge.ContainerLogCodec.decode(line: data),
+                      let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
+                      let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                     continue
                 }
 
                 allLogs.append(LogEntry(
-                    stream: logStream,
-                    message: logMessage,
+                    stream: entry.stream,
+                    message: String(decoding: payload, as: UTF8.self),
                     timestamp: timestamp,
                     includeTimestamp: timestamps
                 ))

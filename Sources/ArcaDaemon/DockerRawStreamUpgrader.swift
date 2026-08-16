@@ -726,24 +726,21 @@ final class DockerRawStreamUpgrader: HTTPServerProtocolUpgrader, Sendable {
             for line in lines {
                 guard !line.isEmpty else { continue }
 
-                // Parse JSON log entry
+                // Parse the JSON log entry with ContainerBridge's own codec.
+                // A default-options ISO8601DateFormatter cannot read the
+                // fractional-seconds stamps the writer emits and returns nil
+                // for every one, which would leave this an empty log rather
+                // than an error.
                 guard let data = line.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let logStream = json["stream"] as? String,
-                      let logMessage = json["log"] as? String,
-                      let timeString = json["time"] as? String else {
-                    continue
-                }
-
-                // Parse timestamp
-                let formatter = ISO8601DateFormatter()
-                guard let timestamp = formatter.date(from: timeString) else {
+                      let entry = try? ContainerBridge.ContainerLogCodec.decode(line: data),
+                      let payload = try? ContainerBridge.ContainerLogCodec.payload(of: entry),
+                      let timestamp = ContainerBridge.LogEntryTimestamp.date(from: entry.time) else {
                     continue
                 }
 
                 allLogs.append(LogEntry(
-                    stream: logStream,
-                    message: logMessage,
+                    stream: entry.stream,
+                    message: String(decoding: payload, as: UTF8.self),
                     timestamp: timestamp
                 ))
             }
