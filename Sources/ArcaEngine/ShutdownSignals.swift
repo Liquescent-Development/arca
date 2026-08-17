@@ -139,10 +139,22 @@ public final class ShutdownSignals: @unchecked Sendable {
 
     /// Hands every byte the pipe holds to the current action, one at a time.
     ///
-    /// Reads until the pipe is empty rather than once per wake-up: a read source
-    /// reports readability, not a count, and two signals close together can
-    /// arrive as one wake-up carrying two bytes. Dropping the second would lose
-    /// the escalation an operator's second `SIGTERM` is.
+    /// **The inner loop is the load-bearing one, and an earlier revision of this
+    /// comment credited the outer one.** A read source reports readability, not
+    /// a count, so two signals close together arrive as one wake-up carrying two
+    /// bytes -- one `read`, two bytes, two actions. Dispatching only `buffer[0]`
+    /// loses the escalation an operator's second `SIGTERM` is, and
+    /// `ShutdownSignalsTests.testTheRelayLosesNothingRaisedBeforeItsActionOrBehindIt`
+    /// catches exactly that: MEASURED, that mutation reports `got [30, 31]` --
+    /// `SIGUSR1, SIGUSR2`, with the second `SIGUSR1` gone.
+    ///
+    /// **The outer loop is a belt no test can distinguish, recorded rather than
+    /// left to be discovered.** MEASURED: replaced with a single `read` per
+    /// wake-up, that same suite stays green, because the source is
+    /// level-triggered and fires again while the pipe still holds anything. It
+    /// earns its place only where that is not enough -- more than 64 signals
+    /// queued at once, or a byte written between the `read` and the source
+    /// re-arming -- and nothing can drive either from a test.
     private func deliver() {
         var buffer = [UInt8](repeating: 0, count: 64)
         while true {

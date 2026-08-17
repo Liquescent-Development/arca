@@ -38,22 +38,30 @@ final class ShutdownSignalsTests: XCTestCase {
     /// loss. 50ms is four orders of magnitude more than a signal delivery needs.
     private let settle: useconds_t = 50_000
 
-    /// The mechanism the engine used to use loses a signal raised in its gap;
-    /// the one that replaced it does not.
+    /// The mechanism this replaced loses a signal raised before its source is
+    /// watching.
     ///
-    /// **One test and not three, because the three are one comparison** and
-    /// because they must run in this order: the first two leave `SIGUSR1` and
-    /// `SIGUSR2` set to `SIG_IGN`, and the third replaces one of those
-    /// dispositions with the capture's own handler.
+    /// **A NEGATIVE CONTROL, and not a claim that libdispatch is broken.** A
+    /// `DispatchSourceSignal` observes deliveries from the moment its kevent is
+    /// registered and makes no promise about earlier ones. What this records is
+    /// that a lost signal is detectable here at all -- which is what gives
+    /// `testTheRelayLosesNothingRaisedBeforeItsActionOrBehindIt`'s positive
+    /// result its meaning. If either assertion below ever goes green, what has
+    /// been invalidated is this file's ability to tell a delivery from a loss,
+    /// not the engine.
     ///
-    /// **The first two assertions are a NEGATIVE CONTROL, not a claim that
-    /// libdispatch is broken.** A `DispatchSourceSignal` observes deliveries
-    /// from the moment its kevent is registered and makes no promise about
-    /// earlier ones; the assertions record that this test can in fact detect a
-    /// lost signal. If either goes green, what has been invalidated is this
-    /// test's ability to tell delivery from loss -- and with it the meaning of
-    /// the third assertion -- rather than the engine.
-    func testTheReplacedMechanismLosesASignalRaisedBeforeItsSourceIsWatchingAndTheNewOneDoesNot() throws {
+    /// Two arms and not one: they answer different questions -- whether the
+    /// kevent is registered when the source is created or when it is resumed --
+    /// and the answer decides how much of the gap is lossy. It is the second,
+    /// so the gap is wider than "between the two statements": it swallows the
+    /// source's own construction.
+    ///
+    /// **It deliberately does not touch `ShutdownSignals`.** Routing the relay
+    /// resumes a read source that lives as long as the process, and a second
+    /// test that had already done so would leave this one unable to reach the
+    /// state it is about. One test owns the relay for that reason, and this is
+    /// not it.
+    func testTheMechanismItReplacedLosesASignalRaisedBeforeItsSourceIsWatching() {
         let queue = DispatchQueue(label: "shutdown-signals-tests")
 
         // Arm one: raised after the disposition changed and before the source
@@ -69,9 +77,6 @@ final class ShutdownSignalsTests: XCTestCase {
         created.cancel()
 
         // Arm two: raised after the source exists and before it is resumed.
-        // Separate from arm one because they answer different questions --
-        // whether the kevent is registered at creation or at resume -- and the
-        // answer decides how much of the gap is lossy.
         signal(SIGUSR2, SIG_IGN)
         let beforeResume = DispatchSemaphore(value: 0)
         let unresumed = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: queue)
@@ -82,34 +87,108 @@ final class ShutdownSignalsTests: XCTestCase {
         let deliveredBeforeResume = beforeResume.wait(timeout: .now() + bound) == .success
         unresumed.cancel()
 
-        // Arm three: the same gap, on the mechanism that replaced it. The
-        // capture is installed, the signal is raised, and only then is anything
-        // routed -- which is precisely the shape `arca-engine` starts in, where
-        // the constructor captures and `EngineEntryPoint.main` routes some
-        // milliseconds later.
-        try ShutdownSignals.shared.capture([SIGUSR1])
-        kill(getpid(), SIGUSR1)
-        usleep(settle)
-        let relayed = DispatchSemaphore(value: 0)
-        ShutdownSignals.shared.route { number in
-            if number == SIGUSR1 { relayed.signal() }
-        }
-        let deliveredByTheRelay = relayed.wait(timeout: .now() + bound) == .success
-
         XCTAssertFalse(
             deliveredBeforeCreation,
             "negative control: a signal raised before the source exists must be undetectable, "
-                + "or this test cannot tell a delivery from a loss"
+                + "or this file cannot tell a delivery from a loss"
         )
         XCTAssertFalse(
             deliveredBeforeResume,
             "negative control: a signal raised before the source is resumed must be undetectable, "
-                + "or this test cannot tell a delivery from a loss"
+                + "or this file cannot tell a delivery from a loss"
         )
-        XCTAssertTrue(
-            deliveredByTheRelay,
+    }
+
+    /// The relay delivers a signal that arrived before its action existed, and
+    /// both of a pair that piled up behind a busy one.
+    ///
+    /// **One test for two arms because one test has to own the relay.**
+    /// `route(to:)` creates and resumes a read source that lives as long as the
+    /// process, so "nothing has routed yet" is a state exactly one test can
+    /// reach -- and the first arm is about precisely that state, because it is
+    /// the shape `arca-engine` starts in: the `dyld` constructor captures, and
+    /// `EngineEntryPoint.main` routes some milliseconds later. Splitting these
+    /// into two tests made the second one's first arm silently measure the
+    /// other's action instead of its own, which is how this arrangement was
+    /// arrived at rather than chosen.
+    ///
+    /// Arm one is the positive half of
+    /// `testTheMechanismItReplacedLosesASignalRaisedBeforeItsSourceIsWatching`:
+    /// the same gap, on the mechanism that replaced it.
+    ///
+    /// **Arm two pins the escalation, which nothing else touched.** The second
+    /// `SIGTERM` an operator sends is what forces a drain a peer would otherwise
+    /// hold open; `ServeCommand`'s action tells the first from the rest by
+    /// counting them, so a relay that collapsed two deliveries into one would
+    /// leave "handles SIGTERM" true and "can be stopped" false. Everything else
+    /// in this file, and `EngineShutdownSignalTests`, sends exactly one signal.
+    ///
+    /// **The pile-up is forced rather than waited for.** The action parks on
+    /// `gate` the first time it is asked to, which holds the relay's serial
+    /// queue inside `deliver()`; the two signals raised while it is parked can
+    /// therefore only reach the pipe, and `deliver()`'s next `read` is
+    /// guaranteed to return both at once. Raising three signals and hoping two
+    /// land in one wake-up would be a different test on every run.
+    ///
+    /// **Two different numbers for the pair, deliberately.** Standard signals do
+    /// not queue: a second `SIGUSR1` arriving while the first is still pending
+    /// is merged with it by the kernel, and this has to measure the relay rather
+    /// than that. `SIGUSR1` is repeated only across the gate, by which point the
+    /// first has long since been handled -- and it is repeated because "the same
+    /// signal twice" is exactly the operator's escalation.
+    func testTheRelayLosesNothingRaisedBeforeItsActionOrBehindIt() throws {
+        // Arm one: captured, raised, and only then routed.
+        try ShutdownSignals.shared.capture([SIGUSR1, SIGUSR2])
+        kill(getpid(), SIGUSR1)
+        usleep(settle)
+        let early = DispatchSemaphore(value: 0)
+        ShutdownSignals.shared.route { number in
+            if number == SIGUSR1 { early.signal() }
+        }
+        XCTAssertEqual(
+            early.wait(timeout: .now() + bound), .success,
             "a signal captured before anything routed it must still be acted on once "
                 + "something does; otherwise the engine ignores SIGTERM forever"
+        )
+
+        // Arm two: two more piled up behind an action that is busy with the
+        // first.
+        let recorder = Recorder()
+        let parked = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        ShutdownSignals.shared.route { number in
+            if recorder.record(number) {
+                parked.signal()
+                gate.wait()
+            }
+        }
+
+        kill(getpid(), SIGUSR1)
+        XCTAssertEqual(
+            parked.wait(timeout: .now() + bound), .success,
+            "the first signal never reached the relay, so nothing was ever parked"
+        )
+
+        // The relay's queue is inside the action now. These two can reach the
+        // pipe and nowhere else until the gate opens.
+        kill(getpid(), SIGUSR2)
+        kill(getpid(), SIGUSR1)
+        usleep(settle)
+        gate.signal()
+
+        let arrived = recorder.awaiting(3, upTo: bound)
+        XCTAssertEqual(
+            arrived.count, 3,
+            "every signal that reached the pipe must reach the action; got \(arrived)"
+        )
+        XCTAssertEqual(
+            arrived.filter { $0 == SIGUSR1 }.count, 2,
+            "a repeat of the same signal is an operator escalating and must not be collapsed "
+                + "into the first; got \(arrived)"
+        )
+        XCTAssertEqual(
+            arrived.filter { $0 == SIGUSR2 }.count, 1,
+            "the other signal must arrive exactly once; got \(arrived)"
         )
     }
 
@@ -159,5 +238,41 @@ final class ShutdownSignalsTests: XCTestCase {
             "capturing a signal must leave it unblocked, or an engine spawned with it blocked "
                 + "installs a handler that never runs"
         )
+    }
+}
+
+/// What the relay handed the action, in order, across threads.
+///
+/// The relay runs its action on a queue of its own and the test asserts from
+/// `XCTest`'s thread, so the list is touched from two. `@unchecked Sendable` for
+/// the reason `ShutdownRequests` in `ArcaEngine` is: the lock is the discipline,
+/// and there is nothing else to check.
+private final class Recorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signals: [Int32] = []
+
+    /// Records `number` and answers whether it was the first ever recorded.
+    ///
+    /// One critical section for the append and the question, so that the answer
+    /// cannot describe a list that has already changed.
+    func record(_ number: Int32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        signals.append(number)
+        return signals.count == 1
+    }
+
+    /// Everything recorded once `count` have arrived, or once `bound` runs out.
+    ///
+    /// Returns what it has either way rather than throwing, because the shape of
+    /// a short list is the finding: a caller asserting `3` wants to see the two
+    /// it got.
+    func awaiting(_ count: Int, upTo bound: TimeInterval) -> [Int32] {
+        let deadline = Date().addingTimeInterval(bound)
+        while true {
+            let recorded = lock.withLock { signals }
+            if recorded.count >= count || Date() >= deadline { return recorded }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
     }
 }
