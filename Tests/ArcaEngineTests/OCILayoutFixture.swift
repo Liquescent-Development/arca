@@ -23,6 +23,36 @@ import Foundation
 /// in the load path unpacks a layer: `ImageStore.ImportOperation` copies layer
 /// blobs by digest and decodes only the index, the manifest and the config.
 enum OCILayoutFixture {
+    /// One layer of a layout: the path its single entry lands at in the unpacked
+    /// filesystem, and the bytes the file there holds.
+    ///
+    /// **Both halves are per-layer on purpose, and neither subsumes the other.**
+    /// A cache keyed by digest can only be shown to have returned the layer it
+    /// was ASKED FOR by layers that differ, and the two readings differ in what
+    /// they can see: the path is what a whole wrong layer in a slot shows
+    /// structurally, and the content is what a right filename over wrong or
+    /// absent bytes shows -- which is the finding `LayerCacheRoleTests` already
+    /// records twice for the one-layer case, one level down each time.
+    struct Layer {
+        /// Relative, which is the shape a real OCI layer tar has; see
+        /// `layerArchive(at:containing:)`.
+        let path: String
+        let content: String
+    }
+
+    /// Refusals, rather than a layout a later test would fail vacuously over.
+    enum Failure: Error {
+        /// Two layers with the same path AND content produce the same tar bytes,
+        /// so they hash to one blob digest and share one cache slot. A test over
+        /// them cannot tell a cache that returned the layer it was asked for from
+        /// one that returned either -- which is the whole property a multi-layer
+        /// fixture exists to make observable.
+        case indistinguishableLayers(String)
+        /// A manifest with no layers unpacks to nothing, so every per-layer
+        /// assertion over it holds by vacuity.
+        case noLayers
+    }
+
     /// Builds a layout at `directory` holding one image under `reference`.
     ///
     /// `payload` is the layer's content, and the whole layout is a function of
@@ -31,8 +61,44 @@ enum OCILayoutFixture {
     /// same `payload` are byte-identical. Both halves are load-bearing -- the
     /// first is how a test spells "the vminit changed", the second is what makes
     /// the first mean anything.
+    ///
+    /// **This one-layer shape is frozen, which is why it is a wrapper rather
+    /// than the implementation.** 12 call sites across 8 test files reach it
+    /// (`grep -rn "OCILayoutFixture.write" Tests/`, 12 hits in 8 files at
+    /// `ea9bcbc`), and `OCILayoutFixtureTests` pins the exact `index.json`
+    /// digest it produces for `payload: "one"`. It delegates below with the
+    /// entry path `payload`, which is the value that keeps those bytes what they
+    /// were: the pin is the check on that, and it is not a claim made here.
     @discardableResult
     static func write(at directory: URL, reference: String, payload: String) throws -> URL {
+        try write(
+            at: directory,
+            reference: reference,
+            layers: [Layer(path: "payload", content: payload)]
+        )
+    }
+
+    /// Builds a layout at `directory` holding one image of `layers` under
+    /// `reference`, bottom layer first -- the order a manifest lists them in and
+    /// the order an overlay stacks them in.
+    ///
+    /// **The suite was one-layer everywhere until this existed, so a whole class
+    /// of defect could not be seen from a test at all**: which layer a cache slot
+    /// holds, whether a cache consulted per layer answers per layer, and whether
+    /// the layers come back in the order the image lists them are all questions
+    /// that need at least two layers to be different questions from "did the
+    /// unpack succeed".
+    ///
+    /// The layers are refused rather than deduplicated when two of them are
+    /// identical: see `Failure.indistinguishableLayers`.
+    @discardableResult
+    static func write(at directory: URL, reference: String, layers: [Layer]) throws -> URL {
+        guard !layers.isEmpty else { throw Failure.noLayers }
+        let identities = layers.map { "\($0.path)=\($0.content)" }
+        guard Set(identities).count == identities.count else {
+            throw Failure.indistinguishableLayers(identities.joined(separator: ", "))
+        }
+
         let blobs = directory.appendingPathComponent("blobs/sha256")
         try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
 
@@ -52,23 +118,31 @@ enum OCILayoutFixture {
         // probability is quoted from either run.
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let layer = try writeBlob(
-            try layerArchive(containing: payload), mediaType: MediaTypes.imageLayer, into: blobs
-        )
+        let layerBlobs = try layers.map {
+            try writeBlob(
+                try layerArchive(at: $0.path, containing: $0.content),
+                mediaType: MediaTypes.imageLayer,
+                into: blobs
+            )
+        }
 
         // architecture and os are read back by the loader, which refuses an
         // image that names no platform or more than one.
+        //
+        // The diffIDs are the blob digests in the same order, which is exact
+        // rather than a shortcut: the layers are uncompressed, and an
+        // uncompressed layer's blob digest IS its diffID.
         let config = ContainerizationOCI.Image(
             architecture: "arm64",
             os: "linux",
             config: ImageConfig(),
-            rootfs: Rootfs(type: "layers", diffIDs: [layer.digest])
+            rootfs: Rootfs(type: "layers", diffIDs: layerBlobs.map(\.digest))
         )
         let configBlob = try writeBlob(
             try encoder.encode(config), mediaType: MediaTypes.imageConfig, into: blobs
         )
 
-        let manifest = Manifest(config: configBlob, layers: [layer])
+        let manifest = Manifest(config: configBlob, layers: layerBlobs)
         var manifestBlob = try writeBlob(
             try encoder.encode(manifest), mediaType: MediaTypes.imageManifest, into: blobs
         )
@@ -83,8 +157,8 @@ enum OCILayoutFixture {
         return directory
     }
 
-    /// The layer blob: a real tar holding `payload` as one file's content,
-    /// rather than `payload`'s bytes laid down raw.
+    /// The layer blob: a real tar holding `payload` as the content of one file
+    /// at `path`, rather than `payload`'s bytes laid down raw.
     ///
     /// **Raw bytes were enough for every test that only loads, and are not
     /// enough for one that unpacks -- but NOT because they fail.** `ImportOperation`
@@ -108,12 +182,15 @@ enum OCILayoutFixture {
     /// it. It is upstream, in the frozen submodule, and recorded for a follow-up.
     ///
     /// Uncompressed, with every entry field fixed, so the bytes are a function
-    /// of `payload` alone. libarchive's gzip filter stamps the current time into
-    /// its header. MEASURED against the entry exactly as built below, two writes
-    /// a second apart: under `filter: .gzip` they hash to `8982bec5474d…` and
-    /// `1bd8b529ffa4…`, under `filter: .none` both to `331693e76444…` -- which
-    /// is reproducible from here, being the layer blob's own filename in a
-    /// layout written with `payload: "the layer this test unpacks"`.
+    /// of `path` and `payload` alone. libarchive's gzip filter stamps the
+    /// current time into its header. MEASURED against the entry exactly as built
+    /// below, two writes a second apart: under `filter: .gzip` they hash to
+    /// `8982bec5474d…` and `1bd8b529ffa4…`, under `filter: .none` both to
+    /// `331693e76444…` -- which is reproducible from here, being the layer
+    /// blob's own filename in a layout written by the one-layer wrapper with
+    /// `payload: "the layer this test unpacks"`, whose `path` is `payload`.
+    /// (Re-derived 2026-08-17 after `path` became a parameter, by listing
+    /// `blobs/sha256` of such a layout: still `331693e76444…`.)
     ///
     /// **The stamp has one-second resolution**: two gzip writes inside the same
     /// second hash identically (measured, `282a67e774c6…` twice). So HAD this
@@ -135,18 +212,20 @@ enum OCILayoutFixture {
     /// media type to pick its decompressor, and an uncompressed layer's digest
     /// really is the `diffID` that `Rootfs` below claims it is.
     ///
-    /// The entry path is relative, which is the shape a real OCI layer tar has;
+    /// `path` is relative, which is the shape a real OCI layer tar has;
     /// `/usr/bin/tar -tvf` prints `Removing leading '/' from member names` for
-    /// an absolute one. It lands as `/payload` in the unpacked filesystem either
-    /// way, which is what `LayerCacheRoleTests` asserts on.
-    private static func layerArchive(containing payload: String) throws -> Data {
+    /// an absolute one. It lands at `/<path>` in the unpacked filesystem either
+    /// way, which is what `LayerCacheRoleTests` asserts on -- `/payload` for the
+    /// one-layer wrapper, and one path per layer for a multi-layer layout, where
+    /// telling the slots apart is the point.
+    private static func layerArchive(at path: String, containing payload: String) throws -> Data {
         let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("arca-oci-layer-\(UUID().uuidString).tar")
         defer { try? FileManager.default.removeItem(at: scratch) }
 
         let content = Data(payload.utf8)
         let entry = WriteEntry()
-        entry.path = "payload"
+        entry.path = path
         entry.fileType = .regular
         entry.permissions = 0o644
         entry.owner = 0

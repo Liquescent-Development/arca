@@ -26,7 +26,29 @@ import XCTest
 /// (`OverlayFSUnpacker.unpackLayerToCache`), and these are the two answers that decision rests
 /// on, driven against real formatted images rather than against a fixture that stands in for
 /// one.
+///
+/// **Every test here was one-layer until `OCILayoutFixture.Layer` existed, and a one-layer
+/// image cannot ask the cache which layer it returned.** With a single layer, "the slot holds
+/// the image's layer", "the slot holds the layer it is keyed by", "the layers come back in the
+/// image's order" and "each layer got its own cache decision" are all the same sentence, and
+/// three of the four go untested while the first passes. The multi-layer tests at the bottom of
+/// this file separate them; the design call and the mutations that show each one can fail are
+/// recorded on those tests.
 final class LayerCacheRoleTests: XCTestCase {
+    /// The layers every multi-layer test here is driven over: distinct path AND distinct
+    /// content, bottom to top.
+    ///
+    /// **The three contents are the same LENGTH (18 bytes each), deliberately.** A reading that
+    /// compared only entry sizes -- which is what the one-layer tests above do, and all they
+    /// need -- cannot tell these apart, so the byte comparisons below are load-bearing rather
+    /// than a stricter spelling of a size check. The paths are distinct for the other half:
+    /// a whole wrong layer in a slot shows up structurally, before any byte is read.
+    private static let layers = [
+        OCILayoutFixture.Layer(path: "bottom", content: "bottom layer bytes"),
+        OCILayoutFixture.Layer(path: "middle", content: "middle layer bytes"),
+        OCILayoutFixture.Layer(path: "top", content: "topmost layer byte")
+    ]
+
     private var scratch: URL!
 
     override func setUpWithError() throws {
@@ -341,6 +363,212 @@ final class LayerCacheRoleTests: XCTestCase {
         )
     }
 
+    /// Each layer's cache slot holds THAT layer, not some layer.
+    ///
+    /// This is the question a one-layer fixture cannot ask. `unpackLayerToCache` keys the cache
+    /// on `layer.digest` and fills it from `image.getContent(digest: layer.digest)`; with one
+    /// layer those are the only digest in the image, so a cache that returned the first match
+    /// regardless of which layer was asked for, or that filled every slot from one layer,
+    /// passes every assertion the tests above make.
+    ///
+    /// It reads the slots BY DIGEST rather than through `config.lowerLayers`, which keeps it
+    /// independent of the order the unpacker hands them back -- that is
+    /// `testTheCachedLayersComeBackInTheImagesOwnOrder`'s subject, and the two are kept
+    /// separable on purpose so that a mutation to one mechanism does not fail both tests.
+    ///
+    /// The path and the content are both asserted because neither covers the other: a slot
+    /// filled from the wrong layer shows a wrong path, and a slot filled with the right
+    /// filename over the wrong or absent bytes shows only in the bytes. The fixture's three
+    /// contents are the same length so that the byte comparison is doing the work.
+    ///
+    /// **MEASURED, and the measurement is the reason this test exists rather than a claim
+    /// about it.** Making every slot's content come from layer 0 -- in
+    /// `OverlayFSUnpacker.unpackLayerToCache`, replacing `image.getContent(digest: layer.digest)`
+    /// with a fetch of `image.manifest(for: SystemPlatform.linuxArm.ociPlatform()).layers[0].digest`,
+    /// which is the cache returning the first match whichever layer was asked for -- fails this
+    /// test and `testAStaleLayerIsRebuiltWhileItsLabelledSiblingIsReused`, and **nothing else in
+    /// the file or the suite**: 243 tests, 2 failures, both of them multi-layer. Every one of
+    /// the eight one-layer tests above stayed green, which is the blindness this task closes
+    /// stated as a reading rather than as an argument.
+    func testEachLayerIsCachedUnderItsOwnDigestHoldingItsOwnContent() async throws {
+        let image = try await loadedImage(
+            reference: "multi-layer-probe:latest", layers: Self.layers
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let descriptors = try await image.manifest(for: platform).layers
+
+        XCTAssertEqual(
+            descriptors.count, Self.layers.count,
+            "the layout must carry one layer per fixture layer, or the per-layer assertions "
+                + "below run over fewer slots than they name"
+        )
+        XCTAssertEqual(
+            Set(descriptors.map(\.digest)).count, Self.layers.count,
+            "the layers must carry DISTINCT digests: the cache is keyed by digest, so layers "
+                + "sharing one cannot be asked for separately and this test would be vacuous"
+        )
+
+        let cache = scratch.appendingPathComponent("layers")
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+        _ = try await unpacker.unpack(
+            image, for: platform, at: scratch.appendingPathComponent("container")
+        )
+
+        for (index, layer) in Self.layers.enumerated() {
+            let slot = cacheSlot(in: cache, digest: descriptors[index].digest)
+            XCTAssertEqual(
+                try pathsIn(imageAt: slot), ["/", "/lost+found", "/\(layer.path)"].sorted(),
+                """
+                the slot keyed by layer \(index)'s digest holds a different layer's entries. A \
+                cache that answers with some layer rather than the one it was asked for builds \
+                a rootfs out of the wrong image content, with Start succeeding.
+                """
+            )
+            XCTAssertEqual(
+                try contentOfEntry(named: "/\(layer.path)", inImageAt: slot),
+                Data(layer.content.utf8),
+                """
+                the slot keyed by layer \(index)'s digest carries that layer's filename over \
+                bytes that are not that layer's. All three fixture layers are the same length, \
+                so no size or structural reading can see this one.
+                """
+            )
+        }
+    }
+
+    /// The layers come back bottom-to-top in the image's own order.
+    ///
+    /// `unpack` unpacks layers concurrently and re-sorts by index before returning, so the
+    /// order in `lowerLayers` is a decision the code makes rather than a consequence of how it
+    /// iterates -- and with one layer that decision is unobservable. The order is what the
+    /// guest stacks the overlay in: reversed, every file that a higher layer overrides comes
+    /// back as the version the image replaced, which is not an error anywhere.
+    ///
+    /// It asserts on the PATHS only, deliberately, and reads none of the slots' contents. That
+    /// is what keeps it separable from `testEachLayerIsCachedUnderItsOwnDigestHoldingItsOwnContent`:
+    /// the two mechanisms -- which content fills a slot, and which order the slots come back in
+    /// -- are independent, and MEASURED to be. Reversing the sort in `OverlayFSUnpacker.unpack`
+    /// (`collected.sorted { $0.0 < $1.0 }` to `{ $0.0 > $1.0 }`) leaves the suite at 243 tests
+    /// with exactly one failure, this one; the content mutation recorded on that test fails two
+    /// tests and leaves this one green. Neither test rides on the other's fix.
+    func testTheCachedLayersComeBackInTheImagesOwnOrder() async throws {
+        let image = try await loadedImage(
+            reference: "layer-order-probe:latest", layers: Self.layers
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let descriptors = try await image.manifest(for: platform).layers
+
+        let cache = scratch.appendingPathComponent("layers")
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+        let config = try await unpacker.unpack(
+            image, for: platform, at: scratch.appendingPathComponent("container")
+        )
+
+        XCTAssertEqual(
+            config.lowerLayers,
+            descriptors.map { cacheSlot(in: cache, digest: $0.digest) },
+            """
+            the unpacked layers are handed to the guest in an order that is not the manifest's. \
+            The overlay stacks them in this order, so a wrong one silently serves the version of \
+            every overridden file that the image replaced.
+            """
+        )
+    }
+
+    /// The cache decides per layer, not once per image.
+    ///
+    /// Three slots, three different starting states in ONE unpack: layer 0 seeded labelled (a
+    /// hit), layer 1 seeded unlabelled (a stale entry, which must be discarded and rebuilt),
+    /// layer 2 not seeded at all (a plain miss). The tests above establish what each of those
+    /// answers means for an image of one layer; nothing in them says the answer is taken again
+    /// for the next layer, and a check hoisted out of the loop -- or a result cached across
+    /// layers -- would leave a partially stale cache either wholly reused or wholly rebuilt.
+    ///
+    /// Wholly reused is the milestone's own defect for the layers that were stale; wholly
+    /// rebuilt is merely slow, which is why the reuse readings here are the ones that would go
+    /// quiet, and why the reused slot is asserted to keep its inode, its size and its emptiness
+    /// rather than just to exist.
+    ///
+    /// The rebuilt and missed slots are asserted to hold THEIR OWN layers, which is the per-layer
+    /// identity question again in the state where it is easiest to get wrong: the unpacker is
+    /// mid-loop with another layer's content already in hand.
+    ///
+    /// **MEASURED against two mutations, and it is the second that says this is not a longer
+    /// spelling of the test above.** The maintainer's `if true || Self.cachedLayerIsReusable(…)`
+    /// -- the pre-fix behaviour exactly -- fails this test and
+    /// `testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt` and nothing else (243
+    /// tests, 2 failures), which
+    /// `testEachLayerIsCachedUnderItsOwnDigestHoldingItsOwnContent` survives because it seeds no
+    /// cache entry at all. The wrong-layer-content mutation recorded on that test fails this one
+    /// too: the two share the content-identity mechanism, and no mutation was found that this
+    /// test survives and that one catches.
+    func testAStaleLayerIsRebuiltWhileItsLabelledSiblingIsReused() async throws {
+        let image = try await loadedImage(
+            reference: "partial-reuse-probe:latest", layers: Self.layers
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let descriptors = try await image.manifest(for: platform).layers
+        let cache = scratch.appendingPathComponent("layers")
+
+        let reused = try cachedLayer(
+            in: cache,
+            digest: descriptors[0].digest,
+            label: ArcaBlockDeviceRole.overlayLayer.volumeLabel
+        )
+        let stale = try cachedLayer(in: cache, digest: descriptors[1].digest, label: nil)
+        let missed = cacheSlot(in: cache, digest: descriptors[2].digest)
+        XCTAssertFalse(
+            OverlayFSUnpacker.cachedLayerExists(at: missed),
+            "layer 2 must start with no cache entry at all, or it is not the miss this names"
+        )
+        let reusedInode = try inodeOfFile(at: reused)
+        let reusedSize = try sizeOfFile(at: reused)
+        let staleInode = try inodeOfFile(at: stale)
+
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+        _ = try await unpacker.unpack(
+            image, for: platform, at: scratch.appendingPathComponent("container")
+        )
+
+        XCTAssertEqual(
+            try inodeOfFile(at: reused), reusedInode,
+            "the labelled sibling must be REUSED: a rebuild here would mean the cache took one "
+                + "decision for the whole image rather than one per layer"
+        )
+        XCTAssertEqual(try sizeOfFile(at: reused), reusedSize)
+        XCTAssertEqual(
+            try pathsIn(imageAt: reused), ["/", "/lost+found"],
+            "a reused slot must not gain its layer, or the readings above cannot tell reuse "
+                + "from a rebuild that happened to land on the same inode"
+        )
+
+        XCTAssertNotEqual(
+            try inodeOfFile(at: stale), staleInode,
+            "the stale sibling must be discarded and rebuilt even though the layer before it "
+                + "was a hit; left alone it reaches the guest unlabelled and is dropped silently"
+        )
+        XCTAssertEqual(
+            try pathsIn(imageAt: stale), ["/", "/lost+found", "/middle"].sorted(),
+            "the rebuilt slot must hold ITS OWN layer -- the unpacker is mid-loop with another "
+                + "layer's content in hand, which is where this is easiest to get wrong"
+        )
+        XCTAssertEqual(
+            try contentOfEntry(named: "/middle", inImageAt: stale),
+            Data(Self.layers[1].content.utf8),
+            "the rebuilt slot carries its layer's filename over another layer's bytes"
+        )
+
+        XCTAssertEqual(
+            try pathsIn(imageAt: missed), ["/", "/lost+found", "/top"].sorted(),
+            "the unseeded slot must be filled from its own layer, which is the plain miss path "
+                + "running beside a hit and a discard in the same unpack"
+        )
+        XCTAssertEqual(
+            try contentOfEntry(named: "/top", inImageAt: missed),
+            Data(Self.layers[2].content.utf8)
+        )
+    }
+
     /// A real `Image`, loaded from a real OCI layout through the engine's own store.
     ///
     /// The load is `ImageManager.loadFromOCILayout`, which is what `arca-engine image load`
@@ -348,9 +576,33 @@ final class LayerCacheRoleTests: XCTestCase {
     /// reports only references, and an `Image` is what the unpacker takes. The digest under test
     /// is therefore Containerization's, not one this test invented.
     private func loadedImage(reference: String, payload: String) async throws -> Image {
-        let layout = try OCILayoutFixture.write(
-            at: scratch.appendingPathComponent("layout"), reference: reference, payload: payload
+        try await loadImage(
+            fromLayoutAt: try OCILayoutFixture.write(
+                at: scratch.appendingPathComponent("layout"),
+                reference: reference,
+                payload: payload
+            )
         )
+    }
+
+    /// The same load, over a layout of more than one layer.
+    ///
+    /// It reaches the frozen one-layer entry point's sibling rather than passing a one-element
+    /// array through it, so the one-layer tests above keep exercising the call shape their
+    /// pinned bytes were measured for (`OCILayoutFixtureTests.pinnedIndexDigest`).
+    private func loadedImage(
+        reference: String, layers: [OCILayoutFixture.Layer]
+    ) async throws -> Image {
+        try await loadImage(
+            fromLayoutAt: try OCILayoutFixture.write(
+                at: scratch.appendingPathComponent("layout"),
+                reference: reference,
+                layers: layers
+            )
+        )
+    }
+
+    private func loadImage(fromLayoutAt layout: URL) async throws -> Image {
         let manager = try EngineManagers.makeImageManager(
             paths: EnginePaths(stateRoot: scratch.appendingPathComponent("state")),
             logger: Logger(label: "layer-cache-role-tests")
@@ -361,11 +613,17 @@ final class LayerCacheRoleTests: XCTestCase {
         )
     }
 
+    /// The cache slot `unpackLayerToCache` keys `digest` to, whether or not anything is there.
+    private func cacheSlot(in cache: URL, digest: String) -> URL {
+        cache.appendingPathComponent(digest).appendingPathComponent("layer.ext4")
+    }
+
     /// `{cache}/{digest}/layer.ext4`, which is the layout `unpackLayerToCache` builds.
     private func cachedLayer(in cache: URL, digest: String, label: String?) throws -> URL {
-        let directory = cache.appendingPathComponent(digest)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let path = directory.appendingPathComponent("layer.ext4")
+        let path = cacheSlot(in: cache, digest: digest)
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
         let formatter = try EXT4.Formatter(
             FilePath(path.path),
             minDiskSize: 2 * 1024 * 1024,
@@ -419,6 +677,17 @@ final class LayerCacheRoleTests: XCTestCase {
             try entriesIn(imageAt: path).first { $0.path == name }?.size,
             "the image must hold an entry at \(name)"
         )
+    }
+
+    /// The bytes one named entry holds, read out of the ext4 image.
+    ///
+    /// One level below `sizeOfEntry`, and the multi-layer tests need it there. The fixture's
+    /// layers are all the same length by construction, so a size reading cannot tell one
+    /// layer's content from another's -- and "the slot holds 18 bytes" is exactly the reading a
+    /// cache that returned the wrong layer would satisfy.
+    private func contentOfEntry(named name: String, inImageAt path: URL) throws -> Data {
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(path.path))
+        return try reader.readFile(at: FilePath(name))
     }
 
     /// A path holding no filesystem at all answers `nil` rather than throwing.

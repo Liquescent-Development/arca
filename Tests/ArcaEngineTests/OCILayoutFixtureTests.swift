@@ -141,6 +141,82 @@ final class OCILayoutFixtureTests: XCTestCase {
         )
     }
 
+    /// The multi-layer entry point refuses layers it could not be asked to tell apart, and
+    /// refuses nothing else.
+    ///
+    /// Two layers with the same path AND content produce the same tar bytes, hash to one blob
+    /// digest, and so share one cache slot. A per-layer test over them cannot tell a cache that
+    /// returned the layer it was asked for from one that returned either -- it would pass
+    /// whichever the cache answered with. Refusing here is what keeps that from becoming a
+    /// vacuous pass in `LayerCacheRoleTests`, which is a failure mode no assertion there can
+    /// see; an empty layer list is the same thing with nothing to assert over at all.
+    ///
+    /// **The two `XCTAssertNoThrow`s are the half that stops this being a guard that refuses too
+    /// much.** Differing in EITHER the path or the content is enough, because either is enough
+    /// to change the tar's bytes -- and the last assertion is why that sentence is a fact about
+    /// the blobs rather than about the guard's own definition of distinct: a layout of two
+    /// layers writes four blobs, two layers plus the config and the manifest, and two layers
+    /// that collided would write three.
+    func testAMultiLayerLayoutRefusesLayersItCouldNotTellApart() throws {
+        let repeated = OCILayoutFixture.Layer(path: "same", content: "same")
+
+        XCTAssertThrowsError(
+            try OCILayoutFixture.write(
+                at: scratch.appendingPathComponent("empty"), reference: Self.reference, layers: []
+            ),
+            "a layout with no layers unpacks to nothing, so every per-layer assertion over it "
+                + "holds by vacuity"
+        )
+        XCTAssertThrowsError(
+            try OCILayoutFixture.write(
+                at: scratch.appendingPathComponent("collide"),
+                reference: Self.reference,
+                layers: [repeated, repeated]
+            ),
+            "two identical layers share one blob digest and so one cache slot; a test over them "
+                + "cannot tell which layer the cache answered with"
+        )
+
+        XCTAssertNoThrow(
+            try OCILayoutFixture.write(
+                at: scratch.appendingPathComponent("by-path"),
+                reference: Self.reference,
+                layers: [
+                    OCILayoutFixture.Layer(path: "left", content: "shared"),
+                    OCILayoutFixture.Layer(path: "right", content: "shared")
+                ]
+            ),
+            "a differing path is enough on its own; refusing this would make every caller vary "
+                + "both halves for no reason"
+        )
+        XCTAssertNoThrow(
+            try OCILayoutFixture.write(
+                at: scratch.appendingPathComponent("by-content"),
+                reference: Self.reference,
+                layers: [
+                    OCILayoutFixture.Layer(path: "shared", content: "left"),
+                    OCILayoutFixture.Layer(path: "shared", content: "right")
+                ]
+            ),
+            "a differing content is enough on its own"
+        )
+
+        for accepted in ["by-path", "by-content"] {
+            XCTAssertEqual(
+                try FileManager.default.contentsOfDirectory(
+                    atPath: scratch.appendingPathComponent(accepted)
+                        .appendingPathComponent("blobs/sha256").path
+                ).count,
+                4,
+                """
+                the two layers of the '\(accepted)' layout collided into one blob. The guard \
+                accepted them, so the property it stands for -- one cache slot per layer -- is \
+                not the property it is checking.
+                """
+            )
+        }
+    }
+
     /// Every file in the layout as one canonical string: `<relative path>=<content digest>` per
     /// line, sorted.
     ///
