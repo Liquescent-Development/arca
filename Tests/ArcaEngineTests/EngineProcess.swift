@@ -8,6 +8,16 @@ struct EngineRun {
     /// since the engine then goes on to serve.
     let exitedOnItsOwn: Bool
     let status: Int32
+    /// Whether the kernel's default disposition ended the process rather than
+    /// the engine's own code.
+    ///
+    /// **A separate fact from `status`, and the distinction is the whole point
+    /// of the test that reads it.** `terminationStatus` reports the signal
+    /// number for a signalled child and an exit code for an exited one, so 15
+    /// alone cannot tell "killed by SIGTERM" from "chose to exit 15". The
+    /// engine's only deliberate exits are `EXIT_SUCCESS` and `EXIT_FAILURE`, so
+    /// nothing it does can produce the first.
+    let wasKilledBySignal: Bool
     let outputText: String
     let errorText: String
 }
@@ -72,7 +82,24 @@ extension XCTestCase {
     /// `exitedOnItsOwn=false status=15 bytes=65536` -- stalled at exactly the
     /// pipe buffer, then killed by the harness's own SIGTERM -- while draining
     /// from the start reported `exitedOnItsOwn=true status=0 bytes=348894`.
-    func runEngine(arguments: [String]) throws -> EngineRun {
+    /// `signallingOnce`, when given, makes this a *startup* probe rather than a
+    /// refusal probe: the engine is sent SIGTERM the moment the closure answers
+    /// true, instead of being left to finish on its own.
+    ///
+    /// It is a predicate and not a delay because the instant has to be inside a
+    /// window rather than after one. `EngineShutdownSignalTests` waits for a
+    /// file the engine itself creates, which is what makes "the engine's own
+    /// code is running and it has not bound anything yet" a fact rather than a
+    /// guess about timing.
+    ///
+    /// An engine that exits before the predicate is ever satisfied throws.
+    /// Signalling a process that has already gone would report `.exit` and pass
+    /// any assertion about not being killed, which is the vacuous green this
+    /// closure exists to make impossible.
+    func runEngine(
+        arguments: [String],
+        signallingOnce ready: (() -> Bool)? = nil
+    ) throws -> EngineRun {
         let process = Process()
         process.executableURL = try engineBinary()
         process.arguments = arguments
@@ -85,6 +112,25 @@ extension XCTestCase {
         try process.run()
         let output = PipeDrain(outputPipe, name: "stdout")
         let errors = PipeDrain(errorPipe, name: "stderr")
+
+        if let ready {
+            let readyBy = Date().addingTimeInterval(30)
+            while !ready() {
+                guard process.isRunning else {
+                    throw EngineNeverReachedTheMoment(errorText: try errors.textAtEOF())
+                }
+                guard Date() < readyBy else {
+                    process.terminate()
+                    process.waitUntilExit()
+                    throw EngineNeverReachedTheMoment(errorText: try errors.textAtEOF())
+                }
+                // A millisecond, not the 20ms the exit poll below uses: the
+                // window this signal has to land inside is milliseconds wide,
+                // and a coarse poll would spend most of it asleep.
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            process.terminate()
+        }
 
         let deadline = Date().addingTimeInterval(30)
         while process.isRunning && Date() < deadline {
@@ -102,9 +148,26 @@ extension XCTestCase {
         return EngineRun(
             exitedOnItsOwn: exitedOnItsOwn,
             status: process.terminationStatus,
+            wasKilledBySignal: process.terminationReason == .uncaughtSignal,
             outputText: try output.textAtEOF(),
             errorText: try errors.textAtEOF()
         )
+    }
+
+    /// A vminit layout that passes `validateEngineInputs` and holds no images.
+    ///
+    /// Shared rather than copied because two files now spawn the binary with
+    /// one: `EngineCommandRefusalTests`, whose subject is the refusal that comes
+    /// after this check, and `EngineShutdownSignalTests`, whose subject is what
+    /// a signal does while the engine is between this check and its bind.
+    func validVminitLayout(in root: URL) throws -> URL {
+        let layout = root.appendingPathComponent("vminit")
+        try FileManager.default.createDirectory(at: layout, withIntermediateDirectories: true)
+        try Data(#"{"imageLayoutVersion":"1.0.0"}"#.utf8)
+            .write(to: layout.appendingPathComponent("oci-layout"))
+        try Data(#"{"schemaVersion":2,"manifests":[]}"#.utf8)
+            .write(to: layout.appendingPathComponent("index.json"))
+        return layout
     }
 
     /// A short root, removed when the test ends.
@@ -169,6 +232,13 @@ struct PipeNeverClosed: Error, CustomStringConvertible {
     let name: String
     var description: String {
         "the engine's \(name) did not reach EOF within 10s of the process being reaped"
+    }
+}
+
+struct EngineNeverReachedTheMoment: Error, CustomStringConvertible {
+    let errorText: String
+    var description: String {
+        "the engine never reached the moment the test meant to signal it at; stderr: \(errorText)"
     }
 }
 
