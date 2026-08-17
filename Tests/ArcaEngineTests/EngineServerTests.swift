@@ -259,7 +259,10 @@ final class EngineServerTests: XCTestCase {
         // reports `alreadyClosed` into a promise that is dropped.
         defer { engine.server.close(promise: nil) }
 
-        let peer = try sockets.connectRawSocket(to: path)
+        // An RPC in flight, because after `SilentConnectionQuiescer` nothing
+        // else holds a shutdown open -- see `SocketFixtures.holdAnExecOpen`,
+        // which records the two cheaper peers that were tried and do not.
+        let peer = sockets.holdAnExecOpen(to: path, group: group)
         try await Task.sleep(nanoseconds: 300_000_000)
 
         let closed = NIOLockedValueBox(false)
@@ -296,10 +299,79 @@ final class EngineServerTests: XCTestCase {
             """
         )
 
-        close(peer)
+        peer.release()
         try await waitUntil("the drain to complete once the peer is gone") {
             outcome.withLockedValue { $0 != nil }
         }
+        XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
+        _ = waiting
+    }
+
+    /// A peer that has been accepted and has sent NOTHING must not hold the
+    /// drain, because it has nothing to drain.
+    ///
+    /// **This is the inside half of a defect Gas Can's live tier measured and
+    /// nothing in this repository could see.** Stopping 1324 engines against
+    /// Arca `218343b`, each holding an ordinary gRPC client channel, gave `1323 x
+    /// exit status: 0, 1 x exit status: 1`, slowest shutdown **10.01s**, and the
+    /// one unclean engine logged `connections did not drain within the grace
+    /// period; closing anyway`. A client whose HTTP/2 preface had been written
+    /// but not yet read when the signal landed is exactly the peer below, and
+    /// once in every few hundred engines it cost the process its grace and its
+    /// exit status.
+    ///
+    /// **It is the exact converse of the test above it, and the pair is the
+    /// point.** That one requires a peer with something outstanding to hold the
+    /// drain; this one requires a peer with nothing outstanding not to. Either
+    /// alone is satisfiable by a wrong engine -- delete
+    /// `SilentConnectionQuiescer` and this goes red while that stays green;
+    /// swallow `ChannelShouldQuiesceEvent` instead of forwarding it and this
+    /// stays green while that goes red.
+    ///
+    /// The accept race is SETUP here as well, and it fails safe in the opposite
+    /// direction to the test above: an unaccepted connection also lets the drain
+    /// complete, so this test can go green for the wrong reason. The `closed`
+    /// control is what stops that -- it requires the shutdown to have actually
+    /// started -- and the sleep is what makes the accept overwhelmingly likely
+    /// to have happened.
+    func testAnAcceptedConnectionThatHasSaidNothingDoesNotHoldTheDrain() async throws {
+        let path = testSocketPath()
+        let engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+        defer { engine.server.close(promise: nil) }
+
+        // Connected and silent, which is now precisely the peer the engine must
+        // NOT wait for. The test above holds an `Exec` open instead, and the two
+        // fixtures being different calls is what keeps this pair a pair.
+        let peer = try sockets.connectRawSocket(to: path)
+        defer { close(peer) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let closed = NIOLockedValueBox(false)
+        engine.onClose.whenComplete { _ in closed.withLockedValue { $0 = true } }
+
+        let outcome = NIOLockedValueBox<String?>(nil)
+        let waiting = Task {
+            do {
+                try await engine.runUntilQuiesced()
+                outcome.withLockedValue { $0 = "returned" }
+            } catch {
+                outcome.withLockedValue { $0 = "threw \(error)" }
+            }
+        }
+
+        engine.beginGracefulShutdown()
+        try await waitUntil("the drain to complete with the silent peer still connected") {
+            outcome.withLockedValue { $0 != nil }
+        }
+
+        XCTAssertTrue(
+            closed.withLockedValue { $0 },
+            "the listener must have closed, or this test asserts nothing at all"
+        )
         XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
         _ = waiting
     }

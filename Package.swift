@@ -147,7 +147,13 @@ let package = Package(
 
         .testTarget(
             name: "ArcaEngineTests",
-            dependencies: ["ArcaEngine"]
+            // `SandboxEngineProto` is here so a test can be a CLIENT of the
+            // engine rather than only a caller of its service object. After
+            // `SilentConnectionQuiescer`, the one thing that holds a graceful
+            // shutdown open is an RPC in flight, and making one needs the
+            // request and response types off the wire. See
+            // `SocketFixtures.holdAnExecOpen`.
+            dependencies: ["ArcaEngine", "SandboxEngineProto"]
         ),
 
         // The `arca-engine` executable: binds SandboxEngineService to a Unix

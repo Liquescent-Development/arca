@@ -95,6 +95,22 @@ public struct EngineServer: Sendable {
         do {
             server = try await Server.insecure(group: group)
                 .withServiceProviders([service])
+                // **`withDebugChannelInitializer` is grpc-swift 1.x's only
+                // public hook into an ACCEPTED channel's pipeline, and its own
+                // doc calls it "intended for debugging".** Named here rather
+                // than left to be discovered: what it actually promises is to
+                // run "after gRPC has initialized each accepted channel ... at
+                // most once per accepted connection", which is exactly what
+                // `SilentConnectionQuiescer` needs and is a stable enough
+                // contract to hold a shutdown property on. The alternative is
+                // reaching into `GRPCServerPipelineConfigurator`, which is
+                // `internal`.
+                .withDebugChannelInitializer { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations
+                            .addHandler(SilentConnectionQuiescer())
+                    }
+                }
                 .bind(unixDomainSocketPath: socketPath)
                 .get()
         } catch {

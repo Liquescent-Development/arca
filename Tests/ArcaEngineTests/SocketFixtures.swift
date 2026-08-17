@@ -1,5 +1,8 @@
 import Darwin
 import Foundation
+import GRPC
+import NIOCore
+import SandboxEngineProto
 import XCTest
 
 /// The socket paths a test created. Raw peers are connected here but owned by
@@ -31,14 +34,26 @@ final class SocketFixtures {
 
     /// A raw peer, connected and silent.
     ///
-    /// Silent on purpose: grpc-swift closes a connection whose protocol it has
-    /// finished negotiating when quiescing sends its GOAWAY, and closing is
-    /// exactly what must NOT happen while a test of the drain looks. One that
-    /// has sent nothing is in no protocol at all, so it holds the drain open and
-    /// the listener closes long before quiescence completes -- which is the
-    /// window both `ShutdownObserverTests` and
-    /// `EngineServerTests.testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener`
-    /// are about.
+    /// **This no longer holds the drain open, and until `SilentConnectionQuiescer`
+    /// it was the only thing that did.** A peer that has sent nothing has
+    /// negotiated no protocol, so no stream can exist and nothing is in flight;
+    /// the engine now closes it the moment it is asked to quiesce. What this
+    /// fixture is for is therefore the opposite of what it used to be for --
+    /// `EngineServerTests.testAnAcceptedConnectionThatHasSaidNothingDoesNotHoldTheDrain`
+    /// requires exactly that closing. Anything that needs a peer the shutdown
+    /// must WAIT for wants [`holdAnExecOpen`] instead.
+    ///
+    /// **Two cheaper fixtures were tried against that requirement and neither
+    /// works -- MEASURED, and recorded so they are not tried again.** One byte
+    /// of the HTTP/2 preface leaves `HTTPVersionParser` at `.notEnoughBytes`, so
+    /// `GRPCServerPipelineConfigurator` keeps buffering and never forwards it
+    /// ("Don't forward the reads: we'll do so when we have configured the
+    /// pipeline"); the byte never reaches `SilentConnectionQuiescer`, which
+    /// reads the channel as silent and closes it. All 24 bytes do configure the
+    /// pipeline, and then grpc-swift's own idle handler turns the quiesce into a
+    /// GOAWAY and closes a connection with no open streams. Both left
+    /// `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` red on
+    /// `XCTAssertNil failed: "returned"`, which is the drain completing.
     ///
     /// The caller closes the descriptor: when it is released is the thing those
     /// tests are measuring, so this type must not decide it for them.
@@ -69,7 +84,71 @@ final class SocketFixtures {
             close(descriptor)
             throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
         }
+
         return descriptor
+    }
+
+    /// A real gRPC client with an `Exec` call open and nothing sent on it, which
+    /// the caller must hold for as long as the shutdown must wait.
+    ///
+    /// **An RPC in flight is the only thing that holds a graceful shutdown open,
+    /// and after `SilentConnectionQuiescer` that is true by design rather than
+    /// by accident.** grpc-swift closes a negotiated connection with no open
+    /// streams when quiescing sends its GOAWAY, and the engine now closes one
+    /// that has negotiated nothing; between them, a peer that is merely
+    /// CONNECTED holds nothing. So a test of the window between the listener
+    /// closing and quiescence completing has to open a stream, which means being
+    /// a client -- hence `SandboxEngineProto` in this target's dependencies.
+    ///
+    /// `Exec` because it is bidirectionally streaming and because
+    /// `SandboxEngineService.runExec` awaits the client's first frame before it
+    /// does anything at all: sending none leaves the handler suspended and the
+    /// stream open, with no container, no image and no VM involved. A unary
+    /// method could not do this -- it answers and the stream ends.
+    ///
+    /// The returned value owns the connection and the call. Releasing it is what
+    /// lets the drain finish, so the tests decide when, exactly as they do for
+    /// the raw descriptor above.
+    func holdAnExecOpen(to path: String, group: EventLoopGroup) -> HeldExec {
+        // The `Configuration` initialiser rather than
+        // `ClientConnection.insecure(group:).connect(...)`, because that builder
+        // offers only `connect(host:port:)` and `withConnectedSocket(_:)` --
+        // grpc-swift 1.23 exposes no Unix-domain-socket overload on it, though
+        // `ConnectionTarget.unixDomainSocket(_:)` is public and is what the
+        // configuration takes.
+        var configuration = ClientConnection.Configuration.default(
+            target: .unixDomainSocket(path),
+            eventLoopGroup: group
+        )
+        // No backoff: a test that has just started this engine wants a failure
+        // to dial to surface as a failed assertion, not to be retried quietly
+        // until the test's own timeout.
+        configuration.connectionBackoff = nil
+        let connection = ClientConnection(configuration: configuration)
+        let call: BidirectionalStreamingCall<
+            Arca_Engine_V1_ExecClientFrame, Arca_Engine_V1_ExecServerFrame
+        > = connection.makeBidirectionalStreamingCall(
+            path: "/arca.engine.v1.SandboxEngine/Exec",
+            callOptions: CallOptions()
+        ) { _ in }
+        return HeldExec(connection: connection, call: call)
+    }
+
+    /// One `Exec` call and the connection under it, released together.
+    ///
+    /// A type rather than a tuple because the order matters: cancelling the call
+    /// is what ends the RPC the server is suspended in, and closing the
+    /// connection first would tear the stream down underneath it.
+    struct HeldExec {
+        let connection: ClientConnection
+        let call: BidirectionalStreamingCall<
+            Arca_Engine_V1_ExecClientFrame, Arca_Engine_V1_ExecServerFrame
+        >
+
+        func release() {
+            call.cancel(promise: nil)
+            _ = connection.close()
+        }
     }
 
     /// Unlinks every path handed out, and its lockfile.
