@@ -326,14 +326,23 @@ final class EngineServerTests: XCTestCase {
     /// `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection`
     /// requires a peer that has negotiated and has nothing outstanding to be
     /// closed by grpc-swift. Each of the three mutations of
-    /// `SilentConnectionQuiescer` kills exactly one of them -- MEASURED, one
-    /// run per row:
+    /// `SilentConnectionQuiescer` kills exactly one of THIS trio -- MEASURED,
+    /// one run per row, each against the 12 tests of these two classes and each
+    /// with the handler restored to sha256 `ce19f68e7e71d187...` afterwards:
     ///
-    /// | mutation | the one that goes red |
-    /// |---|---|
-    /// | delete the `context.close` | this test |
-    /// | drop the `!spoke` guard | `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` |
-    /// | swallow the quiesce instead of forwarding it | `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection` |
+    /// | mutation | the one of the trio that goes red | also red |
+    /// |---|---|---|
+    /// | delete the `context.close` | this test (10.84s) | -- |
+    /// | drop the `!spoke` guard | `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` (1.33s) | `ShutdownObserverTests.testTheObserverDoesNotFireOnAGracefulShutdownWithAHeldPeer` (0.87s) |
+    /// | swallow the quiesce instead of forwarding it | `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection` (10.87s) | -- |
+    ///
+    /// **The third column is not slack in the trio; it is a second class that
+    /// started measuring this.** Closing every accepted connection at quiesce
+    /// also closes the `Exec` that `ShutdownObserverTests` holds, and since fix
+    /// round 1 that test asserts its drain is still outstanding at the moment
+    /// the listener closes -- so it catches the `!spoke` mutation as well.
+    /// Recorded rather than rounded off, because "kills exactly one" is true of
+    /// the trio and a reader running the filter sees two red.
     ///
     /// **The third row is why that test exists, and the claim it replaces was
     /// wrong.** This docstring used to say that swallowing the event would turn

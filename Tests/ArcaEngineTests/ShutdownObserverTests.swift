@@ -84,6 +84,14 @@ final class ShutdownObserverTests: XCTestCase {
     /// so `onClose` and quiescence completed together and the premise in the paragraph above
     /// was no longer true of the fixture, while the test went on passing. An RPC in flight is
     /// now the only thing that holds a graceful shutdown open; see `SocketFixtures.holdAnExecOpen`.
+    ///
+    /// **The timing above is ASSERTED rather than described, and it was not until fix round 1.**
+    /// `drained` is what makes the fixture load-bearing: nothing here failed when the peer
+    /// stopped holding anything, which is how the docstring came to say "long before" about two
+    /// events that had started completing together. With `drained` checked at the same instant
+    /// as `ran`, the pair IS the premise -- the listener has closed and quiescence has not --
+    /// and swapping this peer back to `connectRawSocket` turns the test red instead of leaving
+    /// it green against a sentence that has stopped being true.
     func testTheObserverDoesNotFireOnAGracefulShutdownWithAHeldPeer() async throws {
         let path = testSocketPath()
         let engine = try await EngineServer.start(
@@ -98,12 +106,21 @@ final class ShutdownObserverTests: XCTestCase {
 
         // Recorded first, then initiated -- the order the handler makes structural.
         XCTAssertTrue(asked.recordAndReportFirst())
-        engine.beginGracefulShutdown()
+        let drained = NIOLockedValueBox(false)
+        engine.beginGracefulShutdown().whenComplete { _ in drained.withLockedValue { $0 = true } }
         try await Task.sleep(nanoseconds: 500_000_000)
 
         XCTAssertTrue(
             ran.withLockedValue { $0 },
             "the listener must have closed, or this test asserts nothing at all"
+        )
+        XCTAssertFalse(
+            drained.withLockedValue { $0 },
+            """
+            the drain completed while the peer still held an Exec open, so this test is no \
+            longer standing in the window it exists to cover: onClose and quiescence are \
+            completing together, and a mis-keyed guard would no longer be caught here.
+            """
         )
         XCTAssertFalse(
             wouldExit.withLockedValue { $0 },
