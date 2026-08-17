@@ -18,8 +18,12 @@ public struct ArcaVersion {
     }
 
     /// The full 40-character revision, for the capability gate. Distinct from
-    /// `gitCommit`, which is a 7-character display value ArcaDaemon puts in a
-    /// header: a prefix is not an identity and must not be used as one.
+    /// `gitCommit`, which is a 7-character display value Docker's `/version`
+    /// returns as `GitCommit` -- once for the engine component and once at the
+    /// top level (`Sources/DockerAPI/Handlers/SystemHandlers.swift:35`, `:54`,
+    /// both inside `handleVersion()`): a prefix is not an identity and must
+    /// not be used as one, and widening `gitCommit` in place would change what
+    /// those two payloads report.
     public static var buildRevision: String {
         ArcaBuildInfo.buildRevision
     }
