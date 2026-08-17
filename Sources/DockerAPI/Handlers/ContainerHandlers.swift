@@ -369,6 +369,11 @@ public struct ContainerHandlers: Sendable {
                 return .failure(ContainerError.notFound(id))
             case .containerNotRunning:
                 return .failure(ContainerError.invalidRequest("Container is not running"))
+            case .invalidSignal(let signal):
+                // Its own case rather than `invalidRequest`, which this route
+                // already spends on 409 for a container that is not running.
+                // A signal the engine cannot map is a 400.
+                return .failure(ContainerError.invalidSignal(signal))
             default:
                 return .failure(ContainerError.killFailed(error.description))
             }
@@ -1893,6 +1898,7 @@ public enum ContainerError: Error, CustomStringConvertible {
     case inspectFailed(String)
     case notFound(String)
     case invalidRequest(String)
+    case invalidSignal(String)  // `docker kill --signal X` where X maps to nothing
     case imageNotFound(String)
     case nameAlreadyInUse(String)
     case operationNotPermitted(String)
@@ -1929,6 +1935,8 @@ public enum ContainerError: Error, CustomStringConvertible {
             return "No such container: \(id)"
         case .invalidRequest(let msg):
             return "Invalid request: \(msg)"
+        case .invalidSignal(let signal):
+            return "Invalid signal: \(signal)"
         case .nameAlreadyInUse(let name):
             return "Conflict. The container name '\(name)' is already in use."
         case .operationNotPermitted(let msg):

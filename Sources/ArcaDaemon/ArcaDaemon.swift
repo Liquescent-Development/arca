@@ -578,6 +578,10 @@ public final class ArcaDaemon: @unchecked Sendable {
                 case .invalidRequest:
                     // Container not running -> 409 Conflict (per Docker API spec)
                     return .standard(HTTPResponse.conflict(error.description))
+                case .invalidSignal:
+                    // A signal the engine cannot map is the caller's mistake,
+                    // not the engine's -> 400, as Docker answers it.
+                    return .standard(HTTPResponse.badRequest(error.description))
                 case .operationNotPermitted:
                     return .standard(HTTPResponse.forbidden(error.description))
                 default:

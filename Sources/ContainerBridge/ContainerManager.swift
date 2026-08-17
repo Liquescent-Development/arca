@@ -2908,8 +2908,9 @@ public actor ContainerManager {
             throw ContainerManagerError.containerNotFound(id)
         }
 
-        // Parse signal string to Int32
-        let signalNumber = parseSignal(signal)
+        // Parse signal string to Int32. A signal this engine cannot map fails
+        // the call rather than falling back to SIGKILL on a healthy container.
+        let signalNumber = try parseSignal(signal)
 
         logger.info("Sending signal to container", metadata: [
             "id": "\(dockerID)",
@@ -2927,38 +2928,52 @@ public actor ContainerManager {
         ])
     }
 
-    /// Parse signal string to Int32 signal number
-    private func parseSignal(_ signal: String) -> Int32 {
+    /// The signal numbers a Linux guest can actually receive: the values of
+    /// `Containerization.Signal.linux`, which is 1...31 and 34...64 with 32 and
+    /// 33 -- the gap between `SYS` and `RTMIN` -- correctly absent. Derived from
+    /// the map rather than written as a range, so it cannot drift from the table
+    /// the name lookup below uses.
+    ///
+    /// Deliberately *not* the host's signal space. `Signal.platform` on macOS is
+    /// Darwin's numbering, where `SIGUSR1` is 30 and on Linux it is 10, and the
+    /// number this returns is handed to `LinuxContainer.kill` for a Linux guest.
+    /// Bounding it by the host's `NSIG` would admit numbers meaning something
+    /// else in the guest and reject 34...64, which the guest accepts.
+    /// `ExecManager.signalExec` validates against this same map.
+    private static let guestSignalNumbers: Set<Int32> = Set(Containerization.Signal.linux.values)
+
+    /// Parse a signal string -- `"KILL"`, `"SIGKILL"` or `"9"` -- into the Linux
+    /// signal number to deliver to the guest.
+    ///
+    /// Refuses what it cannot map, where both halves used to guess. An
+    /// unrecognised *name* returned 9 behind a warning, so `docker kill --signal
+    /// BOGUS` destroyed a healthy container; a *number* was returned unvalidated,
+    /// so `docker kill --signal 999` reached the guest as nonsense. Both are
+    /// reachable from Arca's Docker surface.
+    ///
+    /// `nonisolated package` and not `private`: nothing here reads actor state,
+    /// and the only route to it in production -- `killContainer` -- needs a
+    /// running container and a resolved `LinuxContainer`, so it cannot be reached
+    /// without a booted sandbox. `ContainerKillSignalTests` drives it directly.
+    nonisolated package func parseSignal(_ signal: String) throws -> Int32 {
         // Remove SIG prefix if present
         let normalizedSignal = signal.uppercased().hasPrefix("SIG")
             ? String(signal.uppercased().dropFirst(3))
             : signal.uppercased()
 
-        // Try parsing as number first
+        // A number the guest has no signal for is refused, not forwarded.
         if let num = Int32(normalizedSignal) {
+            guard Self.guestSignalNumbers.contains(num) else {
+                throw ContainerManagerError.invalidSignal(signal)
+            }
             return num
         }
 
-        // Map common signal names to numbers
-        switch normalizedSignal {
-        case "HUP": return 1
-        case "INT": return 2
-        case "QUIT": return 3
-        case "KILL": return 9
-        case "TERM": return 15
-        case "USR1": return 10
-        case "USR2": return 12
-        case "ALRM": return 14
-        case "CONT": return 18
-        case "STOP": return 19
-        case "TSTP": return 20
-        case "TTIN": return 21
-        case "TTOU": return 22
-        default:
-            // Default to SIGKILL if unknown
-            logger.warning("Unknown signal name, defaulting to SIGKILL", metadata: ["signal": "\(signal)"])
-            return 9
+        // A name this engine cannot map is refused, not promoted to SIGKILL.
+        guard let number = Containerization.Signal.linux[normalizedSignal] else {
+            throw ContainerManagerError.invalidSignal(signal)
         }
+        return number
     }
 
     /// Pause a running container
@@ -4665,6 +4680,7 @@ public enum ContainerManagerError: Error, CustomStringConvertible {
     case imageNotFound(String)
     case invalidConfiguration(String)
     case invalidParameter(String)  // Phase 5 - Task 5.1: For validating resource limits
+    case invalidSignal(String)  // A signal name or number `parseSignal` cannot map
     case volumeSourceNotFound(String)
     case volumeNotFound(String)
     case volumeManagerNotAvailable
@@ -4695,6 +4711,9 @@ public enum ContainerManagerError: Error, CustomStringConvertible {
             return "Invalid configuration: \(msg)"
         case .invalidParameter(let msg):
             return "Invalid parameter: \(msg)"
+        case .invalidSignal(let signal):
+            // Docker's own wording for this refusal.
+            return "Invalid signal: \(signal)"
         case .volumeSourceNotFound(let path):
             return "Volume source path does not exist: \(path)"
         case .volumeNotFound(let name):
