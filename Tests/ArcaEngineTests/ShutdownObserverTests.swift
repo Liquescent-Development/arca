@@ -77,11 +77,18 @@ final class ShutdownObserverTests: XCTestCase {
     ///
     /// `onClose` completes here long before `quiesced` does -- that is the whole reason the
     /// engine stopped waiting on it -- so this is precisely when a mis-keyed guard would fire.
+    ///
+    /// **The peer is a held `Exec` because `SilentConnectionQuiescer` took the raw silent
+    /// socket's power to hold anything.** This test used to connect a silent socket, and after
+    /// that handler landed the engine closes such a peer the moment it is asked to quiesce --
+    /// so `onClose` and quiescence completed together and the premise in the paragraph above
+    /// was no longer true of the fixture, while the test went on passing. An RPC in flight is
+    /// now the only thing that holds a graceful shutdown open; see `SocketFixtures.holdAnExecOpen`.
     func testTheObserverDoesNotFireOnAGracefulShutdownWithAHeldPeer() async throws {
         let path = testSocketPath()
         let engine = try await EngineServer.start(
             socketPath: path, service: .forTesting(), group: group)
-        let peer = try connectRawSocket(to: path)
+        let peer = sockets.holdAnExecOpen(to: path, group: group)
         try await Task.sleep(nanoseconds: 300_000_000)
 
         let asked = ShutdownRequests()
@@ -103,7 +110,7 @@ final class ShutdownObserverTests: XCTestCase {
             "the guard fired on a healthy graceful shutdown, which would exit non-zero mid-drain"
         )
 
-        close(peer)
+        try await peer.release()
         try await engine.shutDown()
     }
 

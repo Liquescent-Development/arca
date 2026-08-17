@@ -55,6 +55,10 @@ final class SocketFixtures {
     /// `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` red on
     /// `XCTAssertNil failed: "returned"`, which is the drain completing.
     ///
+    /// The second of those is no longer only a rejected attempt: that closing is
+    /// itself a property worth pinning, and [`connectPrefacedSocket`] is the
+    /// same peer used for what it does rather than for what it does not.
+    ///
     /// The caller closes the descriptor: when it is released is the thing those
     /// tests are measuring, so this type must not decide it for them.
     ///
@@ -88,6 +92,57 @@ final class SocketFixtures {
         return descriptor
     }
 
+    /// A raw peer that has sent the HTTP/2 connection preface and nothing after
+    /// it: negotiated, with no stream open and no RPC in flight.
+    ///
+    /// **This is the peer that proves `SilentConnectionQuiescer` FORWARDS the
+    /// quiesce event, and nothing else in this bundle can.** grpc-swift's
+    /// `GRPCIdleHandler` is what turns `ChannelShouldQuiesceEvent` into a GOAWAY
+    /// and closes a connection with no open streams, and it sits downstream of
+    /// `SilentConnectionQuiescer` -- so it only ever sees the event because that
+    /// handler passes it on. `GRPCIdleHandler.userInboundEventTriggered` then
+    /// swallows it ("Swallow this event", grpc-swift 1.27
+    /// `GRPCIdleHandler.swift`), which is why the forwarding has to happen at
+    /// this end of the pipeline or not at all.
+    ///
+    /// A silent peer cannot show that: `SilentConnectionQuiescer` closes it
+    /// itself, forwarded or not. Nor can a held `Exec`: its connection is closed
+    /// by the client, so the drain completes either way. **MEASURED -- swallowing
+    /// the event instead of forwarding it leaves every other test in this bundle
+    /// green.**
+    ///
+    /// The 24 magic bytes are `HTTPVersionParser.http2ClientMagic` verbatim (RFC
+    /// 7540 § 5.3); the nine after them are an empty `SETTINGS` frame, which is
+    /// what a real client sends next and what makes this a well-formed
+    /// connection rather than a prefix the server is still waiting to complete.
+    ///
+    /// The caller closes the descriptor, for the reason [`connectRawSocket`]
+    /// gives: when the peer goes away is what these tests measure.
+    func connectPrefacedSocket(to path: String) throws -> Int32 {
+        let descriptor = try connectRawSocket(to: path)
+        let preface: [UInt8] =
+            Array("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".utf8)
+            + [0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+        var sent = 0
+        while sent < preface.count {
+            let written = preface.withUnsafeBytes { bytes in
+                write(descriptor, bytes.baseAddress!.advanced(by: sent), bytes.count - sent)
+            }
+            // A short write is legal and is resumed; only 0 or -1 is a failure.
+            // Thrown rather than recorded, for `connectRawSocket`'s reason: a
+            // half-written preface leaves the pipeline unconfigured, which is
+            // the opposite of the peer this fixture promises.
+            guard written > 0 else {
+                let code = errno
+                close(descriptor)
+                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            }
+            sent += written
+        }
+        return descriptor
+    }
+
     /// A real gRPC client with an `Exec` call open and nothing sent on it, which
     /// the caller must hold for as long as the shutdown must wait.
     ///
@@ -113,7 +168,7 @@ final class SocketFixtures {
         // The `Configuration` initialiser rather than
         // `ClientConnection.insecure(group:).connect(...)`, because that builder
         // offers only `connect(host:port:)` and `withConnectedSocket(_:)` --
-        // grpc-swift 1.23 exposes no Unix-domain-socket overload on it, though
+        // grpc-swift 1.27 exposes no Unix-domain-socket overload on it, though
         // `ConnectionTarget.unixDomainSocket(_:)` is public and is what the
         // configuration takes.
         var configuration = ClientConnection.Configuration.default(
@@ -145,9 +200,18 @@ final class SocketFixtures {
             Arca_Engine_V1_ExecClientFrame, Arca_Engine_V1_ExecServerFrame
         >
 
-        func release() {
+        /// Awaited rather than fired and forgotten, because the caller's next
+        /// move is usually `tearDown`'s `syncShutdownGracefully()`. Discarding
+        /// the close future leaves the client channel going down while the
+        /// event-loop group is being shut down under it -- the "Cannot schedule
+        /// tasks on an EventLoop that has already shut down" race this class's
+        /// own header describes, arrived at from the client end.
+        ///
+        /// It THROWS rather than swallowing: a connection that cannot be closed
+        /// is something the test should report, not absorb.
+        func release() async throws {
             call.cancel(promise: nil)
-            _ = connection.close()
+            try await connection.close().get()
         }
     }
 

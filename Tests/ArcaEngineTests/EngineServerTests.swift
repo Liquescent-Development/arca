@@ -299,7 +299,7 @@ final class EngineServerTests: XCTestCase {
             """
         )
 
-        peer.release()
+        try await peer.release()
         try await waitUntil("the drain to complete once the peer is gone") {
             outcome.withLockedValue { $0 != nil }
         }
@@ -320,13 +320,29 @@ final class EngineServerTests: XCTestCase {
     /// once in every few hundred engines it cost the process its grace and its
     /// exit status.
     ///
-    /// **It is the exact converse of the test above it, and the pair is the
+    /// **It is the exact converse of the test above it, and the trio is the
     /// point.** That one requires a peer with something outstanding to hold the
-    /// drain; this one requires a peer with nothing outstanding not to. Either
-    /// alone is satisfiable by a wrong engine -- delete
-    /// `SilentConnectionQuiescer` and this goes red while that stays green;
-    /// swallow `ChannelShouldQuiesceEvent` instead of forwarding it and this
-    /// stays green while that goes red.
+    /// drain; this one requires a peer with nothing outstanding not to; and
+    /// `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection`
+    /// requires a peer that has negotiated and has nothing outstanding to be
+    /// closed by grpc-swift. Each of the three mutations of
+    /// `SilentConnectionQuiescer` kills exactly one of them -- MEASURED, one
+    /// run per row:
+    ///
+    /// | mutation | the one that goes red |
+    /// |---|---|
+    /// | delete the `context.close` | this test |
+    /// | drop the `!spoke` guard | `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` |
+    /// | swallow the quiesce instead of forwarding it | `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection` |
+    ///
+    /// **The third row is why that test exists, and the claim it replaces was
+    /// wrong.** This docstring used to say that swallowing the event would turn
+    /// `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` red. Run,
+    /// it does not: with an `Exec` held, `spoke` is true so nothing closes the
+    /// connection early, the drain waits, and releasing the peer completes it
+    /// from the client end -- all 11 tests in these two classes stayed green
+    /// against that mutation. Forwarding was load-bearing and untested, and the
+    /// sentence asserting otherwise was a measurement nobody had taken.
     ///
     /// The accept race is SETUP here as well, and it fails safe in the opposite
     /// direction to the test above: an unaccepted connection also lets the drain
@@ -368,6 +384,73 @@ final class EngineServerTests: XCTestCase {
             outcome.withLockedValue { $0 != nil }
         }
 
+        XCTAssertTrue(
+            closed.withLockedValue { $0 },
+            "the listener must have closed, or this test asserts nothing at all"
+        )
+        XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
+        _ = waiting
+    }
+
+    /// A peer that HAS negotiated and has no stream open must be closed by
+    /// grpc-swift, which can only happen if the quiesce event was forwarded.
+    ///
+    /// **This is the only test in the bundle that fails when
+    /// `SilentConnectionQuiescer` consumes `ChannelShouldQuiesceEvent` instead
+    /// of passing it on, and the mechanism is one handler deep.**
+    /// `GRPCIdleHandler` is what turns that event into a GOAWAY and closes a
+    /// connection with no open streams; it sits downstream of
+    /// `SilentConnectionQuiescer`, so it sees the event only because that
+    /// handler fires it onward. Neither sibling can see this: the silent peer is
+    /// closed by `SilentConnectionQuiescer` itself whether it forwarded or not,
+    /// and the held `Exec` is closed from the client end.
+    ///
+    /// **Forwarding is not a detail.** Swallow it in production and every
+    /// negotiated idle connection holds the full ten-second grace and then costs
+    /// the engine its exit status -- the same defect
+    /// `SilentConnectionQuiescer` was written to fix, one connection-state
+    /// along, and reachable by every ordinary client rather than by one that
+    /// lost a microsecond race.
+    ///
+    /// The peer stays connected throughout: it is the SERVER that must close
+    /// this connection, so a test that closed it would prove nothing.
+    func testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection() async throws {
+        let path = testSocketPath()
+        let engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+        defer { engine.server.close(promise: nil) }
+
+        // Negotiated and idle, which is neither of the other two peers: the
+        // pipeline is configured, so `spoke` is true and this handler will not
+        // close it, and no stream is open, so nothing is draining.
+        let peer = try sockets.connectPrefacedSocket(to: path)
+        defer { close(peer) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let closed = NIOLockedValueBox(false)
+        engine.onClose.whenComplete { _ in closed.withLockedValue { $0 = true } }
+
+        let outcome = NIOLockedValueBox<String?>(nil)
+        let waiting = Task {
+            do {
+                try await engine.runUntilQuiesced()
+                outcome.withLockedValue { $0 = "returned" }
+            } catch {
+                outcome.withLockedValue { $0 = "threw \(error)" }
+            }
+        }
+
+        engine.beginGracefulShutdown()
+        try await waitUntil("the drain to complete with the negotiated peer still connected") {
+            outcome.withLockedValue { $0 != nil }
+        }
+
+        // The same control the silent-peer test carries, for the same reason: an
+        // unaccepted connection would let the drain finish too, and this test
+        // would then be green without having measured anything.
         XCTAssertTrue(
             closed.withLockedValue { $0 },
             "the listener must have closed, or this test asserts nothing at all"
