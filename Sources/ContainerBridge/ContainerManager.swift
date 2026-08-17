@@ -2928,20 +2928,6 @@ public actor ContainerManager {
         ])
     }
 
-    /// The signal numbers a Linux guest can actually receive: the values of
-    /// `Containerization.Signal.linux`, which is 1...31 and 34...64 with 32 and
-    /// 33 -- the gap between `SYS` and `RTMIN` -- correctly absent. Derived from
-    /// the map rather than written as a range, so it cannot drift from the table
-    /// the name lookup below uses.
-    ///
-    /// Deliberately *not* the host's signal space. `Signal.platform` on macOS is
-    /// Darwin's numbering, where `SIGUSR1` is 30 and on Linux it is 10, and the
-    /// number this returns is handed to `LinuxContainer.kill` for a Linux guest.
-    /// Bounding it by the host's `NSIG` would admit numbers meaning something
-    /// else in the guest and reject 34...64, which the guest accepts.
-    /// `ExecManager.signalExec` validates against this same map.
-    private static let guestSignalNumbers: Set<Int32> = Set(Containerization.Signal.linux.values)
-
     /// Parse a signal string -- `"KILL"`, `"SIGKILL"` or `"9"` -- into the Linux
     /// signal number to deliver to the guest.
     ///
@@ -2951,29 +2937,37 @@ public actor ContainerManager {
     /// so `docker kill --signal 999` reached the guest as nonsense. Both are
     /// reachable from Arca's Docker surface.
     ///
+    /// The parsing is Containerization's rather than a copy of it.
+    /// `Signal.init(_:from:)` already normalises the `SIG` prefix, gates a number
+    /// on membership in the table and refuses a name the table has no entry for,
+    /// and `ExecManager.signalExec` calls that same initializer. The two signal
+    /// paths therefore agree by construction, and not because two hand-written
+    /// implementations happen to match.
+    ///
+    /// Its default table is `Signal.linux`, which is the right one and not the
+    /// host's: the number returned here is handed to `LinuxContainer.kill` for a
+    /// **Linux guest**, and the host does not share that numbering -- `SIGUSR1` is
+    /// 30 on Darwin and 10 on Linux. A bound taken from the host's `NSIG` would
+    /// admit numbers meaning something else in the guest and reject 34...64,
+    /// which the guest accepts. It excludes 32 and 33, the gap between `SYS` and
+    /// `RTMIN`, which a range check written as `1...64` would wrongly admit.
+    ///
+    /// The `SignalError` is translated rather than propagated because
+    /// `ContainerHandlers.handleKillContainer` catches `as ContainerManagerError`
+    /// to choose a status code. A bare `SignalError` would miss that catch and be
+    /// reported as a 500 -- the swallowing this refusal exists to prevent. Only
+    /// `SignalError` is caught; anything else propagates untouched.
+    ///
     /// `nonisolated package` and not `private`: nothing here reads actor state,
     /// and the only route to it in production -- `killContainer` -- needs a
     /// running container and a resolved `LinuxContainer`, so it cannot be reached
     /// without a booted sandbox. `ContainerKillSignalTests` drives it directly.
     nonisolated package func parseSignal(_ signal: String) throws -> Int32 {
-        // Remove SIG prefix if present
-        let normalizedSignal = signal.uppercased().hasPrefix("SIG")
-            ? String(signal.uppercased().dropFirst(3))
-            : signal.uppercased()
-
-        // A number the guest has no signal for is refused, not forwarded.
-        if let num = Int32(normalizedSignal) {
-            guard Self.guestSignalNumbers.contains(num) else {
-                throw ContainerManagerError.invalidSignal(signal)
-            }
-            return num
-        }
-
-        // A name this engine cannot map is refused, not promoted to SIGKILL.
-        guard let number = Containerization.Signal.linux[normalizedSignal] else {
+        do {
+            return try Containerization.Signal(signal).rawValue
+        } catch is SignalError {
             throw ContainerManagerError.invalidSignal(signal)
         }
-        return number
     }
 
     /// Pause a running container
