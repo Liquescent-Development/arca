@@ -390,6 +390,13 @@ final class LayerCacheRoleTests: XCTestCase {
     /// the file or the suite**: 243 tests, 2 failures, both of them multi-layer. Every one of
     /// the eight one-layer tests above stayed green, which is the blindness this task closes
     /// stated as a reading rather than as an argument.
+    ///
+    /// **The 243 is the suite the run was taken over, one test short of the commit that landed
+    /// it.** `823201e` also added
+    /// `OCILayoutFixtureTests.testAMultiLayerLayoutRefusesLayersItCouldNotTellApart`, so a
+    /// reader reproducing this mutation at `823201e` sees 244 tests and the same 2 failures --
+    /// not a test that went missing. The failing set is the claim; the total is only the run it
+    /// came from.
     func testEachLayerIsCachedUnderItsOwnDigestHoldingItsOwnContent() async throws {
         let image = try await loadedImage(
             reference: "multi-layer-probe:latest", layers: Self.layers
@@ -451,6 +458,10 @@ final class LayerCacheRoleTests: XCTestCase {
     /// (`collected.sorted { $0.0 < $1.0 }` to `{ $0.0 > $1.0 }`) leaves the suite at 243 tests
     /// with exactly one failure, this one; the content mutation recorded on that test fails two
     /// tests and leaves this one green. Neither test rides on the other's fix.
+    ///
+    /// The 243 is the suite that run was taken over, one test short of `823201e`, which landed
+    /// this alongside `OCILayoutFixtureTests.testAMultiLayerLayoutRefusesLayersItCouldNotTellApart`;
+    /// reproducing the mutation at `823201e` gives 244 tests and the same single failure.
     func testTheCachedLayersComeBackInTheImagesOwnOrder() async throws {
         let image = try await loadedImage(
             reference: "layer-order-probe:latest", layers: Self.layers
@@ -502,6 +513,10 @@ final class LayerCacheRoleTests: XCTestCase {
     /// cache entry at all. The wrong-layer-content mutation recorded on that test fails this one
     /// too: the two share the content-identity mechanism, and no mutation was found that this
     /// test survives and that one catches.
+    ///
+    /// The 243 is the suite that run was taken over, one test short of `823201e`, which landed
+    /// this alongside `OCILayoutFixtureTests.testAMultiLayerLayoutRefusesLayersItCouldNotTellApart`;
+    /// reproducing the mutation at `823201e` gives 244 tests and the same 2 failures.
     func testAStaleLayerIsRebuiltWhileItsLabelledSiblingIsReused() async throws {
         let image = try await loadedImage(
             reference: "partial-reuse-probe:latest", layers: Self.layers
