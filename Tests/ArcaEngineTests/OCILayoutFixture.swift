@@ -34,10 +34,37 @@ enum OCILayoutFixture {
     /// absent bytes shows -- which is the finding `LayerCacheRoleTests` already
     /// records twice for the one-layer case, one level down each time.
     struct Layer {
+        /// How the blob under the layer's media type is written.
+        ///
+        /// **The dishonest case is a fixture for a REFUSAL, and it exists because
+        /// nothing else in the tree can produce one.** Every layer this fixture
+        /// writes is otherwise a real tar (see `layerArchive(at:containing:)`), so
+        /// the input class Task 6 taught `EXT4.Formatter.unpack` to reject --
+        /// bytes that are not the archive their media type declares -- had no
+        /// in-tree producer, and what the unpacker's CALLER does with that
+        /// refusal could not be tested at all. It is the caller, not the refusal,
+        /// that `LayerCacheRoleTests` uses this for.
+        enum Blob {
+            /// A real uncompressed pax tar holding `content` at `path`.
+            case archive
+            /// `content`'s bytes laid down raw under the same archive media type:
+            /// a truncated fetch or a hand-built layout, whose digest is still
+            /// correct so nothing upstream of the unpack objects.
+            case bytesThatAreNotTheDeclaredArchive
+        }
+
         /// Relative, which is the shape a real OCI layer tar has; see
-        /// `layerArchive(at:containing:)`.
+        /// `layerArchive(at:containing:)`. Unused by
+        /// `.bytesThatAreNotTheDeclaredArchive`, which never becomes an entry.
         let path: String
         let content: String
+        let blob: Blob
+
+        init(path: String, content: String, blob: Blob = .archive) {
+            self.path = path
+            self.content = content
+            self.blob = blob
+        }
     }
 
     /// Refusals, rather than a layout a later test would fail vacuously over.
@@ -94,7 +121,11 @@ enum OCILayoutFixture {
     @discardableResult
     static func write(at directory: URL, reference: String, layers: [Layer]) throws -> URL {
         guard !layers.isEmpty else { throw Failure.noLayers }
-        let identities = layers.map { "\($0.path)=\($0.content)" }
+        // The blob mode is part of the identity because it is part of the BYTES:
+        // an honest and a dishonest layer over the same path and content hash
+        // differently and so occupy different cache slots, and refusing them as
+        // indistinguishable would refuse a layout that is not.
+        let identities = layers.map { "\($0.path)=\($0.content)@\($0.blob)" }
         guard Set(identities).count == identities.count else {
             throw Failure.indistinguishableLayers(identities.joined(separator: ", "))
         }
@@ -120,7 +151,7 @@ enum OCILayoutFixture {
         encoder.outputFormatting = [.sortedKeys]
         let layerBlobs = try layers.map {
             try writeBlob(
-                try layerArchive(at: $0.path, containing: $0.content),
+                try layerBlob(for: $0),
                 mediaType: MediaTypes.imageLayer,
                 into: blobs
             )
@@ -157,6 +188,22 @@ enum OCILayoutFixture {
         return directory
     }
 
+    /// The bytes written under a layer's media type, honest or not.
+    ///
+    /// One place, so that `MediaTypes.imageLayer` below is written once for both
+    /// modes: the whole point of the dishonest mode is that the DECLARATION is
+    /// identical and only the bytes differ, and a fixture that spelled the media
+    /// type twice could drift into declaring the two differently -- which would
+    /// make the refusal under test a media-type mismatch rather than a blob one.
+    private static func layerBlob(for layer: Layer) throws -> Data {
+        switch layer.blob {
+        case .archive:
+            return try layerArchive(at: layer.path, containing: layer.content)
+        case .bytesThatAreNotTheDeclaredArchive:
+            return Data(layer.content.utf8)
+        }
+    }
+
     /// The layer blob: a real tar holding `payload` as the content of one file
     /// at `path`, rather than `payload`'s bytes laid down raw.
     ///
@@ -188,6 +235,16 @@ enum OCILayoutFixture {
     /// through production, `OverlayFSUnpacker.swift:84` reporting `the source is
     /// not a paxRestricted archive with filter none: … reading the next archive
     /// header failed with code -30: Truncated tar archive`.
+    ///
+    /// **The quoted text is what `6ede1d5` reported and is no longer what a
+    /// reader at HEAD sees**, because the refusal is now wrapped with the layer's
+    /// identity where the caller knows it (`LayerUnpackFailure`): the same
+    /// failure arrives as `layer 1 of 1, sha256:… (application/vnd.oci.image.layer.v1.tar),
+    /// could not be unpacked into …` carrying the sentence above as its cause.
+    /// The revert is also no longer the way to produce one --
+    /// `Layer.Blob.bytesThatAreNotTheDeclaredArchive` is, and
+    /// `LayerCacheRoleTests.testAnUnpackThatRefusesALayerLeavesNoCacheEntryForTheNextCreateToReuse`
+    /// asserts on both halves of the message rather than quoting it here.
     ///
     /// **That fix does not weaken the requirement to write a real tar.** A
     /// fixture handing the unpacker a blob it refuses tests the refusal, and

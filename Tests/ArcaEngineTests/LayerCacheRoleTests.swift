@@ -584,6 +584,285 @@ final class LayerCacheRoleTests: XCTestCase {
         )
     }
 
+    /// A layer the unpacker REFUSES must leave nothing behind that the next create reuses.
+    ///
+    /// **This is the one state no test in this file constructed, and it is the one that turns a
+    /// loud refusal into a silent wrong rootfs from the second attempt onward.** Every test above
+    /// drives an unpack that succeeds; the refusal Task 6 added
+    /// (`ContainerizationEXT4/Formatter+Unpack.swift:110-120`) throws with the formatter already
+    /// created AT the final cache path and carrying the layer volume label, and `close()` is what
+    /// writes the superblock and that label
+    /// (`ContainerizationEXT4/EXT4+Formatter.swift:645, 970-972`). So a formatter closed on the
+    /// failure path leaves a valid, correctly labelled, EMPTY `layer.ext4` in the slot -- which is
+    /// byte-for-byte what `cachedLayer(in:digest:label:)` above seeds, and
+    /// `testAStaleLayerIsRebuiltWhileItsLabelledSiblingIsReused` proves that is a cache HIT.
+    ///
+    /// The create fails loudly ONCE. Every create afterwards gets an empty layer and succeeds:
+    /// the poisoned slot is a real ext4, carries `.overlayLayer`, is attached, is counted, and
+    /// `ArcaLayerAttachment.resolve` sees `attached == identified` and resolves `.complete`. Task
+    /// 7's count guard cannot see it, because there is nothing about it to see. That is this
+    /// milestone's own defect signature reached through the FAILURE path -- a rootfs built from
+    /// none of its image, with `Start` succeeding.
+    ///
+    /// **MEASURED against the unfixed unpacker before the fix existed**, which is why the second
+    /// assertion is the load-bearing one rather than the first: at submodule `fb2b2f2` the first
+    /// unpack threw as it should and the retry took the cache HIT branch and SUCCEEDED. The exact
+    /// output is in the fix report for this landing.
+    ///
+    /// It asserts the retry THROWS rather than asserting on the cache predicate alone, because
+    /// the predicate is a reading and the retry is the behaviour: an implementation that left a
+    /// slot the predicate rejected but that some other branch accepted would satisfy the reading
+    /// and not the behaviour.
+    func testAnUnpackThatRefusesALayerLeavesNoCacheEntryForTheNextCreateToReuse() async throws {
+        let image = try await loadedImage(
+            reference: "refused-layer-probe:latest",
+            layers: [
+                OCILayoutFixture.Layer(
+                    path: "payload",
+                    content: "these bytes are not a tar",
+                    blob: .bytesThatAreNotTheDeclaredArchive
+                )
+            ]
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let descriptors = try await image.manifest(for: platform).layers
+        let digest = try XCTUnwrap(
+            descriptors.first?.digest, "the fixture image must carry the layer under test"
+        )
+
+        let cache = scratch.appendingPathComponent("layers")
+        let slot = cacheSlot(in: cache, digest: digest)
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+
+        let first = await errorFrom {
+            _ = try await unpacker.unpack(
+                image, for: platform, at: self.scratch.appendingPathComponent("container-1")
+            )
+        }
+        let firstFailure = try XCTUnwrap(
+            first,
+            "the unpack of a blob that is not the archive its media type declares must FAIL; "
+                + "without that this test is not about a failure path at all"
+        )
+        XCTAssertTrue(
+            "\(firstFailure)".contains("is not a paxRestricted archive with filter none"),
+            "the failure must be Task 6's refusal and not some other error, or what it leaves "
+                + "behind is not the state under test. Got: \(firstFailure)"
+        )
+        // The refusal must NAME the layer. `UnpackError.sourceIsNotDeclaredArchive` carries the
+        // declaration it refused against and nothing that identifies which of an image's layers
+        // carried it -- and the layers are unpacked concurrently, so the log order does not say
+        // either. Without the digest an operator cannot find the layer, and the media type is
+        // what tells them whether the blob or the declaration is the wrong half.
+        XCTAssertTrue(
+            "\(firstFailure)".contains(digest),
+            "a refused layer must be named by its DIGEST: it is the only handle the operator has "
+                + "on which layer of the image refused. Got: \(firstFailure)"
+        )
+        XCTAssertTrue(
+            "\(firstFailure)".contains(try XCTUnwrap(descriptors.first?.mediaType)),
+            "a refused layer must name the media type it was declared under, which is the half "
+                + "that says whether the blob or the declaration is wrong. Got: \(firstFailure)"
+        )
+
+        XCTAssertFalse(
+            OverlayFSUnpacker.cachedLayerIsReusable(at: slot),
+            """
+            the refused layer left a REUSABLE cache slot. It is a valid ext4 carrying \
+            .overlayLayer over none of the image, so the guest classifies it, Task 7's count \
+            counts it, and the container boots on a rootfs missing that layer entirely.
+            """
+        )
+        XCTAssertFalse(
+            OverlayFSUnpacker.cachedLayerExists(at: slot),
+            "a cache slot must not exist at all unless the unpack that would fill it succeeded: "
+                + "a slot whose existence is not conditional on success is one predicate change "
+                + "away from being reused again"
+        )
+
+        let second = await errorFrom {
+            _ = try await unpacker.unpack(
+                image, for: platform, at: self.scratch.appendingPathComponent("container-2")
+            )
+        }
+        let secondFailure = try XCTUnwrap(
+            second,
+            """
+            the retry SUCCEEDED over a layer the first attempt refused. The refusal was converted \
+            into a silent acceptance by the cache, which is the whole defect: it fails loudly \
+            once and then hands every later create an empty layer.
+            """
+        )
+        XCTAssertTrue(
+            "\(secondFailure)".contains("is not a paxRestricted archive with filter none"),
+            "the retry must reach the same refusal, not a different failure over the wreckage of "
+                + "the first. Got: \(secondFailure)"
+        )
+    }
+
+    /// One refused layer must not leave its SIBLINGS' slots reusable-but-incomplete.
+    ///
+    /// `unpack` runs the layers in a `withThrowingTaskGroup`
+    /// (`Containerization/Image/Unpacker/OverlayFSUnpacker.swift:84-115`), which cancels the
+    /// siblings when one child throws, and `unpackEntries` checks cancellation each iteration
+    /// (`ContainerizationEXT4/Formatter+Unpack.swift:132`). So a refusal on one layer can stop the
+    /// others mid-unpack -- and a formatter closed there writes a correctly labelled, PARTIALLY
+    /// populated slot. Those are cache hits too, and cache slots are keyed by digest alone, so
+    /// they are shared with every other image carrying the same layer.
+    ///
+    /// The sibling assertion is conditional -- a slot that survives must be COMPLETE -- rather
+    /// than "no slot survives", and deliberately: a sibling that finished before the cancellation
+    /// arrived has a legitimate, complete entry, and refusing that would be asserting a race
+    /// rather than a property. The fixture's layers are one entry each, so they usually do
+    /// finish; the property that must hold either way is that nothing reusable is partial.
+    ///
+    /// The retry assertion is what makes this test more than a longer spelling of the one above:
+    /// it drives a THREE-layer image, where the poisoned slot is one of several and the create
+    /// that reuses it succeeds with two good layers and one empty one. That is the wrong-rootfs
+    /// outcome in the shape a real image has.
+    func testARefusedLayerLeavesNoPartialSlotForItsSiblings() async throws {
+        let layers = [
+            OCILayoutFixture.Layer(path: "bottom", content: "bottom layer bytes"),
+            OCILayoutFixture.Layer(path: "middle", content: "middle layer bytes"),
+            OCILayoutFixture.Layer(
+                path: "top",
+                content: "these bytes are not a tar",
+                blob: .bytesThatAreNotTheDeclaredArchive
+            )
+        ]
+        let image = try await loadedImage(reference: "refused-sibling-probe:latest", layers: layers)
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let descriptors = try await image.manifest(for: platform).layers
+        XCTAssertEqual(
+            Set(descriptors.map(\.digest)).count, layers.count,
+            "the three layers must carry distinct digests, or they share one slot and the "
+                + "sibling assertions below run over fewer slots than they name"
+        )
+
+        let cache = scratch.appendingPathComponent("layers")
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+
+        let first = await errorFrom {
+            _ = try await unpacker.unpack(
+                image, for: platform, at: self.scratch.appendingPathComponent("container-1")
+            )
+        }
+        XCTAssertNotNil(first, "the image carries a layer the unpacker must refuse")
+
+        let refused = cacheSlot(in: cache, digest: descriptors[2].digest)
+        XCTAssertFalse(
+            OverlayFSUnpacker.cachedLayerIsReusable(at: refused),
+            "the refused layer's own slot must not be reusable"
+        )
+
+        for index in 0..<2 {
+            let sibling = cacheSlot(in: cache, digest: descriptors[index].digest)
+            guard OverlayFSUnpacker.cachedLayerIsReusable(at: sibling) else { continue }
+            XCTAssertEqual(
+                try pathsIn(imageAt: sibling), ["/", "/lost+found", "/\(layers[index].path)"].sorted(),
+                """
+                layer \(index)'s slot survived the sibling refusal as a REUSABLE but incomplete \
+                entry. It carries .overlayLayer over part of its layer, and every later create \
+                over this digest -- in any image -- takes it as a hit.
+                """
+            )
+            XCTAssertEqual(
+                try contentOfEntry(named: "/\(layers[index].path)", inImageAt: sibling),
+                Data(layers[index].content.utf8),
+                "a reusable sibling slot must hold its layer's BYTES, not merely an entry "
+                    + "bearing its name: a truncated file is the same absence one level down"
+            )
+        }
+
+        let second = await errorFrom {
+            _ = try await unpacker.unpack(
+                image, for: platform, at: self.scratch.appendingPathComponent("container-2")
+            )
+        }
+        XCTAssertNotNil(
+            second,
+            """
+            the retry of a three-layer image SUCCEEDED over a layer the first attempt refused: \
+            two good layers and one empty one, labelled, counted, and resolved .complete by Task \
+            7's guard. The container boots on a rootfs missing its top layer, and Start succeeds.
+            """
+        )
+    }
+
+    /// A refused unpack must not leave scratch in the cache directory either.
+    ///
+    /// The slot's existence being conditional on success means the unpack has somewhere ELSE to
+    /// write while it is still in doubt, and that somewhere must not survive the failure. An
+    /// operator clearing a poisoned cache clears slots; a directory that accumulates one 2GB file
+    /// per refused attempt fills the state root with files nothing will ever look at or name.
+    ///
+    /// It is a separate test from the two above rather than one more assertion on them because it
+    /// is a separate mechanism: the promotion is what stops the reuse, and the cleanup is what
+    /// stops the accumulation. The mutation matrix in this landing's fix report shows each one
+    /// failing this file alone or those two alone, never both.
+    func testARefusedUnpackLeavesNoScratchBesideTheCacheSlot() async throws {
+        let image = try await loadedImage(
+            reference: "refused-scratch-probe:latest",
+            layers: [
+                OCILayoutFixture.Layer(
+                    path: "payload",
+                    content: "these bytes are not a tar",
+                    blob: .bytesThatAreNotTheDeclaredArchive
+                )
+            ]
+        )
+        let platform = SystemPlatform.linuxArm.ociPlatform()
+        let descriptors = try await image.manifest(for: platform).layers
+        let digest = try XCTUnwrap(descriptors.first?.digest)
+
+        let cache = scratch.appendingPathComponent("layers")
+        let unpacker = OverlayFSUnpacker(layerCachePath: cache)
+        let first = await errorFrom {
+            _ = try await unpacker.unpack(
+                image, for: platform, at: self.scratch.appendingPathComponent("container")
+            )
+        }
+        XCTAssertNotNil(first, "the image carries a layer the unpacker must refuse")
+
+        let slot = cacheSlot(in: cache, digest: digest)
+        let directory = slot.deletingLastPathComponent()
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: directory.path),
+            "the unpacker creates the layer's directory before it formats anything, so this "
+                + "test's reading below is over a directory that exists"
+        )
+        // Anything OTHER than the cache slot itself is scratch the failure did not clean up.
+        // The slot is excluded so that this test says nothing about whether the slot survives --
+        // that is the subject of the two tests above, and keeping the two readings apart is what
+        // makes a mutation to either mechanism fail one test and not the other.
+        let leftovers = try FileManager.default
+            .contentsOfDirectory(atPath: directory.path)
+            .filter { $0 != slot.lastPathComponent }
+            .sorted()
+        XCTAssertEqual(
+            leftovers, [],
+            """
+            a refused unpack left \(leftovers) in the layer's cache directory. Every refused \
+            attempt adds another, none of them is named by anything, and the layer cache grows \
+            without bound in a state root nothing prunes.
+            """
+        )
+    }
+
+    /// Runs `work` and returns the error it threw, or `nil` if it did not throw.
+    ///
+    /// `XCTAssertThrowsError` takes an autoclosure, which cannot carry an `await`, so an async
+    /// throw has to be caught by hand. Here rather than in each test so the three above read as
+    /// the assertions they make rather than as the plumbing that reaches them.
+    private func errorFrom(_ work: () async throws -> Void) async -> Error? {
+        do {
+            try await work()
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     /// A real `Image`, loaded from a real OCI layout through the engine's own store.
     ///
     /// The load is `ImageManager.loadFromOCILayout`, which is what `arca-engine image load`

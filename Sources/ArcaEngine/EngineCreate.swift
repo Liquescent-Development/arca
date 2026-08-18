@@ -253,10 +253,22 @@ package func sandboxContainerSpec(
         // store holds -- and which nothing on the host can connect to. Every
         // check green over a port that does not exist.
         //
-        // The combination is the contract's to permit: `Network` is a `oneof`
-        // and `ports` is a separate `repeated` field (engine.proto:238-246),
-        // with nothing saying which wins. That is a gap in the contract and is
-        // recorded as one; what this engine will not do is resolve it silently.
+        // **The refusal is the CONTRACT's requirement, not a local choice of
+        // this engine's, and the guard below is that requirement implemented.**
+        // `engine.proto:246-252` is normative: "OFFLINE AND PORTS ARE MUTUALLY
+        // EXCLUSIVE, AND OFFLINE WINS BY REFUSAL: an engine that receives
+        // `offline` together with a non-empty CreateRequest.ports MUST refuse
+        // the request with unsupported_capability rather than publish, silently
+        // drop the ports, or pick a winner of its own." `CreateRequest.ports`
+        // points back at it (`engine.proto:271-272`).
+        //
+        // **It was a gap here, and this comment said so until it was not.**
+        // `Network` is a `oneof` and `ports` a separate `repeated` field, so the
+        // wire format still permits the combination and nothing about the FIELDS
+        // says which wins; what closed it is the rule, written into the proto by
+        // `b036b10` in this milestone. So relaxing this guard is a contract
+        // violation rather than a local decision -- and `contract_minor = 1`,
+        // which this engine answers, is what advertises conformance to it.
         //
         // `unsupported_capability` rather than a bad-request code: the request
         // is well formed and this build cannot serve it, which is what that
