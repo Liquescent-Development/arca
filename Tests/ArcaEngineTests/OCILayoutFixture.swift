@@ -161,13 +161,15 @@ enum OCILayoutFixture {
     /// at `path`, rather than `payload`'s bytes laid down raw.
     ///
     /// **Raw bytes were enough for every test that only loads, and are not
-    /// enough for one that unpacks -- but NOT because they fail.** `ImportOperation`
-    /// copies layer blobs by digest and never opens one, so nothing before now
-    /// noticed the fixture's "layer" was not an archive. `EXT4.Formatter.unpack`
-    /// does open it, and MEASURED, it accepts it silently: reverting this line to
-    /// `Data(payload.utf8)` under `MediaTypes.imageLayerGzip` logs `Layer cached
-    /// … size_mb=2048` with no error and leaves an ext4 image enumerating as
-    /// `["/", "/lost+found"]`. An empty filesystem, correctly labelled.
+    /// enough for one that unpacks -- and when this was written, NOT because they
+    /// failed.** `ImportOperation` copies layer blobs by digest and never opens
+    /// one, so nothing before then noticed the fixture's "layer" was not an
+    /// archive. `EXT4.Formatter.unpack` does open it, and against the unpacker at
+    /// submodule `3f68806` it accepted one silently: MEASURED there, reverting
+    /// this line to `Data(payload.utf8)` under `MediaTypes.imageLayerGzip` logged
+    /// `Layer cached … size_mb=2048` with no error and left an ext4 image
+    /// enumerating as `["/", "/lost+found"]`. An empty filesystem, correctly
+    /// labelled.
     ///
     /// That is why a real tar is required rather than merely tidier: a test
     /// asserting only on the label cannot tell that apart from a layer that
@@ -176,10 +178,21 @@ enum OCILayoutFixture {
     /// succeeding. `testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt`
     /// asserts on `/payload`, and the revert above is what makes it fail.
     ///
-    /// **A defect in the unpacker is visible from here and is NOT this
-    /// fixture's to fix**: production turns a mis-typed or corrupt layer blob
-    /// into a valid, correctly labelled, empty `layer.ext4` rather than refusing
-    /// it. It is upstream, in the frozen submodule, and recorded for a follow-up.
+    /// **The unpacker defect that measurement exposed is CLOSED at submodule
+    /// `6ede1d5`, so the paragraph above describes `3f68806` and not the code
+    /// this fixture runs against.** `unpack` refuses a source that is not the
+    /// archive its declared media type says it is, rather than turning it into a
+    /// valid, correctly labelled, empty `layer.ext4`. MEASURED after that commit,
+    /// the same revert -- `Data($0.content.utf8)` in place of `layerArchive`,
+    /// under this fixture's `MediaTypes.imageLayer` -- fails the same test
+    /// through production, `OverlayFSUnpacker.swift:84` reporting `the source is
+    /// not a paxRestricted archive with filter none: … reading the next archive
+    /// header failed with code -30: Truncated tar archive`.
+    ///
+    /// **That fix does not weaken the requirement to write a real tar.** A
+    /// fixture handing the unpacker a blob it refuses tests the refusal, and
+    /// every test that reaches this line is asking a question about a layer that
+    /// unpacked.
     ///
     /// Uncompressed, with every entry field fixed, so the bytes are a function
     /// of `path` and `payload` alone. libarchive's gzip filter stamps the
