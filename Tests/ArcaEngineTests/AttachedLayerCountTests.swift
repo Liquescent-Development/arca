@@ -79,21 +79,37 @@ final class AttachedLayerCountTests: XCTestCase {
         )
     }
 
-    /// The count is per-container configuration, and the framework carries it as such.
+    /// That the count is a per-container property with no default, and nothing more.
     ///
-    /// It reaches the guest as a kernel command line argument built at VM creation, so a
-    /// value set on one container's configuration must not be a value every VM gets: two
-    /// containers of different images run in different VMs and are told different numbers.
-    func testTheCountIsCarriedPerContainerConfiguration() throws {
+    /// **Read what this asserts, not what its subject suggests.** Setting a `var` on two
+    /// independent structs and reading it back is true of any `var` on any struct, and this
+    /// would pass if nothing downstream ever read the property. What it does pin is the one
+    /// part that is a decision rather than a language guarantee: the default is `nil` and not
+    /// `0`, so a VM nobody reported a count for tells the guest "no report" and never "no
+    /// layers". Those are different claims and only one of them describes an empty image.
+    ///
+    /// **What no test in either repository pins, and what happens when it breaks.** The value
+    /// reaches the guest through three plain assignments after this one: `LinuxContainer.create`
+    /// into `VMConfiguration`, and each VMM manager's `create` into its instance configuration.
+    /// MEASURED: deleting `attachedOverlayLayers: self.config.attachedOverlayLayers` from
+    /// `LinuxContainer.create` compiles and leaves all 247 tests here and all 613 in the
+    /// submodule passing. What it would then do to a guest is not measured but follows from
+    /// one branch: the guest receives no count, resolves `.unreported`, and refuses the boot --
+    /// the same refusal path that WAS measured live for a mismatched count, whose only trace
+    /// is a line in `bootlog.log`. The hop after that cannot be driven from a macOS test:
+    /// `VZVirtualMachineInstance.toVZ` ends in `VZVirtualMachineConfiguration.validate()`,
+    /// which needs the virtualization entitlement. Those hops are covered by the live tier and
+    /// by nothing else.
+    func testTheCountIsNilByDefaultAndSettablePerConfiguration() throws {
+        // Not zero. A VM with no Arca overlay must reach the guest saying nothing at all.
+        XCTAssertNil(LinuxContainer.Configuration().attachedOverlayLayers)
+
         var four = LinuxContainer.Configuration()
         var one = LinuxContainer.Configuration()
-        four.attachedOverlayLayers = plan(layers: 4).attachedLayerCount
-        one.attachedOverlayLayers = plan(layers: 1).attachedLayerCount
+        four.attachedOverlayLayers = 4
+        one.attachedOverlayLayers = 1
 
         XCTAssertEqual(four.attachedOverlayLayers, 4)
-        XCTAssertEqual(one.attachedOverlayLayers, 1)
-        // Nothing sets it by default: a VM with no Arca overlay reports no count at all,
-        // which the guest distinguishes from a report of zero.
-        XCTAssertNil(LinuxContainer.Configuration().attachedOverlayLayers)
+        XCTAssertEqual(one.attachedOverlayLayers, 1, "the count is per container, not per process")
     }
 }
