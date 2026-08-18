@@ -1,0 +1,14 @@
+# sha256 of every file in kernel/recipe/, plus the Linux source tarball the
+# recipe downloads. Verified by scripts/build-kernel.sh before every build.
+# Regenerate the recipe/ lines with:
+#   cd kernel && find recipe -type f | sort | xargs shasum -a 256
+d82786eb2d114b4c3d3b50f010757ea27f425f87929353188dc009756a293cc6  recipe/build.sh
+0b05408d7d5f5d5e941d89767780dc87a2e90e2f8ef20ec6f8cf11a3037f9f36  recipe/config-arm64
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  recipe/image/.dockerignore
+12495f89bf29700bf7e7cc09334ad2df58bd15bba9fde4dbabbb9830bffeb04f  recipe/image/Dockerfile
+a51719fced24ac227acb5a88acf9a3f9f6f5a5a58f4b35a7e5ad908de16e2561  recipe/image/sources.list
+056c4be3d19ef08cc0a98c7c681494afd34961827a77ec89a230add324b24852  recipe/Makefile
+b92578eac616f8dd27bb9279a660081db45b772ac64afb816deed0d70c79f2e7  recipe/README.md
+# The Linux source tarball, fetched to the work dir by recipe/Makefile:32.
+# This digest is kernel.org's own published sum (sha256sums.asc, v6.x).
+390cdde032719925a08427270197ef55db4e90c09d454e9c3554157292c9f361  source.tar.xz
