@@ -1285,15 +1285,22 @@ public actor ContainerManager {
         // - Bind mount from `/` to container rootfs path (FIRST mount - critical!)
         // - Writable block device for upper/work directories (/dev/vdc)
         // - Block device mounts for each layer (read-only EXT4, /dev/vdd onwards)
-        let overlayMounts = mounter.buildMounts(
+        let overlayPlan = mounter.buildMounts(
             containerID: dockerID,
             overlayConfig: effectiveOverlayConfig,
             writablePath: writablePath.path,
             additionalMounts: []  // Will be added in configuration closure
         )
+        let overlayMounts = overlayPlan.mounts
+        // How many layer devices this VM is being given, taken from the plan that attached
+        // them and told to the guest below. The guest compares it with what it can identify:
+        // an image with no layers and layers it failed to identify are otherwise the same
+        // observation there. See OverlayFSMountPlan and ArcaLayerAttachment.
+        let attachedOverlayLayers = overlayPlan.attachedLayerCount
         logger.debug("Built OverlayFS mounts", metadata: [
             "docker_id": "\(dockerID)",
-            "overlay_mounts": "\(overlayMounts.count)"
+            "overlay_mounts": "\(overlayMounts.count)",
+            "attached_overlay_layers": "\(attachedOverlayLayers)"
         ])
 
         // Log layer paths for debugging
@@ -1340,6 +1347,10 @@ public actor ContainerManager {
             configLogger.debug("⏱️ Configuration closure started", metadata: [
                 "docker_id": "\(dockerID)"
             ])
+
+            // Tell the guest how many layer devices came with these mounts. Set from the same
+            // plan that built them, so the number and the devices cannot drift apart.
+            containerConfig.attachedOverlayLayers = attachedOverlayLayers
 
             // Configure the container process (OCI-compliant)
             // Implement proper Docker entrypoint/cmd semantics:
