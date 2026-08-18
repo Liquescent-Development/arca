@@ -1,9 +1,22 @@
 # Release artefacts for `gascan-engine-m4`
 
-Identity of the two binary assets published with the `gascan-engine-m4` tag on
-Arca commit `4134b54549a5de89cfe2c4bf567df1b0c93d7ee3` (branch
-`feat/milestone-4-engine`, submodule `containerization` at
-`63041224e82befc1e3a825253125feabbc323da7`).
+Identity of the two binary assets published with the `gascan-engine-m4` tag.
+
+The annotated tag `d143a6611fdb62e46b11f76cca2627a258f1b2eb` dereferences to
+Arca commit `c545612b056e028d5885968a7b9f586d694f994c` — the commit that adds
+this file — on branch `feat/milestone-4-engine`, with submodule
+`containerization` at `63041224e82befc1e3a825253125feabbc323da7`. Gas Can's
+`engine/arca-pin.json` records that same revision.
+
+**The artefacts themselves were built from the tree at `4134b54549a5de89cfe2c4bf567df1b0c93d7ee3`**,
+which is `c545612`'s grandparent; the two commits between them add this document
+and the kernel recipe and change no engine code. An earlier version of this line
+gave `4134b54` as the tag's commit, which is wrong twice over: the tag is not
+there, and that tree has no `kernel/recipe/`, so a reader checking it out to
+audit the corresponding-source offer would find none. **The copy inside the
+`gascan-engine-m4` tag still carries the wrong SHA and cannot be corrected
+without re-cutting the tag, which is not warranted** — the pin, the digests and
+the published bytes are all correct.
 
 Gas Can's `engine/arca-pin.json` records these digests and its fetch verifies
 them, so this file states exactly which bytes were hashed. A directory is not a

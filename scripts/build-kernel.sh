@@ -82,6 +82,19 @@ echo "  ✓ $actual"
 echo
 
 # 5. Build, using the recipe's own Makefile and build.sh unchanged.
+#
+#    `vmlinux` is removed first because the staging rsync above cannot: it is
+#    `--exclude`d, and under `--delete` an exclude PROTECTS the receiver's copy
+#    rather than removing it (only `--delete-excluded` would). So a previous
+#    run's kernel sits here on every subsequent run, and the `[ ! -f vmlinux ]`
+#    guard below -- which exists for the one case where `container run` returns
+#    0 without producing an artifact -- is always satisfied by it. The operator
+#    would then get a digest, a byte count and "Build complete", all describing
+#    a kernel this run did not build, in the same shape as a real success.
+#
+#    Costs nothing: the object tree lives in /kbuild inside the container, so
+#    removing this file does not force a recompile.
+rm -f vmlinux
 echo "→ Building kernel (this takes 10-15 minutes)..."
 make
 

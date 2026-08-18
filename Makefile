@@ -234,7 +234,7 @@ build-assets: kernel vminit
 	@echo "Compressing kernel..."
 	@gzip -c ~/.arca/vmlinux > assets/vmlinux-arm64.gz
 	@echo "Packaging vminit OCI image..."
-	@cd ~/.arca && tar czf $(shell pwd)/assets/vminit-oci-arm64.tar.gz vminit/
+	@cd ~/.arca && COPYFILE_DISABLE=1 tar czf $(shell pwd)/assets/vminit-oci-arm64.tar.gz vminit/
 	@echo "Generating checksums..."
 	@cd assets && shasum -a 256 vmlinux-arm64.gz vminit-oci-arm64.tar.gz > SHA256SUMS
 	@echo "✓ Assets built successfully:"
