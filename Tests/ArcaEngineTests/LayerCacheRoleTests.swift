@@ -607,7 +607,9 @@ final class LayerCacheRoleTests: XCTestCase {
     /// **MEASURED against the unfixed unpacker before the fix existed**, which is why the second
     /// assertion is the load-bearing one rather than the first: at submodule `fb2b2f2` the first
     /// unpack threw as it should and the retry took the cache HIT branch and SUCCEEDED. The exact
-    /// output is in the fix report for this landing.
+    /// output is quoted in `Documentation/EVIDENCE-layer-cache-poisoning.md`, in this repository
+    /// and in git -- a committed test citing a file that is not committed leaves its evidence
+    /// with no durable home, which is where this record spent Landing 1.
     ///
     /// It asserts the retry THROWS rather than asserting on the cache predicate alone, because
     /// the predicate is a reading and the retry is the behaviour: an implementation that left a
@@ -798,8 +800,9 @@ final class LayerCacheRoleTests: XCTestCase {
     ///
     /// It is a separate test from the two above rather than one more assertion on them because it
     /// is a separate mechanism: the promotion is what stops the reuse, and the cleanup is what
-    /// stops the accumulation. The mutation matrix in this landing's fix report shows each one
-    /// failing this file alone or those two alone, never both.
+    /// stops the accumulation. The mutation matrix in
+    /// `Documentation/EVIDENCE-layer-cache-poisoning.md` shows each one failing this test alone
+    /// or those two alone, never both.
     func testARefusedUnpackLeavesNoScratchBesideTheCacheSlot() async throws {
         let image = try await loadedImage(
             reference: "refused-scratch-probe:latest",

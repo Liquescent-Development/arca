@@ -22,3 +22,8 @@
 
 # Per-release artefact records: digests Gas Can's pin verifies, so they are public
 !RELEASE-ARTIFACTS-*.md
+
+# Measurements that committed test docstrings cite. A test in git citing a file
+# that is not in git leaves its evidence with no durable home, which is how the
+# layer-cache record came to live in another repository's ignored scaffolding.
+!EVIDENCE-*.md
