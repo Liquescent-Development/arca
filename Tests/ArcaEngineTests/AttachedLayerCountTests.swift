@@ -91,15 +91,20 @@ final class AttachedLayerCountTests: XCTestCase {
     /// **What no test in either repository pins, and what happens when it breaks.** The value
     /// reaches the guest through three plain assignments after this one: `LinuxContainer.create`
     /// into `VMConfiguration`, and each VMM manager's `create` into its instance configuration.
-    /// MEASURED: deleting `attachedOverlayLayers: self.config.attachedOverlayLayers` from
-    /// `LinuxContainer.create` compiles and leaves all 247 tests here and all 613 in the
-    /// submodule passing. What it would then do to a guest is not measured but follows from
-    /// one branch: the guest receives no count, resolves `.unreported`, and refuses the boot --
-    /// the same refusal path that WAS measured live for a mismatched count, whose only trace
-    /// is a line in `bootlog.log`. The hop after that cannot be driven from a macOS test:
-    /// `VZVirtualMachineInstance.toVZ` ends in `VZVirtualMachineConfiguration.validate()`,
-    /// which needs the virtualization entitlement. Those hops are covered by the live tier and
-    /// by nothing else.
+    /// MEASURED at submodule `cc2ea7d` / Arca `a3e812d`: deleting
+    /// `attachedOverlayLayers: self.config.attachedOverlayLayers` from `LinuxContainer.create`
+    /// compiles and leaves all 247 tests here and all 613 in the submodule -- its whole count
+    /// at that commit -- passing. What it would then do to a guest is not measured but follows
+    /// from one branch: the guest receives no count, resolves `.unreported`, and refuses the
+    /// boot -- the same refusal path that WAS measured live for a mismatched count, whose only
+    /// trace is a line in `bootlog.log`.
+    ///
+    /// **The hop after that one IS pinned**, in the submodule: `VZAttachedLayerReportTests`
+    /// drives `VZVirtualMachineInstance.Configuration.linuxBootLoader(kernel:initialFilesystem:)`
+    /// and asserts the count reaches the boot loader's command line. What is still uncovered is
+    /// `toVZ` itself -- it ends in `VZVirtualMachineConfiguration.validate()`, which needs the
+    /// virtualization entitlement -- and each manager's assignment into its instance
+    /// configuration. Those are covered by the live tier and by nothing else.
     func testTheCountIsNilByDefaultAndSettablePerConfiguration() throws {
         // Not zero. A VM with no Arca overlay must reach the guest saying nothing at all.
         XCTAssertNil(LinuxContainer.Configuration().attachedOverlayLayers)
