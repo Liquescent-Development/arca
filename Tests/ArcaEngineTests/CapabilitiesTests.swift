@@ -58,7 +58,25 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertTrue(capabilities.loopbackPublish)
         XCTAssertTrue(capabilities.resourceLimits)
         XCTAssertEqual(capabilities.offline, .unverified)
-        XCTAssertEqual(capabilities.contractMinor, 0)
+        XCTAssertEqual(capabilities.contractMinor, 1)
         XCTAssertEqual(capabilities.engineVersion.minor, 2)
+    }
+
+    func testCapabilitiesCarryAFullLengthBuildRevision() async {
+        let service = SandboxEngineService.forTesting()
+        let response = await service.capabilities(request: .init())
+        let revision = response.capabilities.buildRevision
+        XCTAssertEqual(revision.count, 40, "build revision must be a full object id, not a prefix")
+        XCTAssertEqual(revision, revision.lowercased())
+        XCTAssertTrue(
+            revision.allSatisfy { $0.isHexDigit },
+            "build revision must be lowercase hex, got \(revision)"
+        )
+    }
+
+    func testCapabilitiesDeclareContractMinorOne() async {
+        let service = SandboxEngineService.forTesting()
+        let response = await service.capabilities(request: .init())
+        XCTAssertEqual(response.capabilities.contractMinor, 1)
     }
 }

@@ -1285,15 +1285,22 @@ public actor ContainerManager {
         // - Bind mount from `/` to container rootfs path (FIRST mount - critical!)
         // - Writable block device for upper/work directories (/dev/vdc)
         // - Block device mounts for each layer (read-only EXT4, /dev/vdd onwards)
-        let overlayMounts = mounter.buildMounts(
+        let overlayPlan = mounter.buildMounts(
             containerID: dockerID,
             overlayConfig: effectiveOverlayConfig,
             writablePath: writablePath.path,
             additionalMounts: []  // Will be added in configuration closure
         )
+        let overlayMounts = overlayPlan.mounts
+        // How many layer devices this VM is being given, taken from the plan that attached
+        // them and told to the guest below. The guest compares it with what it can identify:
+        // an image with no layers and layers it failed to identify are otherwise the same
+        // observation there. See OverlayFSMountPlan and ArcaLayerAttachment.
+        let attachedOverlayLayers = overlayPlan.attachedLayerCount
         logger.debug("Built OverlayFS mounts", metadata: [
             "docker_id": "\(dockerID)",
-            "overlay_mounts": "\(overlayMounts.count)"
+            "overlay_mounts": "\(overlayMounts.count)",
+            "attached_overlay_layers": "\(attachedOverlayLayers)"
         ])
 
         // Log layer paths for debugging
@@ -1340,6 +1347,10 @@ public actor ContainerManager {
             configLogger.debug("⏱️ Configuration closure started", metadata: [
                 "docker_id": "\(dockerID)"
             ])
+
+            // Tell the guest how many layer devices came with these mounts. Set from the same
+            // plan that built them, so the number and the devices cannot drift apart.
+            containerConfig.attachedOverlayLayers = attachedOverlayLayers
 
             // Configure the container process (OCI-compliant)
             // Implement proper Docker entrypoint/cmd semantics:
@@ -2908,8 +2919,9 @@ public actor ContainerManager {
             throw ContainerManagerError.containerNotFound(id)
         }
 
-        // Parse signal string to Int32
-        let signalNumber = parseSignal(signal)
+        // Parse signal string to Int32. A signal this engine cannot map fails
+        // the call rather than falling back to SIGKILL on a healthy container.
+        let signalNumber = try parseSignal(signal)
 
         logger.info("Sending signal to container", metadata: [
             "id": "\(dockerID)",
@@ -2927,37 +2939,45 @@ public actor ContainerManager {
         ])
     }
 
-    /// Parse signal string to Int32 signal number
-    private func parseSignal(_ signal: String) -> Int32 {
-        // Remove SIG prefix if present
-        let normalizedSignal = signal.uppercased().hasPrefix("SIG")
-            ? String(signal.uppercased().dropFirst(3))
-            : signal.uppercased()
-
-        // Try parsing as number first
-        if let num = Int32(normalizedSignal) {
-            return num
-        }
-
-        // Map common signal names to numbers
-        switch normalizedSignal {
-        case "HUP": return 1
-        case "INT": return 2
-        case "QUIT": return 3
-        case "KILL": return 9
-        case "TERM": return 15
-        case "USR1": return 10
-        case "USR2": return 12
-        case "ALRM": return 14
-        case "CONT": return 18
-        case "STOP": return 19
-        case "TSTP": return 20
-        case "TTIN": return 21
-        case "TTOU": return 22
-        default:
-            // Default to SIGKILL if unknown
-            logger.warning("Unknown signal name, defaulting to SIGKILL", metadata: ["signal": "\(signal)"])
-            return 9
+    /// Parse a signal string -- `"KILL"`, `"SIGKILL"` or `"9"` -- into the Linux
+    /// signal number to deliver to the guest.
+    ///
+    /// Refuses what it cannot map, where both halves used to guess. An
+    /// unrecognised *name* returned 9 behind a warning, so `docker kill --signal
+    /// BOGUS` destroyed a healthy container; a *number* was returned unvalidated,
+    /// so `docker kill --signal 999` reached the guest as nonsense. Both are
+    /// reachable from Arca's Docker surface.
+    ///
+    /// The parsing is Containerization's rather than a copy of it.
+    /// `Signal.init(_:from:)` already normalises the `SIG` prefix, gates a number
+    /// on membership in the table and refuses a name the table has no entry for,
+    /// and `ExecManager.signalExec` calls that same initializer. The two signal
+    /// paths therefore agree by construction, and not because two hand-written
+    /// implementations happen to match.
+    ///
+    /// Its default table is `Signal.linux`, which is the right one and not the
+    /// host's: the number returned here is handed to `LinuxContainer.kill` for a
+    /// **Linux guest**, and the host does not share that numbering -- `SIGUSR1` is
+    /// 30 on Darwin and 10 on Linux. A bound taken from the host's `NSIG` would
+    /// admit numbers meaning something else in the guest and reject 34...64,
+    /// which the guest accepts. It excludes 32 and 33, the gap between `SYS` and
+    /// `RTMIN`, which a range check written as `1...64` would wrongly admit.
+    ///
+    /// The `SignalError` is translated rather than propagated because
+    /// `ContainerHandlers.handleKillContainer` catches `as ContainerManagerError`
+    /// to choose a status code. A bare `SignalError` would miss that catch and be
+    /// reported as a 500 -- the swallowing this refusal exists to prevent. Only
+    /// `SignalError` is caught; anything else propagates untouched.
+    ///
+    /// `nonisolated package` and not `private`: nothing here reads actor state,
+    /// and the only route to it in production -- `killContainer` -- needs a
+    /// running container and a resolved `LinuxContainer`, so it cannot be reached
+    /// without a booted sandbox. `ContainerKillSignalTests` drives it directly.
+    nonisolated package func parseSignal(_ signal: String) throws -> Int32 {
+        do {
+            return try Containerization.Signal(signal).rawValue
+        } catch is SignalError {
+            throw ContainerManagerError.invalidSignal(signal)
         }
     }
 
@@ -4665,6 +4685,7 @@ public enum ContainerManagerError: Error, CustomStringConvertible {
     case imageNotFound(String)
     case invalidConfiguration(String)
     case invalidParameter(String)  // Phase 5 - Task 5.1: For validating resource limits
+    case invalidSignal(String)  // A signal name or number `parseSignal` cannot map
     case volumeSourceNotFound(String)
     case volumeNotFound(String)
     case volumeManagerNotAvailable
@@ -4695,6 +4716,9 @@ public enum ContainerManagerError: Error, CustomStringConvertible {
             return "Invalid configuration: \(msg)"
         case .invalidParameter(let msg):
             return "Invalid parameter: \(msg)"
+        case .invalidSignal(let signal):
+            // Docker's own wording for this refusal.
+            return "Invalid signal: \(signal)"
         case .volumeSourceNotFound(let path):
             return "Volume source path does not exist: \(path)"
         case .volumeNotFound(let name):

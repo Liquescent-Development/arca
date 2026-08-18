@@ -83,3 +83,10 @@ Documentation/IMPLEMENTATION_PLAN.md
 
 # IDE settings
 .vscode/
+
+# Vendored kernel recipe
+#
+# kernel/recipe/ is a verbatim copy of Apple's kernel build recipe and must stay
+# byte-identical to kernel/recipe.sha256. The empty .dockerignore is part of it
+# and is otherwise caught by the global ignore file.
+!kernel/recipe/image/.dockerignore

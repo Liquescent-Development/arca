@@ -233,14 +233,8 @@ final class EngineCommandRefusalTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    /// A well-formed vminit layout, so the kernel is the only thing wrong.
-    private func validVminitLayout(in root: URL) throws -> URL {
-        let layout = root.appendingPathComponent("vminit")
-        try FileManager.default.createDirectory(at: layout, withIntermediateDirectories: true)
-        try Data(#"{"imageLayoutVersion":"1.0.0"}"#.utf8)
-            .write(to: layout.appendingPathComponent("oci-layout"))
-        try Data(#"{"schemaVersion":2,"manifests":[]}"#.utf8)
-            .write(to: layout.appendingPathComponent("index.json"))
-        return layout
-    }
+    // `validVminitLayout` -- a well-formed layout, so the kernel is the only
+    // thing wrong -- moved to `EngineProcess.swift` when `EngineShutdownSignalTests`
+    // needed the same one. It sits beside the runner because both files that
+    // spawn the binary need both.
 }

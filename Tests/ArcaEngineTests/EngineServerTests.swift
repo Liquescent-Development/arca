@@ -259,7 +259,10 @@ final class EngineServerTests: XCTestCase {
         // reports `alreadyClosed` into a promise that is dropped.
         defer { engine.server.close(promise: nil) }
 
-        let peer = try sockets.connectRawSocket(to: path)
+        // An RPC in flight, because after `SilentConnectionQuiescer` nothing
+        // else holds a shutdown open -- see `SocketFixtures.holdAnExecOpen`,
+        // which records the two cheaper peers that were tried and do not.
+        let peer = sockets.holdAnExecOpen(to: path, group: group)
         try await Task.sleep(nanoseconds: 300_000_000)
 
         let closed = NIOLockedValueBox(false)
@@ -296,10 +299,171 @@ final class EngineServerTests: XCTestCase {
             """
         )
 
-        close(peer)
+        try await peer.release()
         try await waitUntil("the drain to complete once the peer is gone") {
             outcome.withLockedValue { $0 != nil }
         }
+        XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
+        _ = waiting
+    }
+
+    /// A peer that has been accepted and has sent NOTHING must not hold the
+    /// drain, because it has nothing to drain.
+    ///
+    /// **This is the inside half of a defect Gas Can's live tier measured and
+    /// nothing in this repository could see.** Stopping 1324 engines against
+    /// Arca `218343b`, each holding an ordinary gRPC client channel, gave `1323 x
+    /// exit status: 0, 1 x exit status: 1`, slowest shutdown **10.01s**, and the
+    /// one unclean engine logged `connections did not drain within the grace
+    /// period; closing anyway`. A client whose HTTP/2 preface had been written
+    /// but not yet read when the signal landed is exactly the peer below, and
+    /// once in every few hundred engines it cost the process its grace and its
+    /// exit status.
+    ///
+    /// **It is the exact converse of the test above it, and the trio is the
+    /// point.** That one requires a peer with something outstanding to hold the
+    /// drain; this one requires a peer with nothing outstanding not to; and
+    /// `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection`
+    /// requires a peer that has negotiated and has nothing outstanding to be
+    /// closed by grpc-swift. Each of the three mutations of
+    /// `SilentConnectionQuiescer` kills exactly one of THIS trio -- MEASURED,
+    /// one run per row, each against the 12 tests of these two classes and each
+    /// with the handler restored to sha256 `ce19f68e7e71d187...` afterwards:
+    ///
+    /// | mutation | the one of the trio that goes red | also red |
+    /// |---|---|---|
+    /// | delete the `context.close` | this test (10.84s) | -- |
+    /// | drop the `!spoke` guard | `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` (1.33s) | `ShutdownObserverTests.testTheObserverDoesNotFireOnAGracefulShutdownWithAHeldPeer` (0.87s) |
+    /// | swallow the quiesce instead of forwarding it | `testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection` (10.87s) | -- |
+    ///
+    /// **The third column is not slack in the trio; it is a second class that
+    /// started measuring this.** Closing every accepted connection at quiesce
+    /// also closes the `Exec` that `ShutdownObserverTests` holds, and since fix
+    /// round 1 that test asserts its drain is still outstanding at the moment
+    /// the listener closes -- so it catches the `!spoke` mutation as well.
+    /// Recorded rather than rounded off, because "kills exactly one" is true of
+    /// the trio and a reader running the filter sees two red.
+    ///
+    /// **The third row is why that test exists, and the claim it replaces was
+    /// wrong.** This docstring used to say that swallowing the event would turn
+    /// `testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener` red. Run,
+    /// it does not: with an `Exec` held, `spoke` is true so nothing closes the
+    /// connection early, the drain waits, and releasing the peer completes it
+    /// from the client end -- all 11 tests in these two classes stayed green
+    /// against that mutation. Forwarding was load-bearing and untested, and the
+    /// sentence asserting otherwise was a measurement nobody had taken.
+    ///
+    /// The accept race is SETUP here as well, and it fails safe in the opposite
+    /// direction to the test above: an unaccepted connection also lets the drain
+    /// complete, so this test can go green for the wrong reason. The `closed`
+    /// control is what stops that -- it requires the shutdown to have actually
+    /// started -- and the sleep is what makes the accept overwhelmingly likely
+    /// to have happened.
+    func testAnAcceptedConnectionThatHasSaidNothingDoesNotHoldTheDrain() async throws {
+        let path = testSocketPath()
+        let engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+        defer { engine.server.close(promise: nil) }
+
+        // Connected and silent, which is now precisely the peer the engine must
+        // NOT wait for. The test above holds an `Exec` open instead, and the two
+        // fixtures being different calls is what keeps this pair a pair.
+        let peer = try sockets.connectRawSocket(to: path)
+        defer { close(peer) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let closed = NIOLockedValueBox(false)
+        engine.onClose.whenComplete { _ in closed.withLockedValue { $0 = true } }
+
+        let outcome = NIOLockedValueBox<String?>(nil)
+        let waiting = Task {
+            do {
+                try await engine.runUntilQuiesced()
+                outcome.withLockedValue { $0 = "returned" }
+            } catch {
+                outcome.withLockedValue { $0 = "threw \(error)" }
+            }
+        }
+
+        engine.beginGracefulShutdown()
+        try await waitUntil("the drain to complete with the silent peer still connected") {
+            outcome.withLockedValue { $0 != nil }
+        }
+
+        XCTAssertTrue(
+            closed.withLockedValue { $0 },
+            "the listener must have closed, or this test asserts nothing at all"
+        )
+        XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
+        _ = waiting
+    }
+
+    /// A peer that HAS negotiated and has no stream open must be closed by
+    /// grpc-swift, which can only happen if the quiesce event was forwarded.
+    ///
+    /// **This is the only test in the bundle that fails when
+    /// `SilentConnectionQuiescer` consumes `ChannelShouldQuiesceEvent` instead
+    /// of passing it on, and the mechanism is one handler deep.**
+    /// `GRPCIdleHandler` is what turns that event into a GOAWAY and closes a
+    /// connection with no open streams; it sits downstream of
+    /// `SilentConnectionQuiescer`, so it sees the event only because that
+    /// handler fires it onward. Neither sibling can see this: the silent peer is
+    /// closed by `SilentConnectionQuiescer` itself whether it forwarded or not,
+    /// and the held `Exec` is closed from the client end.
+    ///
+    /// **Forwarding is not a detail.** Swallow it in production and every
+    /// negotiated idle connection holds the full ten-second grace and then costs
+    /// the engine its exit status -- the same defect
+    /// `SilentConnectionQuiescer` was written to fix, one connection-state
+    /// along, and reachable by every ordinary client rather than by one that
+    /// lost a microsecond race.
+    ///
+    /// The peer stays connected throughout: it is the SERVER that must close
+    /// this connection, so a test that closed it would prove nothing.
+    func testTheQuiesceEventReachesTheHandlersThatCloseANegotiatedConnection() async throws {
+        let path = testSocketPath()
+        let engine = try await EngineServer.start(
+            socketPath: path,
+            service: .forTesting(),
+            group: group
+        )
+        defer { engine.server.close(promise: nil) }
+
+        // Negotiated and idle, which is neither of the other two peers: the
+        // pipeline is configured, so `spoke` is true and this handler will not
+        // close it, and no stream is open, so nothing is draining.
+        let peer = try sockets.connectPrefacedSocket(to: path)
+        defer { close(peer) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let closed = NIOLockedValueBox(false)
+        engine.onClose.whenComplete { _ in closed.withLockedValue { $0 = true } }
+
+        let outcome = NIOLockedValueBox<String?>(nil)
+        let waiting = Task {
+            do {
+                try await engine.runUntilQuiesced()
+                outcome.withLockedValue { $0 = "returned" }
+            } catch {
+                outcome.withLockedValue { $0 = "threw \(error)" }
+            }
+        }
+
+        engine.beginGracefulShutdown()
+        try await waitUntil("the drain to complete with the negotiated peer still connected") {
+            outcome.withLockedValue { $0 != nil }
+        }
+
+        // The same control the silent-peer test carries, for the same reason: an
+        // unaccepted connection would let the drain finish too, and this test
+        // would then be green without having measured anything.
+        XCTAssertTrue(
+            closed.withLockedValue { $0 },
+            "the listener must have closed, or this test asserts nothing at all"
+        )
         XCTAssertEqual(outcome.withLockedValue { $0 }, "returned")
         _ = waiting
     }

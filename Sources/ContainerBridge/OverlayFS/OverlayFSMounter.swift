@@ -6,6 +6,30 @@ import Containerization
 import ContainerizationEXT4
 import SystemPackage
 
+/// What a container's VM is given, and how many of those things are image layers.
+///
+/// **The count exists so that the guest can tell an image with no layers from layers it failed
+/// to identify**, which are the same observation from inside the guest: an overlay writable
+/// with nothing under it. It travels to vminitd on the kernel command line; see
+/// `ArcaLayerAttachment` in the containerization framework.
+///
+/// It is returned together with the mounts rather than recomputed by the caller because the two
+/// must agree by construction. A caller that counted `lowerLayers` itself would be counting the
+/// host's list of layer PATHS, not the devices this type attached, and the guard the count feeds
+/// is worth exactly as much as that identity.
+public struct OverlayFSMountPlan: Sendable {
+    /// The mounts for the VM configuration, rootfs bind mount first.
+    public let mounts: [Containerization.Mount]
+
+    /// How many of `mounts` are OverlayFS layer block devices.
+    public let attachedLayerCount: Int
+
+    public init(mounts: [Containerization.Mount], attachedLayerCount: Int) {
+        self.mounts = mounts
+        self.attachedLayerCount = attachedLayerCount
+    }
+}
+
 /// Helper for mounting OverlayFS in guest VMs
 ///
 /// Encapsulates OverlayFS-specific logic to avoid modifying Apple's containerization framework.
@@ -48,13 +72,14 @@ public struct OverlayFSMounter: Sendable {
     ///   - overlayConfig: OverlayFS configuration with layer paths
     ///   - writablePath: Path to writable.ext4 filesystem for upper/work
     ///   - additionalMounts: Additional container mounts (proc, sys, etc.)
-    /// - Returns: Array of Mount objects for VM configuration
+    /// - Returns: The mounts for the VM configuration and how many layer devices are among
+    ///   them. See ``OverlayFSMountPlan``.
     public func buildMounts(
         containerID: String,
         overlayConfig: Containerization.OverlayFSConfig,
         writablePath: String,
         additionalMounts: [Containerization.Mount]
-    ) -> [Containerization.Mount] {
+    ) -> OverlayFSMountPlan {
         var mounts: [Containerization.Mount] = []
 
         // 1. FIRST MOUNT: Bind mount from `/` to container rootfs path
@@ -97,6 +122,12 @@ public struct OverlayFSMounter: Sendable {
         // 3. Attach each layer.ext4 as a read-only block device
         // Guest will see these as /dev/vdc, /dev/vdd, /dev/vde, etc.
         // vminitd will mount these at /mnt/layer{index} during boot
+        //
+        // This loop is what the count in the returned plan counts. It is incremented here,
+        // beside the append it describes, rather than read off `lowerLayers.count` afterwards:
+        // the number the guest is told has to be the number of devices this function actually
+        // attached, and those are the same only for as long as nothing skips an iteration.
+        var attachedLayerCount = 0
         for (index, layerPath) in overlayConfig.lowerLayers.enumerated() {
             let layerMount = Containerization.Mount.block(
                 format: "ext4",
@@ -106,6 +137,7 @@ public struct OverlayFSMounter: Sendable {
                 runtimeOptions: []
             )
             mounts.append(layerMount)
+            attachedLayerCount += 1
 
             logger?.debug("Added layer block device mount", metadata: [
                 "index": "\(index)",
@@ -121,12 +153,12 @@ public struct OverlayFSMounter: Sendable {
         logger?.info("Built OverlayFS mount configuration", metadata: [
             "bind_mount": "/",
             "writable_device": "/dev/vdb",
-            "layers": "\(overlayConfig.lowerLayers.count)",
+            "layers": "\(attachedLayerCount)",
             "layer_devices_start": "/dev/vdc",
             "total_mounts": "\(mounts.count)"
         ])
 
-        return mounts
+        return OverlayFSMountPlan(mounts: mounts, attachedLayerCount: attachedLayerCount)
     }
 
     // Removed with the move to labelled devices: `writableDevicePath` (/dev/vdb),

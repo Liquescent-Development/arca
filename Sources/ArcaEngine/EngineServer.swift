@@ -95,6 +95,22 @@ public struct EngineServer: Sendable {
         do {
             server = try await Server.insecure(group: group)
                 .withServiceProviders([service])
+                // **`withDebugChannelInitializer` is grpc-swift 1.x's only
+                // public hook into an ACCEPTED channel's pipeline, and its own
+                // doc calls it "intended for debugging".** Named here rather
+                // than left to be discovered: what it actually promises is to
+                // run "after gRPC has initialized each accepted channel ... at
+                // most once per accepted connection", which is exactly what
+                // `SilentConnectionQuiescer` needs and is a stable enough
+                // contract to hold a shutdown property on. The alternative is
+                // reaching into `GRPCServerPipelineConfigurator`, which is
+                // `internal`.
+                .withDebugChannelInitializer { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations
+                            .addHandler(SilentConnectionQuiescer())
+                    }
+                }
                 .bind(unixDomainSocketPath: socketPath)
                 .get()
         } catch {
@@ -264,8 +280,15 @@ public struct EngineServer: Sendable {
     /// That the listener closes while an accepted connection is still open -- so
     /// `onClose` completes and the drain does not -- is what
     /// `EngineServerTests.testRunUntilQuiescedWaitsForAcceptedConnectionsNotTheListener`
-    /// drives, against a real `EngineServer` and a raw peer holding the drain
-    /// open.
+    /// drives, against a real `EngineServer` and a peer with an `Exec` call open
+    /// holding the drain.
+    ///
+    /// **That peer used to be a raw silent socket and this sentence used to say
+    /// so.** `SilentConnectionQuiescer` closes a connection that has never spoken
+    /// the moment the engine is asked to quiesce, so a silent socket now holds
+    /// nothing and the test it anchors would have gone green against a
+    /// `runUntilQuiesced` that waited on the wrong thing. An RPC in flight is
+    /// what is left; see `SocketFixtures.holdAnExecOpen`.
     ///
     /// **THE CALL SITE'S WRONG-ARGUMENT HALF IS CLOSED BY CONSTRUCTION AND THE
     /// REST OF IT IS STILL NOT PINNED.** While this took a future,

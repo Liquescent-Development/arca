@@ -122,6 +122,7 @@ let package = Package(
         .target(
             name: "ArcaEngine",
             dependencies: [
+                "ArcaSignalCapture",
                 "SandboxEngineProto",
                 "ContainerBridge",
                 .product(name: "GRPC", package: "grpc-swift"),
@@ -129,9 +130,30 @@ let package = Package(
             ]
         ),
 
+        // The one part of shutdown-signal handling that cannot be Swift: a
+        // signal handler may only call async-signal-safe functions, and reaching
+        // a descriptor from a Swift function that captures nothing means a Swift
+        // global, whose access goes through `swift_once` and therefore takes a
+        // lock. Sources/ArcaSignalCapture/include/ArcaSignalCapture.h carries
+        // the argument in full. Zero dependencies, and it must stay that way:
+        // everything it does happens inside a signal handler.
+        .target(name: "ArcaSignalCapture"),
+
+        // The load-time half, linked by the `arca-engine` executable alone. Its
+        // whole content is a `dyld` constructor, and splitting it out is what
+        // keeps that constructor from following ArcaEngine into the test bundle
+        // and installing SIGTERM handlers inside `xctest`. See its header.
+        .target(name: "ArcaSignalCaptureAtLoad", dependencies: ["ArcaSignalCapture"]),
+
         .testTarget(
             name: "ArcaEngineTests",
-            dependencies: ["ArcaEngine"]
+            // `SandboxEngineProto` is here so a test can be a CLIENT of the
+            // engine rather than only a caller of its service object. After
+            // `SilentConnectionQuiescer`, the one thing that holds a graceful
+            // shutdown open is an RPC in flight, and making one needs the
+            // request and response types off the wire. See
+            // `SocketFixtures.holdAnExecOpen`.
+            dependencies: ["ArcaEngine", "SandboxEngineProto"]
         ),
 
         // The `arca-engine` executable: binds SandboxEngineService to a Unix
@@ -141,6 +163,11 @@ let package = Package(
             name: "arca-engine",
             dependencies: [
                 "ArcaEngine",
+                // Only the executable, and deliberately not ArcaEngine: this
+                // target's whole content is a `dyld` constructor, and a
+                // constructor linked into ArcaEngine would follow it into the
+                // test bundle and install SIGTERM handlers inside `xctest`.
+                "ArcaSignalCaptureAtLoad",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ]

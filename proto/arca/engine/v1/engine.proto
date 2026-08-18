@@ -122,6 +122,12 @@ message Capabilities {
   bool resource_limits = 8;
   // Whether an offline sandbox can be proven to have no egress.
   Isolation offline = 9;
+  // The engine's own build revision, as a full 40-character lowercase hex Git
+  // object id. A consumer certifies an engine BY REVISION, because an engine
+  // that asserted its own certification would be deciding the question the
+  // certification exists to answer. So this field carries identity and nothing
+  // else: never a tag, never a short hash. A prefix is not an identity.
+  string build_revision = 20;
   // Reserved for the network-model phase. 10 = egress_policy (Isolation),
   // 11 = peer_channels (bool). Reserved rather than present: a capability
   // nothing enforces is a surface that exists and is undefended.
@@ -238,6 +244,12 @@ message Offline { reserved 1; }
 message Network {
   oneof mode {
     // No egress. The engine must be able to report ISOLATION_PROVEN for this.
+    // OFFLINE AND PORTS ARE MUTUALLY EXCLUSIVE, AND OFFLINE WINS BY REFUSAL:
+    // an engine that receives `offline` together with a non-empty
+    // CreateRequest.ports MUST refuse the request with unsupported_capability
+    // rather than publish, silently drop the ports, or pick a winner of its
+    // own. Three implementations already behave this way and none of them
+    // said so here, which is one refactor away from losing the rule.
     Offline offline = 1;
     // Name of an engine-managed network resource, created with the sandbox.
     string networked_name = 2;
@@ -256,6 +268,7 @@ message CreateRequest {
   ImageDigest image = 2;
   ProjectMount project = 3;
   repeated Volume volumes = 4;
+  // Refused when the network is `offline`; see the rule on Network.offline.
   repeated PortMapping ports = 5;
   repeated EnvironmentVariable environment = 6;
   ResourceLimits resources = 7;
