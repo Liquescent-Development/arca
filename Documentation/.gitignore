@@ -19,3 +19,6 @@
 !LIMITATIONS.md
 !DISTRIBUTION.md
 !VMINIT_BUILD.md
+
+# Per-release artefact records: digests Gas Can's pin verifies, so they are public
+!RELEASE-ARTIFACTS-*.md
