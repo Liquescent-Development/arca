@@ -123,6 +123,45 @@ second container from the same image skips the unpack. The per-image destination
 in the previous subsection is what preserves it; a per-container destination would
 pay the full unpack on every `gascan up`.
 
+### The cache slot must not be poisonable, and a naive revert makes it so
+
+`EVIDENCE-layer-cache-poisoning.md` records a defect found by the whole-landing
+review of milestone 4 Landing 1 after seven task-scoped reviews had passed, fixed
+at `4134b54` and published in `gascan-engine-m4` (`c545612`): the formatter was
+pointed at the final cache path with `close()` deferred, so an unpack that *threw*
+still left a valid, correctly labelled, **empty** ext4 in the slot, and the next
+create's reuse predicate hit it.
+
+**That fix lives in `OverlayFSUnpacker.swift` — `promoteStagedLayer` at `:204-220`
+and the staging path at `:352-377` — which §4.1 deletes.** Upstream's
+`EXT4Unpacker` carries the pre-fix shape, `defer { try? filesystem.close() }` at
+`:55` and `:85`, and so does the fork's copy; the fix was never applied there.
+`OverlayFSUnpacker.swift:368` names the hazard exactly: a `defer { try? … }`
+"would swallow it and promote whatever it left".
+
+A per-image cache built directly on upstream's unpacker therefore reproduces the
+defect at **image** granularity, which is worse than the layer case it replaces:
+one poisoned `rootfs.ext4` is reused by every later container from that image.
+
+**Requirement.** Arca's own per-image unpack helper stages and promotes, carrying
+both mechanisms the evidence document mutation-tested as disjoint:
+
+1. The slot's existence is conditional on success — unpack into a sibling staging
+   path, call `close()` explicitly rather than in a `defer`, and promote onto the
+   final path with `rename(2)` only after it returns. `rename` and not
+   `FileManager.moveItem`, for the atomic replacement `OverlayFSUnpacker.swift:204-215`
+   explains.
+2. The staging file does not survive a failure — remove it on the error path.
+
+The fix is implemented in the parent repository, where the cache path is chosen,
+so the submodule gains no new fork-local divergence. This leaves upstream's
+`EXT4Unpacker` latently poisonable for any other caller that caches on it, which
+is a real upstream defect and worth reporting, but it is not this change's job.
+
+Each mechanism needs its own test, and the pair must be mutation-tested to a
+disjoint failing set the way `EVIDENCE-layer-cache-poisoning.md` records for the
+layer version. An untested invariant and no invariant are worth the same.
+
 ---
 
 ## 4. Scope, measured
@@ -318,12 +357,17 @@ design being removed, and **only one of them is in the repository**:
   `OVERLAYFS_IMPLEMENTATION_GUIDE.md`, `OVERLAYFS_SIMPLIFIED_APPROACH.md` and
   `OVERLAYFS_IMPLEMENTATION_VIOLATIONS.md`.
 
-`EVIDENCE-layer-cache-poisoning.md` needs care rather than deletion. The
-`!EVIDENCE-*.md` rule exists because committed test docstrings cite these files,
-and the gitignore's own comment records what happens otherwise: evidence with no
-durable home. Removing the layer cache does not make the poisoning that was
-observed untrue, so mark the document superseded and say what replaced the
-mechanism — and check for test docstrings citing it before touching it.
+`EVIDENCE-layer-cache-poisoning.md` must be **updated, not superseded and not
+deleted**. Its defect does not go away with the layer cache; §3 shows the same
+hazard reappearing at image granularity, and the fix it records is the one being
+carried forward. What changes is where the mechanism lives — out of
+`OverlayFSUnpacker.swift` and into the parent's per-image unpack helper — and
+which tests pin it, since `LayerCacheRoleTests.swift` is deleted here and its
+replacements are new. Rewrite those two sections, keep the defect and fix
+narrative, and record a fresh mutation matrix for the new tests rather than
+carrying the old one forward as though it still ran. Check for test docstrings
+citing the file before touching it; that citation is why the `!EVIDENCE-*.md`
+rule exists.
 
 This design document is tracked under a new `!DESIGN-*.md` allowlist entry, for
 the same reason: `gascan`'s documentation will cite it, and a citation pointing
