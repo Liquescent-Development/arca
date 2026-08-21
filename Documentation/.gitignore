@@ -27,3 +27,8 @@
 # that is not in git leaves its evidence with no durable home, which is how the
 # layer-cache record came to live in another repository's ignored scaffolding.
 !EVIDENCE-*.md
+
+# Designs another repository's documentation cites, for the same reason as the
+# evidence records above: a cross-repository citation into an ignored file points
+# at nothing the reader can fetch.
+!DESIGN-*.md
