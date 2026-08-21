@@ -147,19 +147,34 @@ one poisoned `rootfs.ext4` is reused by every later container from that image.
 both mechanisms the evidence document mutation-tested as disjoint:
 
 1. The slot's existence is conditional on success — unpack into a sibling staging
-   path, call `close()` explicitly rather than in a `defer`, and promote onto the
-   final path with `rename(2)` only after it returns. `rename` and not
-   `FileManager.moveItem`, for the atomic replacement `OverlayFSUnpacker.swift:204-215`
-   explains.
+   path and promote onto the final path with `rename(2)` only after the unpack
+   returns without throwing. `rename` and not `FileManager.moveItem`, for the
+   atomic replacement `OverlayFSUnpacker.swift:204-215` explains.
 2. The staging file does not survive a failure — remove it on the error path.
+
+**One hole staging alone does not close, and how it is closed here.** The original
+fix could un-defer `close()` because it owned the formatter. This helper does not:
+it calls upstream's `EXT4Unpacker.unpack`, which owns the formatter and closes it
+in `defer { try? filesystem.close() }`. A `close()` that fails is therefore
+swallowed, `unpack` returns normally, and staging would promote an artefact whose
+superblock never landed.
+
+So the staged file is **verified before promotion** — opened with `EXT4.Reader`,
+which fails if the superblock is not readable — and a failure removes the staging
+file and throws. This is a positive check on the artefact rather than trust in the
+call that produced it, and it is the reachable equivalent of making `close()` the
+commit point without adding fork-local divergence to the submodule.
+
+That gives three mechanisms to test, not two: promotion-on-success,
+staging-cleanup-on-failure, and verification-before-promotion.
 
 The fix is implemented in the parent repository, where the cache path is chosen,
 so the submodule gains no new fork-local divergence. This leaves upstream's
 `EXT4Unpacker` latently poisonable for any other caller that caches on it, which
 is a real upstream defect and worth reporting, but it is not this change's job.
 
-Each mechanism needs its own test, and the pair must be mutation-tested to a
-disjoint failing set the way `EVIDENCE-layer-cache-poisoning.md` records for the
+Each mechanism needs its own test, and the three must be mutation-tested to
+disjoint failing sets the way `EVIDENCE-layer-cache-poisoning.md` records for the
 layer version. An untested invariant and no invariant are worth the same.
 
 ---
