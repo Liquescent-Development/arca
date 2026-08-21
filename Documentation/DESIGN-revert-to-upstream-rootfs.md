@@ -83,12 +83,26 @@ would be wrong even though it would turn the suite green:
 Upstream's model, adopted unchanged:
 
 - The host unpacks **all image layers into one ext4** with upstream's
-  `EXT4Unpacker`. That unpacker caches per *image*: it resolves a block path and
-  refuses when one already exists
-  (`containerization/Sources/Containerization/Image/Unpacker/EXT4Unpacker.swift:151-153`
-  at `upstream/main`).
+  `EXT4Unpacker`, which refuses when a block already exists at the destination it
+  is given (`EXT4Unpacker.swift:151-153` at `upstream/main`).
 - The host attaches that rootfs plus one writable ext4, and hands both to
   `LinuxContainer(rootfs:writableLayer:)`.
+
+**The destination is ours to choose, and the choice matters.** Upstream's
+`EXT4Unpacker` is not a per-image cache in itself; it refuses a pre-existing block
+at whatever path the caller passes. Upstream's own convenience overload passes
+`<containerRoot>/<id>/rootfs.ext4` and its private `unpack` helper catches
+`.exists` and reuses the block (`ContainerManager.swift:342-357` at
+`upstream/main`) — but that path is per *container*, so every new container
+re-unpacks the whole image.
+
+This design therefore calls the lower-level
+`create(_:image:rootfs:writableLayer:networking:configuration:)`
+(`ContainerManager.swift:287` at `upstream/main`) and supplies a rootfs unpacked
+once to a path keyed by the image digest. Both overloads are upstream public API
+and neither adds fork delta; choosing the lower one costs a destination path we
+own and buys back the repeat-create speed the per-layer cache provides today.
+It is also the same per-image artefact `PrepareImage` will need (§7).
 - The **guest composes the overlay**, upstream's way: rootfs as the lower layer,
   the writable mount as the upper.
 
@@ -100,8 +114,14 @@ the rootfs, and the writable layer. A 35-layer image attaches the same number as
 
 The fork caches one ext4 per *layer*, which wins when many derived images share
 base layers — a registry workload. Gas Can has one pinned workspace image, so
-cross-image layer sharing is worth nothing, while upstream's per-image cache
-delivers the same repeat-create benefit attaching a constant number of devices.
+cross-image layer sharing is worth nothing. A rootfs cached per image, as above,
+delivers the same repeat-create benefit for that workload while attaching a
+constant number of devices.
+
+What the fork's cache does buy, and this design must not silently drop, is that a
+second container from the same image skips the unpack. The per-image destination
+in the previous subsection is what preserves it; a per-container destination would
+pay the full unpack on every `gascan up`.
 
 ---
 
