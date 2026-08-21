@@ -114,14 +114,69 @@ is empty — so the source read here is the source that ran.
 
 ### 4.1 Submodule `arca-containerization`
 
-Delete:
+**The overlay design is not confined to three files.** The fork is 61 files and
+13,770 insertions ahead of `upstream/main`, most of it the unrelated `arca-services`
+Go tree. Within it, overlay code touches **21 files**, and in fourteen of them it is
+interleaved with fork changes that must survive. The table below is the triage that
+scopes this work. `OVL` counts changed lines matching
+`overlay|volumeLabel|lowerLayers|upperDir|workDir|layerCache|attachedOverlay|ArcaBlockDevice|ArcaLayerAttachment`;
+`TOTAL` counts all changed lines. Both were produced on 2026-08-21 from
+`git diff upstream/main..HEAD -- <file>` counting `^[+-][^+-]`.
 
-| Path | Lines |
-|---|---|
-| `Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift` | 441 |
-| `Sources/Containerization/ArcaLayerAttachment.swift` | 95 |
-| `Sources/Containerization/ArcaBlockDeviceRole.swift` | 73 |
-| `Tests/ContainerizationTests/ArcaLayerAttachmentTests.swift` | — |
+**Delete outright** — every one of these is overlay-only:
+
+| Path | OVL / TOTAL | Note |
+|---|---|---|
+| `Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift` | 45 / 401 | |
+| `Sources/Containerization/ArcaLayerAttachment.swift` | 8 / 87 | |
+| `Sources/Containerization/ArcaBlockDeviceRole.swift` | 15 / 65 | |
+| `Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift` | 9 / 85 | see below |
+| `Sources/ContainerizationEXT4/EXT4+FilesystemEnumerator.swift` | 0 / 83 | see below |
+| `Tests/ContainerizationTests/ArcaLayerAttachmentTests.swift` | 12 / 77 | |
+| `Tests/ContainerizationTests/VZAttachedLayerReportTests.swift` | 11 / 75 | |
+
+Two of those are reached only through code this change removes, so they are dead on
+arrival rather than deleted on judgement:
+
+- `EXT4+VolumeLabel.swift` exists so that a block device can be classified by its
+  ext4 volume label. Its only consumers are `ArcaBlockDeviceRole.swift:67`,
+  `OverlayFSUnpacker.swift:283` and `:357` in this repository, and
+  `OverlayFSMounter.swift:204` and `LayerCacheRoleTests.swift` in the parent — all
+  deleted here. Note the name collision: `StateStore.swift`'s `volumeLabelsJSON`
+  (`:74`, `:307`, `:1185`, `:1220`) is Docker volume *labels* and is unrelated.
+- `EXT4+FilesystemEnumerator.swift` has **no consumer at all** in this repository,
+  and its only consumer in the parent is `LayerCacheRoleTests.swift:957-959`, which
+  §4.3 deletes.
+
+**Edit per hunk** — overlay is threaded through changes that must stay, so these
+cannot be reverted wholesale to `upstream/main`:
+
+| Path | OVL / TOTAL | What the overlay part is |
+|---|---|---|
+| `vminitd/Sources/VminitdCore/ArcaBoot.swift` | 39 / 287 | see below |
+| `vminitd/Sources/VminitdCore/AgentCommand.swift` | 16 / 38 | the boot calls |
+| `Sources/Containerization/ContainerManager.swift` | 14 / 53 | a 4th `create` overload upstream does not have |
+| `vminitd/Sources/VminitdCore/Server+GRPC.swift` | 11 / 92 | two mount-handler branches |
+| `Sources/ContainerizationEXT4/EXT4+Formatter.swift` | 10 / 28 | the `volumeLabel:` parameter |
+| `Tests/ContainerizationTests/KernelTests.swift` | 9 / 50 | the layer-count kernel argument |
+| `Sources/Containerization/LinuxContainer.swift` | 8 / 84 | `attachedOverlayLayers` at `:117`, `:664` |
+| `Sources/Containerization/VZVirtualMachineInstance.swift` | 7 / 37 | `attachedOverlayLayers` at `:90`, `:425-442` |
+| `Sources/Containerization/Kernel+Commandline.swift` | 6 / 43 | `linuxCommandline(initialFilesystem:attachedOverlayLayers:)` |
+| `Sources/Containerization/VMConfiguration.swift` | 6 / 9 | `attachedOverlayLayers` at `:91`, `:100`, `:108` |
+| `Sources/ContainerizationEXT4/EXT4.swift` | 4 / 5 | `volumeLabelTooLong` |
+| `Sources/Containerization/CHVirtualMachineInstance.swift` | 4 / 8 | |
+| `Sources/Containerization/CHVirtualMachineManager.swift` | 1 / 3 | `:109` |
+| `Sources/Containerization/VZVirtualMachineManager.swift` | 1 / 3 | |
+
+**Leave alone.** These carry fork changes with no overlay content, and the three
+with an `OVL` of 1 match only a comment that mentions the overlay unpacker in
+passing: `ArchiveReader.swift` (0/91), `EXT4+Reader.swift` (0/16),
+`Formatter+Unpack.swift` (0/25), `ImageConfig.swift` (0/19), `Mount.swift` (0/33),
+`User.swift` (0/12), `ManagedProcess.swift` (0/107), `RuncProcess.swift` (0/2),
+all four `vmexec/` files, `ArchiveReaderTests.swift` (0/200),
+`EXT4Unpacker.swift` (1/31), `LayerUnpackFailure.swift` (1/42),
+`TestFormatterUnpack.swift` (1/201), and the entire `vminitd/extensions/arca-services`
+Go tree.
 
 Edit, guest side:
 
