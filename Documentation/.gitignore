@@ -32,3 +32,8 @@
 # evidence records above: a cross-repository citation into an ignored file points
 # at nothing the reader can fetch.
 !DESIGN-*.md
+
+# The implementation plan for a tracked design. It spans this repository, the
+# containerization submodule and gascan, so no single repository's ignored
+# scaffolding is the right home for it.
+!PLAN-*.md
