@@ -19,6 +19,9 @@
 - **Never commit to `main`.** Every step below lands through a PR, merged with a merge commit and never squashed — the design cites SHAs.
 - Repositories: submodule `containerization/` = `Vas-Solutus/arca-containerization`; parent = `Vas-Solutus/arca`; consumer = `gascan` at `/Users/kiener/code/gascan`.
 - Baselines to beat, measured 2026-08-21: 1-layer alpine `2 passed (1 suite, 5.03s)`; 35-layer workspace `create failed ... no free indices are available for allocation`; unpack of 36 layers `duration_seconds=14.83`.
+- **Never run `swift test --disable-swift-testing` in the submodule.** Measured 2026-08-21 in `containerization/`: it returns exit 0 and `Executed 0 tests, with 0 failures` — the suite is entirely swift-testing, so that flag proves compilation and nothing else. Plain `swift test` runs the real suite (608 tests in 84 suites as of `ecdcdd6`). Earlier drafts of this plan specified the flag at 13 sites; every "tests pass" it produced would have been green for the wrong reason. In the **parent** repo the flag does run XCTest — `EVIDENCE-layer-cache-poisoning.md` records 250 tests under it — but plain `swift test` is a superset there too, so use it in both.
+- **On macOS, `swift build` compiles none of the guest.** Everything in `vminitd/Sources/VminitdCore/ArcaBoot.swift` and its callers sits inside `#if os(Linux)`. Guest changes are only compiled by `make vminitd`, which builds for `aarch64-swift-linux-musl`. A green `swift build` is not evidence about guest code.
+- **Re-derive the per-file overlay/total counts; do not trust §4.1's table.** Those counts are keyword matches over changed lines, and a doc-comment block about overlay contributes lines that carry none of the keywords. Measured on `Kernel+Commandline.swift`: the table implies 6 overlay lines of 43, while the actual delta is 41+/3− and *all* of it is one `ARCA PATCH` block about `attachedOverlayLayers`. The table is a map of where to look, not a budget of what to change. Before restoring any file from `upstream/main`, read its full diff and decide hunk by hunk.
 
 ---
 
@@ -32,7 +35,7 @@ Run after every task in this PR, from `containerization/`:
 
 ```bash
 swift build 2>&1 | tail -20
-swift test --disable-swift-testing 2>&1 | tail -20
+swift test 2>&1 | tail -20
 ```
 
 ### Task 1: Remove the guest's overlay composition
@@ -204,7 +207,7 @@ Read `/tmp/cm.diff`. Remove the added overload and any overlay-only helper it ca
 
 - [ ] **Step 4: Build and test**
 
-Run: `swift build 2>&1 | tail -20` then `swift test --disable-swift-testing 2>&1 | tail -20`
+Run: `swift build 2>&1 | tail -20` then `swift test 2>&1 | tail -20`
 Expected: both succeed. `Sources/Containerization` no longer mentions overlay.
 
 - [ ] **Step 5: Verify**
@@ -260,7 +263,7 @@ In `EXT4.swift`, delete `case volumeLabelTooLong(_ label: String, _ bytes: Int)`
 
 - [ ] **Step 4: Build and test**
 
-Run: `swift build 2>&1 | tail -20` then `swift test --disable-swift-testing 2>&1 | tail -20`
+Run: `swift build 2>&1 | tail -20` then `swift test 2>&1 | tail -20`
 Expected: both pass.
 
 - [ ] **Step 5: Confirm the fork's kept improvements are still present**
@@ -291,7 +294,7 @@ Branch from `main`. Run after every task, from the repository root:
 
 ```bash
 swift build 2>&1 | tail -20
-swift test --disable-swift-testing 2>&1 | tail -20
+swift test 2>&1 | tail -20
 ```
 
 ### Task 5: The per-image rootfs unpacker, with a slot that cannot be poisoned
@@ -430,7 +433,7 @@ Write the four `Self.fixture*` helpers and `modificationDate(of:)` against the e
 
 - [ ] **Step 3: Run the tests and watch them fail**
 
-Run: `swift test --disable-swift-testing --filter ImageRootfsUnpackerTests 2>&1 | tail -20`
+Run: `swift test --filter ImageRootfsUnpackerTests 2>&1 | tail -20`
 Expected: FAIL — `cannot find 'ImageRootfsUnpacker' in scope`.
 
 - [ ] **Step 4: Write the implementation**
@@ -553,7 +556,7 @@ Check `EXT4.Reader`'s real initialiser label before running — if it is not `bl
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
-Run: `swift test --disable-swift-testing --filter ImageRootfsUnpackerTests 2>&1 | tail -20`
+Run: `swift test --filter ImageRootfsUnpackerTests 2>&1 | tail -20`
 Expected: 4 tests, 0 failures.
 
 - [ ] **Step 6: Commit**
@@ -587,7 +590,7 @@ shasum -a 256 Sources/ContainerBridge/ImageRootfsUnpacker.swift | tee /tmp/rootf
 
 Change the unpack destination from `staging` to `slot` and delete the `try Self.promote(at:to:)` call. This is the pre-fix in-place shape.
 
-Run: `swift test --disable-swift-testing --filter ArcaEngineTests 2>&1 | tail -20`
+Run: `swift test --filter ArcaEngineTests 2>&1 | tail -20`
 Expected: `testARefusedUnpackLeavesNoCacheSlot` fails. Record the exact failing set and the run's totals.
 
 **A mutation that fails on every path measures a broken build, not the mechanism.** If `promote` now throws on success paths too, the mutation is unclean — discard it, note that it happened, and construct a cleaner one.
@@ -737,7 +740,7 @@ Remove `:137` (`let overlayConfig: Containerization.OverlayFSConfig?`) and the `
 
 - [ ] **Step 2: Build and test**
 
-Run: `swift build 2>&1 | tail -20` then `swift test --disable-swift-testing 2>&1 | tail -20`
+Run: `swift build 2>&1 | tail -20` then `swift test 2>&1 | tail -20`
 Expected: build passes. Tests fail only in the three overlay test files Task 11 deletes.
 
 - [ ] **Step 3: Commit**
@@ -843,7 +846,7 @@ Write `Self.temporaryStateRoot()` following the pattern in `Tests/ArcaEngineTest
 
 - [ ] **Step 2: Run and watch it fail**
 
-Run: `swift test --disable-swift-testing --filter LayerCacheReclaimTests 2>&1 | tail -20`
+Run: `swift test --filter LayerCacheReclaimTests 2>&1 | tail -20`
 Expected: FAIL — `cannot find 'LayerCacheReclaim' in scope`.
 
 - [ ] **Step 3: Implement the reclaim**
@@ -888,7 +891,7 @@ Add `import ContainerizationError`; `ArcaEngine` already depends on it.
 
 - [ ] **Step 4: Run and watch it pass**
 
-Run: `swift test --disable-swift-testing --filter LayerCacheReclaimTests 2>&1 | tail -20`
+Run: `swift test --filter LayerCacheReclaimTests 2>&1 | tail -20`
 Expected: 3 tests, 0 failures.
 
 - [ ] **Step 5: Call it once at start, and rename the path**
@@ -905,7 +908,7 @@ In `StateStore.swift`, delete the `layerCache` table (`:22`), its `create`/`crea
 
 ```bash
 swift build 2>&1 | tail -20
-swift test --disable-swift-testing 2>&1 | tail -20
+swift test 2>&1 | tail -20
 git add -A
 git commit -m "revert: drop the per-layer cache table and reclaim its disk once"
 ```
@@ -952,7 +955,7 @@ rtk proxy grep -in "overlay\|layer cache\|per-layer" Documentation/ARCHITECTURE.
 - [ ] **Step 5: Full suite, then commit**
 
 ```bash
-swift test --disable-swift-testing 2>&1 | tail -20
+swift test 2>&1 | tail -20
 git add -A
 git commit -m "docs: the poisoning fix moved, and three docs described an architecture that is gone"
 ```
@@ -973,7 +976,7 @@ git add containerization
 ```bash
 rm -rf .build
 swift build 2>&1 | tail -20
-swift test --disable-swift-testing 2>&1 | tail -20
+swift test 2>&1 | tail -20
 ```
 Expected: both pass with no overlay symbols anywhere.
 
