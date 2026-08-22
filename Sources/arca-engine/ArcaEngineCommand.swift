@@ -175,10 +175,15 @@ struct ServeCommand: AsyncParsableCommand {
         // half-initialised engine that answers unsupported_capability for
         // everything that matters. This runs ahead of the socket directory too,
         // so a refusal leaves nothing behind on disk.
+        //
+        // The raw option strings, not `URL`s built here: `EngineInputs` does
+        // that parse itself, and doing it at this call site would resolve
+        // `--state-root ""` against the working directory before
+        // `validateEngineInputs` ever saw that it was empty. See `EngineInputs`.
         let inputs = EngineInputs(
-            stateRoot: URL(fileURLWithPath: stateRoot),
-            kernelPath: URL(fileURLWithPath: kernelPath),
-            vminitLayout: URL(fileURLWithPath: vminitLayout)
+            stateRoot: stateRoot,
+            kernelPath: kernelPath,
+            vminitLayout: vminitLayout
         )
         try validateEngineInputs(inputs)
 
