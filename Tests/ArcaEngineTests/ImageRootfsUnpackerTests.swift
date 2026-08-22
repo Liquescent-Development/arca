@@ -191,6 +191,43 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         )
     }
 
+    /// The rootfs mount declares `ext4`, on both paths.
+    ///
+    /// **`isBlock` cannot see this and neither can any other assertion in this file.**
+    /// `Mount.block(format:)` stores its `format` argument AS `type` (`Mount.swift:82`),
+    /// while `isBlock` tests `runtimeOptions` (`Mount.swift:446-451`) and is true for a
+    /// block device of any format. Nothing else here reads `type`, so before this test
+    /// `blockMount`'s `"ext4"` could become `"ext3"` in silence.
+    ///
+    /// It is the half of the mount that reaches the guest intact. Upstream overwrites
+    /// `destination` before handing the mount to the agent -- `lowerMount.destination =
+    /// lowerPath` at `LinuxContainer.swift:590`, `upperMount.destination = upperMountPath`
+    /// at `:598` -- and never touches `type`, so `type` is what the guest tries to mount
+    /// the device as. A wrong string there fails the mount inside the VM, which is the
+    /// slowest place in this system to find a one-character defect.
+    ///
+    /// The artefact really is an ext4: `verifyReadable` constructs an `EXT4.EXT4Reader`
+    /// over it before promotion, so this is pinning the mount's agreement with the bytes
+    /// rather than an unbacked string.
+    func testTheRootfsMountDeclaresExt4OnBothTheUnpackAndTheCacheHit() async throws {
+        let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
+
+        let fresh = try await unpacker.rootfs(for: image, platform: Self.platform)
+        XCTAssertEqual(
+            fresh.mount.type, "ext4",
+            "the freshly promoted rootfs mount must declare ext4; the guest mounts the "
+                + "device as whatever this says"
+        )
+        XCTAssertTrue(fresh.mount.isBlock, "the rootfs must be a virtio block device")
+
+        let hit = try await unpacker.rootfs(for: image, platform: Self.platform)
+        XCTAssertEqual(
+            hit.mount.type, "ext4",
+            "the cache-hit rootfs mount must declare ext4, and the hit is the common case"
+        )
+        XCTAssertTrue(hit.mount.isBlock)
+    }
+
     /// Mechanism 1, isolated: the unpack's destination is a sibling of the slot, never the
     /// slot itself.
     ///

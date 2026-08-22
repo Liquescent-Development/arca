@@ -109,8 +109,9 @@ final class ContainerBridgePathsTests: XCTestCase {
         )
     }
 
-    /// The image rootfs cache must not be named `layers`, and this is the one assertion
-    /// in this file that is about a literal value rather than a relationship.
+    /// The image rootfs cache must not live inside the directory the layer reclaim
+    /// deletes, and this is the one assertion in this file about a literal value rather
+    /// than a relationship.
     ///
     /// **It is here because the value has a consequence outside this type.** Task 10 adds a
     /// reclaim that deletes `<state-root>/layers` on every engine start, to clear the
@@ -130,16 +131,30 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// `XCTAssertEqual(paths.imageRootfs, root.appendingPathComponent("image-rootfs"))`,
     /// which would be the restatement of the derivation this file's other tests were
     /// rewritten to remove -- it would pass over any rename and fail over a harmless one.
-    /// What must never happen is this one collision, so that is what is asserted.
-    func testTheImageRootfsCacheIsNotTheDirectoryTheLayerReclaimDeletes() {
+    /// What must never happen is this one containment, so that is what is asserted.
+    ///
+    /// **Containment and not `lastPathComponent != "layers"`, which is what this test
+    /// checked when it was first written.** The reclaim is a recursive `removeItem(at:)` on
+    /// the directory, so `<state-root>/layers/v2` -- a plausible shape for a later cache
+    /// revision -- is deleted on every engine start just as surely as `<state-root>/layers`
+    /// is, and passed the narrower check. The directory named here is Task 10's delete
+    /// target, not a second derivation of `EnginePaths.imageRootfs`: it is the hazard, and
+    /// naming it is the point.
+    func testTheImageRootfsCacheIsNotInsideTheDirectoryTheLayerReclaimDeletes() {
         let root = temporaryRoot()
         let paths = EnginePaths(stateRoot: root)
 
-        XCTAssertNotEqual(
-            paths.imageRootfs.lastPathComponent, "layers",
-            "the image rootfs cache must not be <state-root>/layers: the layer reclaim "
-                + "deletes that directory on every engine start, so a live per-image cache "
-                + "there is destroyed on each start and re-unpacked in full"
+        // Task 10's delete target. Both sides are built from the same `root`, so comparing
+        // the paths as text needs no symlink resolution.
+        let reclaimed = root.appendingPathComponent("layers")
+        let cache = paths.imageRootfs.path
+
+        XCTAssertFalse(
+            cache == reclaimed.path || cache.hasPrefix(reclaimed.path + "/"),
+            "the image rootfs cache must not be \(reclaimed.path) nor anything inside it: "
+                + "the layer reclaim removes that directory recursively on every engine "
+                + "start, so a live per-image cache under it is destroyed on each start and "
+                + "re-unpacked in full. Got \(cache)"
         )
     }
 

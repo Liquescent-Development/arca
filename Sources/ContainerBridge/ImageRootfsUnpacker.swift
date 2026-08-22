@@ -102,8 +102,14 @@ public struct ImageRootfsUnpacker: Sendable {
     /// both complete safely: each artefact is verified before it is promoted and `rename(2)`
     /// is atomic, so the loser's work is simply replaced. A sweep on the unpack path would
     /// delete a concurrent call's in-flight staging file out from under it and turn a race
-    /// that is safe today into a corrupt one. Initialisation is the only point at which
-    /// there is provably no in-flight work to destroy.
+    /// that is safe today into a corrupt one. Initialisation is the point at which a
+    /// process has no in-flight work of its own to destroy.
+    ///
+    /// **That bound is process-local, and the code does not enforce it.** Two processes
+    /// over one cache root -- a stale engine and a new one -- would have the second's sweep
+    /// delete the first's in-flight staging files, which is exactly the corrupt race this
+    /// rule avoids everywhere else. Calling this is only safe while one process owns the
+    /// cache root.
     public func reapOrphanedStagingFiles() throws {
         // Not an error: a cache root that has never been written holds no orphans. This is a
         // defined state of the cache, not a failure being swallowed -- every other error

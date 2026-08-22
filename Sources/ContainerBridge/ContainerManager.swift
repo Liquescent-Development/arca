@@ -325,7 +325,7 @@ public actor ContainerManager {
         // Sweep the cache root once, here, and deliberately NOT before each unpack: two
         // concurrent unpacks stage to distinct UUID paths and both complete safely, so a
         // per-unpack sweep would delete a concurrent call's in-flight file and turn a safe
-        // race into a corrupt one. See the doc comment on the reaper.
+        // race into a corrupt one. See the doc comment on `reapOrphanedStagingFiles`.
         //
         // WHY HERE IS THE SAFE POINT, and the bound on that claim: within this process
         // `initialize()` runs before any unpack can start, so there is no in-flight work

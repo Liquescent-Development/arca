@@ -130,6 +130,17 @@ final class CreatePathSeamTests: XCTestCase {
         )
         XCTAssertEqual(first.mount.source, path.path)
         XCTAssertTrue(first.mount.isBlock, "the writable layer must be a block device")
+        // `type` and not just `isBlock`: `Mount.block(format:)` stores `format` AS `type`
+        // (`Mount.swift:82`), while `isBlock` reads `runtimeOptions` (`:446-451`) and is
+        // true for any format at all -- so `isBlock` alone cannot see "ext4" become
+        // "ext3". The format is also the half that survives into the guest: upstream
+        // overwrites `destination` before mounting (`LinuxContainer.swift:597-599`) and
+        // leaves `type` alone, so it is what the guest actually tries to mount as.
+        XCTAssertEqual(
+            first.mount.type, "ext4",
+            "the writable layer must be formatted and declared ext4 -- EXT4.Formatter wrote "
+                + "it, and this string is what the guest mounts it as"
+        )
         XCTAssertTrue(
             first.mount.options.isEmpty,
             "the writable layer must attach writable -- it is the overlay's upper layer and "
