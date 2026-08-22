@@ -17,10 +17,10 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// Mechanism 1: a refused unpack leaves no slot for the next create to hit.
     func testARefusedUnpackLeavesNoCacheSlot() async throws {
         let (unpacker, image, cacheRoot) = try await Self.fixtureRefusingItsLayer()
-        let slot = unpacker.rootfsPath(forImageDigest: image.digest)
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
 
         do {
-            _ = try await unpacker.rootfs(for: image, platform: .current)
+            _ = try await unpacker.rootfs(for: image, platform: Self.platform)
             XCTFail("the unpack was expected to refuse the layer")
         } catch {
             // expected
@@ -36,9 +36,9 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// Mechanism 2: the staging file does not survive the failure.
     func testARefusedUnpackLeavesNoScratchBesideTheSlot() async throws {
         let (unpacker, image, cacheRoot) = try await Self.fixtureRefusingItsLayer()
-        let slot = unpacker.rootfsPath(forImageDigest: image.digest)
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
 
-        _ = try? await unpacker.rootfs(for: image, platform: .current)
+        _ = try? await unpacker.rootfs(for: image, platform: Self.platform)
 
         let residue = (try? FileManager.default.contentsOfDirectory(
             atPath: slot.deletingLastPathComponent().path)) ?? []
@@ -56,10 +56,10 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// would promote that. Verification before promotion is what refuses it.
     func testAStagedFileWithNoReadableSuperblockIsNotPromoted() async throws {
         let (unpacker, image, cacheRoot) = try await Self.fixtureWhoseStagedFileIsTruncated()
-        let slot = unpacker.rootfsPath(forImageDigest: image.digest)
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
 
         do {
-            _ = try await unpacker.rootfs(for: image, platform: .current)
+            _ = try await unpacker.rootfs(for: image, platform: Self.platform)
             XCTFail("an unreadable staged filesystem was expected to be refused")
         } catch {
             // expected
@@ -76,10 +76,10 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     func testASecondCallReusesThePromotedSlot() async throws {
         let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
 
-        let first = try await unpacker.rootfs(for: image, platform: .current)
+        let first = try await unpacker.rootfs(for: image, platform: Self.platform)
         let firstModified = try Self.modificationDate(of: first)
 
-        let second = try await unpacker.rootfs(for: image, platform: .current)
+        let second = try await unpacker.rootfs(for: image, platform: Self.platform)
         let secondModified = try Self.modificationDate(of: second)
 
         XCTAssertEqual(first.source, second.source)
@@ -107,7 +107,7 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// does not exist and the bytes are somewhere else.
     func testTheUnpackWritesASiblingOfTheSlotAndNeverTheSlotItself() async throws {
         var (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
-        let slot = unpacker.rootfsPath(forImageDigest: image.digest)
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
 
         let observation = PromotionObservation()
         unpacker.willPromote = { staging in
@@ -117,7 +117,7 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             )
         }
 
-        _ = try await unpacker.rootfs(for: image, platform: .current)
+        _ = try await unpacker.rootfs(for: image, platform: Self.platform)
 
         let staging = try XCTUnwrap(
             observation.staging, "the unpack must reach the promotion seam at all"
@@ -136,6 +136,96 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             observation.slotExistedAtPromotion, false,
             "the cache slot existed before the promotion, so something other than a "
                 + "verified promotion can create it"
+        )
+    }
+
+    /// The slot is keyed by platform as well as digest, so one platform's rootfs is never
+    /// handed to another.
+    ///
+    /// `image.digest` is the INDEX descriptor's digest and `manifest(for:)` picks a
+    /// per-platform manifest out of that index, so a multi-platform image has one digest and
+    /// a different layer set per platform. Keyed on the digest alone, the second call here
+    /// would take the cache-hit branch and return the arm64 rootfs for an amd64 request --
+    /// no unpack, no verification, no error.
+    ///
+    /// `testASecondCallReusesThePromotedSlot` passes either way, so nothing else in this
+    /// suite can see it. It cannot fire in a single build today, because
+    /// `ContainerManager.detectSystemPlatform()` is a compile-time `#if arch(arm64)` switch;
+    /// it becomes live if arca honours `--platform` or a cache root moves between machines.
+    func testAnotherPlatformDoesNotGetThisPlatformsRootfs() async throws {
+        let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
+        let otherSlot = unpacker.rootfsPath(
+            forImageDigest: image.digest, platform: Self.otherPlatform
+        )
+
+        XCTAssertNotEqual(
+            slot, otherSlot,
+            "two platforms share one cache slot, so whichever unpacks first decides what "
+                + "every later platform boots"
+        )
+
+        let promoted = try await unpacker.rootfs(for: image, platform: Self.platform)
+        XCTAssertEqual(promoted.source, slot.path)
+
+        // The fixture image carries an arm64 manifest and nothing else, so the amd64
+        // request has nothing to unpack and must SAY so rather than quietly answering out
+        // of the slot beside it.
+        do {
+            let wrong = try await unpacker.rootfs(for: image, platform: Self.otherPlatform)
+            XCTFail(
+                "an amd64 request was answered with \(wrong.source); the fixture image is "
+                    + "arm64-only, so this can only have come from the arm64 slot"
+            )
+        } catch {
+            // expected: no amd64 manifest in the index
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: otherSlot.path))
+    }
+
+    /// The staging file left by the failure staging exists to protect against is reaped.
+    ///
+    /// The `catch` cleanup handles an in-process throw, which
+    /// `testARefusedUnpackLeavesNoScratchBesideTheSlot` pins. It cannot handle the case
+    /// `testTheUnpackWritesASiblingOfTheSlotAndNeverTheSlotItself` names as staging's whole
+    /// reason for existing -- a crash, a `SIGKILL`, a power loss -- which runs no cleanup at
+    /// all and leaves a fully sized rootfs behind under a UUID no later call will ever
+    /// choose again.
+    ///
+    /// The second assertion is not decoration: a reaper that took the whole directory, or
+    /// matched on `rootfs.ext4` as a prefix, would satisfy the first one while destroying
+    /// every cached image on the machine.
+    func testTheReaperRemovesAnOrphanedStagingFileAndSparesThePromotedSlot() async throws {
+        let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
+        let directory = slot.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        // Exactly what a SIGKILL between the unpack and the rename leaves behind.
+        let orphan = directory.appendingPathComponent("rootfs.ext4.staging-\(UUID().uuidString)")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: orphan.path, contents: Data(repeating: 0, count: 4096)
+            ),
+            "the fixture must actually create the orphan it is about to assert on"
+        )
+
+        _ = try await unpacker.rootfs(for: image, platform: Self.platform)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: slot.path),
+            "the unpack must have promoted a slot for the sparing assertion to mean anything"
+        )
+
+        try unpacker.reapOrphanedStagingFiles()
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: orphan.path),
+            "a staging file orphaned by a crash survived the reaper; each one is a full "
+                + "rootfs and they accumulate one per crash"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: slot.path),
+            "the reaper deleted the promoted rootfs, not just the orphan beside it"
         )
     }
 
@@ -168,6 +258,36 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             return _slotExistedAtPromotion
         }
     }
+
+    /// The platform every test here requests, and deliberately NOT `Platform.current`.
+    ///
+    /// `OCILayoutFixture` writes `architecture: "arm64", os: "linux"` with no variant
+    /// (`OCILayoutFixture.swift:167`). `Platform.current` reads `uname` and hardcodes
+    /// `os: "linux"` (`ContainerizationOCI/Platform.swift:38-48`), so on this arm64 host it
+    /// supplies `variant: "v8"` and matches the fixture only through the `arm64`+`nil`
+    /// versus `arm64`+`"v8"` special case in `Platform.==` (`:252-266`) -- the suite's
+    /// correctness resting on a compatibility shim two modules away.
+    ///
+    /// **The reason to change it is not the shim, it is that the wrong host goes silently
+    /// GREEN.** MEASURED, substituting what `Platform.current` returns on an x86_64 host
+    /// (`Platform(arch: "amd64", os: "linux", variant: nil)`, since
+    /// `normalizeArch("x86_64") -> ("amd64", nil)`): only
+    /// `testASecondCallReusesThePromotedSlot` and
+    /// `testTheUnpackWritesASiblingOfTheSlotAndNeverTheSlotItself` fail. The three tests
+    /// carrying the ENTIRE anti-poisoning guarantee PASS -- vacuously.
+    /// `image.manifest(for:)` throws `unsupported platform linux/amd64` before
+    /// `EXT4.Formatter` is ever constructed, and `prepareUnpackPath` creates nothing, so the
+    /// `catch` is entered, no slot exists, and `XCTAssertFalse(fileExists)` is satisfied
+    /// without the mechanism under test ever running. Two reds beside three false greens is
+    /// the worst shape available: the red reads as "a platform problem" and the reader
+    /// concludes the other three were unaffected.
+    ///
+    /// Naming the same platform the fixture writes removes both the shim dependence and the
+    /// vacuity. `LayerCacheRoleTests` already spells it this way (`:238`, `:329`, `:404`).
+    private static let platform = SystemPlatform.linuxArm.ociPlatform()
+
+    /// A platform the fixture image does NOT carry, for the cache-key test below.
+    private static let otherPlatform = SystemPlatform.linuxAmd.ociPlatform()
 
     /// Small enough that four unpacks are cheap, and the value `verifyReadable` is handed:
     /// the size assertion is `>= capacityInBytes`, so the number the unpacker is
@@ -215,13 +335,29 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// superblock is swallowed and `unpack` returns normally over a file that is not a
     /// filesystem. Truncating at the seam produces that artefact without needing a
     /// formatter that can be made to fail on demand.
+    ///
+    /// **1536 bytes, and the number is the whole point of the fixture.** Zero is the one
+    /// length that EVERY guard in the chain catches, so it cannot distinguish them. MEASURED
+    /// on this Darwin host, `FileHandle.read(upToCount: 1024)` after `seek(toOffset: 1024)`
+    /// returns `nil` for sizes 0, 512 and 1024, and `Data(count: 512)` for 1536. Upstream's
+    /// reader is `guard let data = try? handle.read(upToCount: superBlockSize) else { throw }`
+    /// -- a NIL check, not a length check -- so a zero-byte artefact is refused by upstream
+    /// itself and `verifyReadable`'s size assertion could be deleted without any test
+    /// noticing, before Task 12's bump and equally after it.
+    ///
+    /// At 1536 the read succeeds SHORT. Today the fork's `data.count == superBlockSize`
+    /// guard (`containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`)
+    /// still refuses it, so nothing goes red now. After Task 12 removes that guard with the
+    /// volume-label work, upstream hands the 512-byte `Data` to `loadLittleEndian` for a
+    /// 1024-byte struct, and the size check is the only thing left between the caller and an
+    /// out-of-bounds load. Only at this length does the check become falsifiable.
     private static func fixtureWhoseStagedFileIsTruncated() async throws
         -> (ImageRootfsUnpacker, Containerization.Image, URL)
     {
         var (unpacker, image, cacheRoot) = try await fixtureThatUnpacksCleanly()
         unpacker.willPromote = { staging in
             let handle = try FileHandle(forWritingTo: staging)
-            try handle.truncate(atOffset: 0)
+            try handle.truncate(atOffset: 1536)
             try handle.close()
         }
         return (unpacker, image, cacheRoot)

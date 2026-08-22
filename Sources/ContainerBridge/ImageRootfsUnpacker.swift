@@ -32,17 +32,94 @@ public struct ImageRootfsUnpacker: Sendable {
     /// Test seam: called with the staging URL immediately before verification.
     internal var willPromote: (@Sendable (URL) throws -> Void)?
 
+    /// Written once, because the reaper below finds orphans by matching it. Two spellings
+    /// could drift apart, and the way they would fail is that the reaper silently stops
+    /// finding anything -- the one failure mode a sweep has no way to report.
+    private static let stagingPrefix = "rootfs.ext4.staging-"
+
     public init(cacheRoot: URL, capacityInBytes: UInt64, logger: Logger) {
         self.cacheRoot = cacheRoot
         self.capacityInBytes = capacityInBytes
         self.logger = logger
     }
 
-    /// Where this image's composed rootfs lives, whether or not it exists yet.
-    public func rootfsPath(forImageDigest digest: String) -> URL {
+    /// Where this image's composed rootfs lives on `platform`, whether or not it exists yet.
+    ///
+    /// **The platform is part of the key because the bytes are a function of it.**
+    /// `image.digest` is the *index* descriptor's digest
+    /// (`containerization/Sources/Containerization/Image/Image.swift:48`), and
+    /// `manifest(for:)` selects a per-platform manifest out of that index (`:68-80`): a
+    /// multi-platform image has ONE digest and a different layer set per platform. Keyed on
+    /// the digest alone, an arm64 rootfs promoted into the slot would be returned for an
+    /// amd64 request -- no unpack, no verification, no error, wrong filesystem. That cannot
+    /// fire in a single build today, because `ContainerManager.detectSystemPlatform()` is a
+    /// compile-time `#if arch(arm64)` switch and so a given cache root is only ever written
+    /// by one platform; it becomes live the moment arca honours `--platform`, or a cache
+    /// root is copied between machines.
+    public func rootfsPath(forImageDigest digest: String, platform: ContainerizationOCI.Platform) -> URL {
         cacheRoot
             .appendingPathComponent(digest.replacingOccurrences(of: ":", with: "-"))
+            .appendingPathComponent("\(platform.os)-\(platform.architecture)")
             .appendingPathComponent("rootfs.ext4")
+    }
+
+    /// Removes staging files left by a failure that never reached the `catch` below.
+    ///
+    /// Staging exists for the failure that runs no cleanup at all -- a crash, a `SIGKILL`, a
+    /// power loss between the unpack and the `rename`. Those leave a fully sized
+    /// (`capacityInBytes`, gigabytes in production) `rootfs.ext4.staging-<uuid>` in the
+    /// image's directory. It poisons nothing, because only a promotion can create the slot,
+    /// but the next call takes a fresh UUID, so the orphan is never reused and never removed
+    /// and they accumulate one per crash, forever.
+    ///
+    /// **Call this once when the cache root is initialised, and deliberately NOT before each
+    /// unpack.** Two concurrent calls for the same image stage to distinct UUID paths and
+    /// both complete safely: each artefact is verified before it is promoted and `rename(2)`
+    /// is atomic, so the loser's work is simply replaced. A sweep on the unpack path would
+    /// delete a concurrent call's in-flight staging file out from under it and turn a race
+    /// that is safe today into a corrupt one. Initialisation is the only point at which
+    /// there is provably no in-flight work to destroy.
+    public func reapOrphanedStagingFiles() throws {
+        // Not an error: a cache root that has never been written holds no orphans. This is a
+        // defined state of the cache, not a failure being swallowed -- every other error
+        // below propagates.
+        guard FileManager.default.fileExists(atPath: cacheRoot.path) else { return }
+
+        // A recursive walk, deliberately NOT the two levels `rootfsPath` happens to build
+        // today. A reaper that spelt out `<digest>/<platform>/` would still compile after any
+        // change to the slot's shape, and the way it would fail is by silently finding
+        // nothing -- which is indistinguishable from a cache with no orphans in it. Matching
+        // on the name alone is also what keeps a promoted slot safe: `rootfs.ext4` does not
+        // carry the `rootfs.ext4.staging-` prefix, and no directory does either.
+        var walkFailure: Error?
+        guard
+            let walk = FileManager.default.enumerator(
+                at: cacheRoot,
+                includingPropertiesForKeys: nil,
+                options: [],
+                errorHandler: { _, error in
+                    // Stop rather than skip. A sweep that walked past an unreadable
+                    // directory would report success over a cache it had only partly seen.
+                    walkFailure = error
+                    return false
+                }
+            )
+        else {
+            throw ContainerizationError(
+                .internalError,
+                message: "could not enumerate the image rootfs cache at \(cacheRoot.path)"
+            )
+        }
+
+        for case let entry as URL in walk
+        where entry.lastPathComponent.hasPrefix(Self.stagingPrefix) {
+            try FileManager.default.removeItem(at: entry)
+            logger.info(
+                "reaped an orphaned rootfs staging file",
+                metadata: ["path": "\(entry.path)"]
+            )
+        }
+        if let walkFailure { throw walkFailure }
     }
 
     /// The image's composed rootfs, unpacked if it is not already cached.
@@ -50,7 +127,7 @@ public struct ImageRootfsUnpacker: Sendable {
         for image: Containerization.Image,
         platform: ContainerizationOCI.Platform
     ) async throws -> Containerization.Mount {
-        let slot = rootfsPath(forImageDigest: image.digest)
+        let slot = rootfsPath(forImageDigest: image.digest, platform: platform)
         if FileManager.default.fileExists(atPath: slot.path) {
             logger.debug("image rootfs cache hit", metadata: ["path": "\(slot.path)"])
             return Self.blockMount(at: slot)
@@ -59,7 +136,7 @@ public struct ImageRootfsUnpacker: Sendable {
         let directory = slot.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let staging = directory.appendingPathComponent("rootfs.ext4.staging-\(UUID().uuidString)")
+        let staging = directory.appendingPathComponent("\(Self.stagingPrefix)\(UUID().uuidString)")
 
         do {
             let unpacker = EXT4Unpacker(capacityInBytes: capacityInBytes)
@@ -95,9 +172,25 @@ public struct ImageRootfsUnpacker: Sendable {
     /// undersized buffer. `UnsafeRawBufferPointer.load` bounds-checks with
     /// `_debugPrecondition`, which is `@inlinable` and so evaluated in the *client's*
     /// build configuration: **a release build compiles the check out and reads
-    /// `MemoryLayout<EXT4.SuperBlock>.size` bytes past the end**; a debug build traps. A
-    /// file shorter than the 1024-byte superblock offset yields a zero-count `Data` whose
-    /// base address may be nil.
+    /// `MemoryLayout<EXT4.SuperBlock>.size` bytes past the end**; a debug build traps.
+    ///
+    /// **The window is file lengths in (1024, 2048) exclusive, and nowhere else.** MEASURED
+    /// on this Darwin host, `FileHandle.read(upToCount: 1024)` after
+    /// `seek(toOffset: 1024)`:
+    ///
+    /// ```
+    /// size=0    -> nil            size=1025 -> Data(count: 1)
+    /// size=512  -> nil            size=1536 -> Data(count: 512)
+    /// size=1024 -> nil            size=2047 -> Data(count: 1023)
+    ///                             size=2048 -> Data(count: 1024)
+    /// ```
+    ///
+    /// At or below the 1024-byte offset the read returns **nil**, which upstream's
+    /// `guard let data = try? ... else { throw }` catches on its own -- so a truncated-to-zero
+    /// artefact does NOT reach the load and cannot demonstrate this check. Only a length
+    /// strictly between the offset and offset+superblock returns a short, non-nil `Data`
+    /// that upstream hands straight to `loadLittleEndian`. That range is why
+    /// `fixtureWhoseStagedFileIsTruncated` truncates to 1536 rather than to 0.
     ///
     /// The `s_magic` check at `:62` runs *after* that load, so it is no defence at all --
     /// the out-of-bounds read has already happened, whether or not the magic survived.
@@ -114,11 +207,16 @@ public struct ImageRootfsUnpacker: Sendable {
     /// `containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`
     /// (`data.count == superBlockSize`), and it is what refuses the truncated artefact
     /// today. MEASURED: weakening the guard below to `size >= 0` and running
-    /// `swift test --filter ImageRootfsUnpackerTests` leaves all 5 tests passing, and the
+    /// `swift test --filter ImageRootfsUnpackerTests` leaves every test passing, and the
     /// error `testAStagedFileWithNoReadableSuperblockIsNotPromoted` observes becomes
     /// `could not read 1024 bytes of superblock from ... at offset 1024` -- the fork guard,
     /// not this one. That guard goes out with the volume-label work, so no test in this
     /// suite can distinguish a live size check from a dead one until the pointer moves.
+    /// After the bump the fixture's 1536-byte artefact reaches upstream's nil-check as a
+    /// 512-byte `Data`, upstream lets it through, and this check becomes the only thing
+    /// left -- so weakening it should then fail
+    /// `testAStagedFileWithNoReadableSuperblockIsNotPromoted`, and Task 12 should confirm
+    /// that it does.
     private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
         let size = try FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64
         guard let size, size >= capacityInBytes else {
