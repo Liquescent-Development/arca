@@ -558,15 +558,31 @@ public struct ImageRootfsUnpacker: Sendable {
     /// `EXT4Unpacker` swallows a failing `close()`, so `unpack` returning is not proof the
     /// filesystem is complete. Opening it is — but only with the size check below.
     ///
-    /// **Why the size check is not belt-and-braces.** Task 4 restored
+    /// **The size check is required because the load is unbounded — not because the magic
+    /// number covers most cases.** Task 4 restored
     /// `ContainerizationEXT4/EXT4+Reader.swift` to upstream, which inlines the superblock
-    /// read as `guard let data = try? self.handle.read(upToCount: superBlockSize) else`.
-    /// It checks only that the read did not throw, so a SHORT read reaches
-    /// `loadLittleEndian(as: EXT4.SuperBlock.self)` on an undersized `Data`. The fork's
-    /// deleted version had `data.count == superBlockSize`; that guard arrived with the
-    /// volume-label work and went out with it. The magic number rejects most garbage, but
-    /// a truncated file whose `s_magic` survives is exactly the artefact this function
-    /// exists to catch, so opening it alone is not enough.
+    /// read as `guard let data = try? self.handle.read(upToCount: superBlockSize) else`,
+    /// checking only that the read did not throw. The fork's deleted
+    /// `EXT4.SuperBlock.read` asserted `data.count == superBlockSize`; that guard arrived
+    /// with the volume-label work and went out with it.
+    ///
+    /// On a short read, `EXT4+Reader.swift:59-61` reaches
+    /// `data.withUnsafeBytes { $0.loadLittleEndian(as: EXT4.SuperBlock.self) }` on an
+    /// undersized buffer. `UnsafeRawBufferPointer.load` bounds-checks with
+    /// `_debugPrecondition`, which is `@inlinable` and so evaluated in the *client's*
+    /// build configuration: **a release build compiles the check out and reads
+    /// `MemoryLayout<EXT4.SuperBlock>.size` bytes past the end**; a debug build traps. A
+    /// file shorter than the 1024-byte superblock offset yields a zero-count `Data` whose
+    /// base address may be nil.
+    ///
+    /// The `s_magic` check at `:62` runs *after* that load, so it is no defence at all —
+    /// the out-of-bounds read has already happened, whether or not the magic survived.
+    /// Do not weaken the size assertion on the theory that magic narrows the window.
+    ///
+    /// Nor could re-adding the fork's guard have closed the class: `:123`, `:141`, `:156`
+    /// and `:227` read group descriptors, inodes and data blocks with the same unchecked
+    /// pattern, all of it upstream. Asserting the file's size at the caller, before the
+    /// reader is constructed at all, is the right place for this.
     private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
         let size = try FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64
         guard let size, size >= capacityInBytes else {
@@ -577,7 +593,7 @@ public struct ImageRootfsUnpacker: Sendable {
                     + "promote it into the image cache"
             )
         }
-        _ = try EXT4.Reader(blockPath: FilePath(path.path))
+        _ = try EXT4.EXT4Reader(blockDevice: FilePath(path.path))
     }
 
     /// `rename(2)` rather than `FileManager.moveItem`, and the difference is not stylistic:
@@ -604,7 +620,7 @@ public struct ImageRootfsUnpacker: Sendable {
 #endif
 ```
 
-Check `EXT4.Reader`'s real initialiser label before running — if it is not `blockPath:`, use whatever `Tests/ArcaEngineTests/LayerCacheRoleTests.swift:958` used before deletion.
+The reader's type and label are confirmed, not guessed: `EXT4.EXT4Reader(blockDevice: FilePath)`, declared at `ContainerizationEXT4/EXT4+Reader.swift:44` inside `extension EXT4`, and called that way at `Tests/ContainerizationEXT4Tests/TestEXT4Format.swift:150`. There is no `EXT4.Reader` and no `blockPath:` label — an earlier draft of this plan used both and would not have compiled.
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
