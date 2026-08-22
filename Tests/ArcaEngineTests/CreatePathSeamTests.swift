@@ -43,14 +43,25 @@ final class CreatePathSeamTests: XCTestCase {
     ///
     /// The count is over the whole file including comments, so prose that spells
     /// `reapOrphanedStagingFiles()` with its parentheses fails this test. The comment at the
-    /// call site therefore refers to "the reaper" instead. Deliberate, and the same trade
-    /// `testTheContainersDirectoryIsDerivedInExactlyOnePlace` already makes.
+    /// call site therefore spells the symbol bare, without parentheses. Deliberate, and the
+    /// same trade `testTheContainersDirectoryIsDerivedInExactlyOnePlace` already makes.
+    ///
+    /// **The two assertions therefore match different strings, and that is the point.** That
+    /// bare-spelt comment sits *inside* the `initialize()` window the second assertion scans.
+    /// If the second assertion also accepted the bare spelling, one edit that deleted the call
+    /// and tidied the comment to the parenthesised form would leave the whole-file count at 1
+    /// and the window still containing the string -- both assertions green, and the reaper
+    /// never called. The second assertion so requires the receiver as well, which only a call
+    /// can supply and prose about the symbol cannot. The count stays over the bare spelling so
+    /// that a second sweep added under any other receiver -- `rootfsUnpacker.` is the one on
+    /// the unpack path -- still trips it.
     func testTheStagingReaperIsCalledExactlyOnceAndFromInitialize() throws {
         let source = try BridgeSources.containerManager()
-        let call = "reapOrphanedStagingFiles()"
+        let anySweep = "reapOrphanedStagingFiles()"
+        let call = "unpacker.reapOrphanedStagingFiles()"
 
         XCTAssertEqual(
-            source.components(separatedBy: call).count - 1, 1,
+            source.components(separatedBy: anySweep).count - 1, 1,
             "the staging reaper must be called exactly once in this file: zero means "
                 + "orphaned staging files accumulate one full rootfs per crash forever, and "
                 + "more than once means something sweeps outside initialize(), which would "
@@ -60,7 +71,8 @@ final class CreatePathSeamTests: XCTestCase {
         XCTAssertTrue(
             try Self.initializeBody(of: source).contains(call),
             "the one call to the staging reaper must be inside initialize(), the only point "
-                + "in a process with no in-flight unpack to destroy"
+                + "in a process with no in-flight unpack to destroy, and it must be spelt "
+                + "with its receiver so that a comment naming the symbol cannot satisfy this"
         )
     }
 

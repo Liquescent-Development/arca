@@ -148,7 +148,6 @@ public actor ContainerManager {
         let stderrWriter: Writer
         let stdinReader: ChannelReader?
         let mounts: [Containerization.Mount]
-        let overlayConfig: Containerization.OverlayFSConfig?  // OverlayFS configuration for layered images
         let networkMode: String?  // "vmnet" or "bridge"/nil
         let labels: [String: String]  // Container labels for configuration
 
@@ -1907,7 +1906,6 @@ public actor ContainerManager {
                     stderrWriter: stderrBroadcast,
                     stdinReader: nil,  // Not attached
                     mounts: mounts,
-                    overlayConfig: nil,  // Will be unpacked in createNativeContainer
                     networkMode: networkMode,
                     labels: labels ?? [:],
                     memory: memory,
@@ -2174,7 +2172,6 @@ public actor ContainerManager {
                     stderrWriter: stderrBroadcast,
                     stdinReader: attachInfo?.handles.stdin,  // Include stdin if attached
                     mounts: config.mounts,
-                    overlayConfig: nil,  // Will be unpacked in createNativeContainer
                     networkMode: info.hostConfig.networkMode,
                     labels: info.config.labels,
                     // Memory Limits (Phase 5 - Task 5.1)
@@ -2308,7 +2305,6 @@ public actor ContainerManager {
                         stderrWriter: stderrBroadcast,
                         stdinReader: nil,  // No stdin for recreated containers
                         mounts: recreatedMounts,
-                        overlayConfig: nil,  // TODO: Wire up from OverlayFSUnpacker (Phase 1)
                         networkMode: info.hostConfig.networkMode,
                         labels: info.config.labels,
                         // Memory Limits (Phase 5 - Task 5.1)
