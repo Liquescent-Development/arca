@@ -41,38 +41,42 @@ final class CreatePathSeamTests: XCTestCase {
     ///   distinct UUID paths, verify, atomic `rename(2)` -- into a corrupt one. That is why
     ///   the whole-file count is asserted and not just the presence inside `initialize()`.
     ///
-    /// The count is over the whole file including comments, so prose that spells
-    /// `reapOrphanedStagingFiles()` with its parentheses fails this test. The comment at the
-    /// call site therefore spells the symbol bare, without parentheses. Deliberate, and the
-    /// same trade `testTheContainersDirectoryIsDerivedInExactlyOnePlace` already makes.
+    /// **Both assertions scan a comment-stripped view, and neither is sound without it.** The
+    /// call-site comment at `ContainerManager.swift:327` names the symbol, and it sits *inside*
+    /// the `initialize()` window the second assertion scans. Against raw text, one edit that
+    /// deleted the call and rewrote that comment to name what it had removed would leave the
+    /// count at 1 and the window still containing the string -- both assertions green, and the
+    /// reaper never called. No choice of searched-for spelling fixes that, because any spelling
+    /// a call can have, a comment can have too. Stripping comments closes the class rather than
+    /// an instance of it, and it lets both assertions share one bare string instead of trading
+    /// holes between two.
     ///
-    /// **The two assertions therefore match different strings, and that is the point.** That
-    /// bare-spelt comment sits *inside* the `initialize()` window the second assertion scans.
-    /// If the second assertion also accepted the bare spelling, one edit that deleted the call
-    /// and tidied the comment to the parenthesised form would leave the whole-file count at 1
-    /// and the window still containing the string -- both assertions green, and the reaper
-    /// never called. The second assertion so requires the receiver as well, which only a call
-    /// can supply and prose about the symbol cannot. The count stays over the bare spelling so
-    /// that a second sweep added under any other receiver -- `rootfsUnpacker.` is the one on
-    /// the unpack path -- still trips it.
+    /// **`strippingComments` is a lexer's approximation, not a parser.** It is unaware of
+    /// string literals, so a `//` or `/*` inside one would be taken as the start of a comment
+    /// and the rest of that line -- or block -- dropped, which could in principle hide a call
+    /// that followed it. Measured at `0afac32` by scanning every literal in the file: none
+    /// contains either sequence, and the file's only two `://` occurrences are themselves
+    /// inside `//` comments (`:2951`, `:2970`). That is a property of the file as it stands,
+    /// not a guarantee about it forever; if it stops holding, this guard weakens quietly
+    /// rather than going red.
     func testTheStagingReaperIsCalledExactlyOnceAndFromInitialize() throws {
         let source = try BridgeSources.containerManager()
-        let anySweep = "reapOrphanedStagingFiles()"
-        let call = "unpacker.reapOrphanedStagingFiles()"
+        let call = "reapOrphanedStagingFiles()"
 
         XCTAssertEqual(
-            source.components(separatedBy: anySweep).count - 1, 1,
-            "the staging reaper must be called exactly once in this file: zero means "
-                + "orphaned staging files accumulate one full rootfs per crash forever, and "
-                + "more than once means something sweeps outside initialize(), which would "
-                + "delete a concurrent unpack's in-flight staging file"
+            Self.strippingComments(source).components(separatedBy: call).count - 1, 1,
+            "exactly one occurrence of the staging reaper must survive comment-stripping in "
+                + "this file: zero means orphaned staging files accumulate one full rootfs per "
+                + "crash forever, and more than once means something sweeps outside "
+                + "initialize(), which would delete a concurrent unpack's in-flight staging "
+                + "file. This counts text and not execution -- an occurrence in unreachable "
+                + "code would still count"
         )
 
         XCTAssertTrue(
-            try Self.initializeBody(of: source).contains(call),
-            "the one call to the staging reaper must be inside initialize(), the only point "
-                + "in a process with no in-flight unpack to destroy, and it must be spelt "
-                + "with its receiver so that a comment naming the symbol cannot satisfy this"
+            try Self.strippingComments(String(Self.initializeBody(of: source))).contains(call),
+            "the one surviving occurrence of the staging reaper must be inside initialize(), "
+                + "the only point in a process with no in-flight unpack to destroy"
         )
     }
 
@@ -84,6 +88,10 @@ final class CreatePathSeamTests: XCTestCase {
     /// the second assertion above exists to catch. A brace-counting parse would be more
     /// exact and more to go wrong; if either marker stops matching this throws, and the test
     /// goes red rather than quietly checking the whole file.
+    ///
+    /// **Takes raw source, and must.** Its closing marker is a `///` doc comment, so cutting
+    /// the window has to happen before comments are stripped, not after. The caller strips the
+    /// window this returns.
     private static func initializeBody(of source: String) throws -> Substring {
         let opening = "    public func initialize() async throws {"
         let next = "    /// Load persisted containers from StateStore and reconcile"
@@ -96,6 +104,57 @@ final class CreatePathSeamTests: XCTestCase {
             "the member after initialize() is no longer the one this guard bounds against"
         )
         return source[start.upperBound..<end.lowerBound]
+    }
+
+    /// `source` with `//` line comments and `/* */` block comments removed, newlines kept so
+    /// that nothing on separate lines is joined into a match that was not there.
+    ///
+    /// Lexical, not syntactic. It tracks block-comment nesting, which Swift permits, but it
+    /// does not know about string literals -- see the caller's doc comment for what that costs
+    /// and why it is safe against `ContainerManager.swift` as it stands. An unterminated block
+    /// comment would swallow the remainder, and cannot occur here: the file this scans is also
+    /// compiled by this target, so an unterminated block would fail the build first.
+    private static func strippingComments(_ source: String) -> String {
+        let characters = Array(source)
+        var stripped = String()
+        stripped.reserveCapacity(characters.count)
+        var index = 0
+        var blockDepth = 0
+
+        while index < characters.count {
+            let character = characters[index]
+            let following = index + 1 < characters.count ? characters[index + 1] : nil
+
+            if blockDepth > 0 {
+                if character == "/", following == "*" {
+                    blockDepth += 1
+                    index += 2
+                } else if character == "*", following == "/" {
+                    blockDepth -= 1
+                    index += 2
+                } else {
+                    if character == "\n" { stripped.append(character) }
+                    index += 1
+                }
+                continue
+            }
+
+            if character == "/", following == "*" {
+                blockDepth += 1
+                index += 2
+                continue
+            }
+
+            if character == "/", following == "/" {
+                while index < characters.count, characters[index] != "\n" { index += 1 }
+                continue
+            }
+
+            stripped.append(character)
+            index += 1
+        }
+
+        return stripped
     }
 
     // MARK: - The writable upper layer
