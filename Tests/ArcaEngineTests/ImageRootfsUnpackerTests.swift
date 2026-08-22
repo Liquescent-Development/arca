@@ -465,10 +465,13 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// arm64 fixture): all three passed on `unsupported: "platform linux/amd64"`, having
     /// never run the mechanism they exist to pin.
     ///
-    /// Both halves are checked, as `LayerCacheRoleTests` does. The wrapper proves the
-    /// failure happened *inside* the per-layer unpack loop, so the formatter existed and the
-    /// staging file was already on disk; the cause proves it is Task 6's archive refusal
-    /// rather than some other mid-unpack failure.
+    /// **Both halves are checked, and each rules out a different way of passing wrongly.**
+    /// The wrapper proves the failure happened *inside* the per-layer unpack loop, so the
+    /// formatter existed and the staging file was already on disk; the cause proves it is
+    /// Task 6's archive refusal rather than some other mid-unpack failure. Either one alone
+    /// leaves the other unconstrained -- the wrapper alone admits any mid-unpack error, and
+    /// the cause alone admits the archive refusal raised from somewhere that never built a
+    /// slot.
     private static func assertIsTheLayerRefusal(
         _ error: Error, file: StaticString = #filePath, line: UInt = #line
     ) {
@@ -541,7 +544,9 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// concludes the other three were unaffected.
     ///
     /// Naming the same platform the fixture writes removes both the shim dependence and the
-    /// vacuity. `LayerCacheRoleTests` already spells it this way (`:238`, `:329`, `:404`).
+    /// vacuity. The convention came from `LayerCacheRoleTests`, which named the platform
+    /// explicitly at each of its fixtures; that file was deleted in `2d1f8db`, so this suite
+    /// is now the only place the convention lives and it is stated here rather than cited.
     private static let platform = SystemPlatform.linuxArm.ociPlatform()
 
     /// A platform the fixture image does NOT carry, for the cache-key test below.
@@ -555,10 +560,12 @@ final class ImageRootfsUnpackerTests: XCTestCase {
 
     /// One directory per process, removed whole in `tearDown`.
     ///
-    /// The fixtures are `static` because the tests reach them as `Self.fixture*`, so they
-    /// cannot hang their scratch off an instance property the way `LayerCacheRoleTests`
-    /// does. A per-fixture subdirectory under one root keeps two fixtures in the same test
-    /// from sharing an image store, which would make the second load see the first's image.
+    /// The fixtures are `static` because the tests reach them as `Self.fixture*`, and a
+    /// `static` member has no `self` to hang its scratch off -- so the root is `static` too
+    /// and the cleanup is the `class` `tearDown` override rather than the instance one, which
+    /// is the whole reason this is not a per-instance property. A per-fixture subdirectory
+    /// under one root keeps two fixtures in the same test from sharing an image store, which
+    /// would make the second load see the first's image.
     private static let scratchRoot = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("arca-image-rootfs-unpacker-tests-\(UUID().uuidString)")
 
