@@ -490,13 +490,21 @@ final class ContainerBridgePathsTests: XCTestCase {
         )
     }
 
-    /// The ContainerBridge source both tests above read.
+    /// The ContainerBridge source the guard above reads.
     ///
-    /// The derivation lives in `BridgeSources` because `CreatePathSeamTests` reads the same
-    /// file, and two spellings of it would be free to drift -- which for a text guard shows
-    /// up as the guard silently passing over a file it never opened. A missing or
-    /// unreadable file throws and fails the test and is never skipped; these two are
-    /// already the weaker half of this task's evidence.
+    /// The derivation lives in `BridgeSources`, which used to be shared with
+    /// `CreatePathSeamTests`. It is not any more: that file's reaper guard was a source-text
+    /// counter too, was defeated five times running -- by a comment, by a comment naming a
+    /// receiver, by `//` inside a string literal, by a literal supplying the token, and by
+    /// string interpolation -- and in `23027c4` it was replaced by a test that runs the code.
+    /// `BridgeSources` therefore has one consumer today. It stays there rather than being
+    /// inlined here because the failure it prevents is not about sharing: a guard that
+    /// resolves the repo root wrongly reads a file that is not the one it names, which for a
+    /// text guard is indistinguishable from passing. A missing or unreadable file throws and
+    /// fails the test and is never skipped.
+    ///
+    /// This guard is the weaker half of its own evidence, and knowingly so -- see the
+    /// unpinned hole recorded on the test above.
     private static func containerManagerSource() throws -> String {
         try BridgeSources.containerManager()
     }

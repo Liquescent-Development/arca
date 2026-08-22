@@ -3,12 +3,14 @@ import Foundation
 import Logging
 @testable import ArcaEngine
 
-/// The ContainerBridge sources this target's source-text guards read.
+/// The ContainerBridge source this target's one remaining source-text guard reads.
 ///
-/// Shared rather than copied into each guard's own file. Two spellings of "find the repo
-/// root from `#filePath`" would be free to drift, and the way that drifts is that one
-/// guard silently starts reading a file that is not the one it names -- which for a text
-/// guard is indistinguishable from the guard passing.
+/// **One consumer, not several.** This was shared between two guards until `23027c4`, when
+/// `CreatePathSeamTests`'s reaper guard -- a source-text counter that five successive
+/// instruments failed to make sound -- was replaced by a test that runs the code.
+/// `ContainerBridgePathsTests`.`testTheContainersDirectoryIsDerivedInExactlyOnePlace` is what
+/// is left. It stays here rather than being inlined into that file so the next text guard, if
+/// there is ever one, does not spell the repo-root walk a second time and drift.
 ///
 /// Located from `#filePath` rather than from the test bundle, because the bundle holds no
 /// sources. A missing or unreadable file throws and fails the test; it is never skipped. A
