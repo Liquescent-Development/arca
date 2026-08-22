@@ -368,6 +368,51 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         )
     }
 
+    /// An unpack leaves a concurrent call's in-flight staging file alone.
+    ///
+    /// **This is the corruption half of the sweep's contract, and it is the half a
+    /// source-text guard was carrying until this commit.** The reaper must run exactly once,
+    /// when the cache root is opened, and never on the unpack path. Two concurrent unpacks
+    /// stage to distinct UUID paths and both finish safely -- each artefact is verified before
+    /// promotion and `rename(2)` is atomic, so the loser's work is simply replaced. Sweep
+    /// before each unpack instead and the second call deletes the first's in-flight file out
+    /// from under it, turning a race that is safe today into a corrupt one.
+    ///
+    /// The staging file created here is what a *concurrent* call would have on disk mid-flight.
+    /// It is indistinguishable on disk from the orphan in the test above; that is exactly why
+    /// the sweep cannot be moved onto this path, and why the two tests assert opposite fates
+    /// for the same kind of file.
+    ///
+    /// The slot assertion is not decoration: without it, an unpack that failed before it
+    /// touched anything would satisfy the survival assertion having never run the path.
+    func testAnUnpackSparesAConcurrentCallsStagingFile() async throws {
+        let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
+        let directory = slot.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let inFlight = directory.appendingPathComponent("rootfs.ext4.staging-\(UUID().uuidString)")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: inFlight.path, contents: Data(repeating: 0, count: 4096)
+            ),
+            "the fixture must actually create the staging file it is about to assert on"
+        )
+
+        _ = try await unpacker.rootfs(for: image, platform: Self.platform)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: slot.path),
+            "the unpack must have promoted a slot, or it never ran the path under test"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: inFlight.path),
+            "the unpack path swept the cache root and destroyed a staging file it did not "
+                + "own; run concurrently that is another call's in-flight rootfs being "
+                + "deleted mid-write, which is corruption rather than accumulation"
+        )
+    }
+
     /// An unreadable directory stops the sweep loudly rather than being walked past.
     ///
     /// **MEASURED that nothing else pins this**: reducing the enumerator's `errorHandler` to

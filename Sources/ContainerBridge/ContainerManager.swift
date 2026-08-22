@@ -315,34 +315,62 @@ public actor ContainerManager {
         )
 
         // One composed rootfs per image, shared by every container from it.
-        let unpacker = ImageRootfsUnpacker(
-            cacheRoot: imageRootfsCachePath,
+        rootfsUnpacker = try Self.openImageRootfsCache(
+            at: imageRootfsCachePath,
             capacityInBytes: Self.imageRootfsCapacityInBytes,
             logger: logger
         )
-
-        // Sweep the cache root once, here, and deliberately NOT before each unpack: two
-        // concurrent unpacks stage to distinct UUID paths and both complete safely, so a
-        // per-unpack sweep would delete a concurrent call's in-flight file and turn a safe
-        // race into a corrupt one. See the doc comment on `reapOrphanedStagingFiles`.
-        //
-        // WHY HERE IS THE SAFE POINT, and the bound on that claim: within this process
-        // `initialize()` runs before any unpack can start, so there is no in-flight work
-        // to destroy. That is process-local. Two `arca-engine` processes over one state
-        // root -- a stale engine and a new one -- would have the second's sweep delete the
-        // first's in-flight staging files, which is the corrupt race this ordering avoids
-        // everywhere else. Nothing in this plan runs two engines on one state root, and
-        // nothing here enforces that.
-        //
-        // Not caught: an unreadable cache root is a broken state root, and starting over it
-        // would leave every later unpack writing somewhere the engine cannot audit.
-        try unpacker.reapOrphanedStagingFiles()
-        rootfsUnpacker = unpacker
 
         logger.info("ContainerManager initialized successfully")
 
         // Load persisted container state and reconcile
         try await loadPersistedState()
+    }
+
+    /// Opens the image rootfs cache: builds the unpacker over `cacheRoot` and sweeps it once.
+    ///
+    /// **Separate from `initialize()` so that it can be run.** `initialize()` builds a
+    /// `Kernel` and a `Containerization.VmnetNetwork` before it reaches this, so it needs a
+    /// kernel image and a VM; nothing in the test target has either. Preparing the cache root
+    /// has nothing to do with either of those, and while the two were welded together the
+    /// only available check on this sweep was a guard that read this file as text and counted
+    /// a string. That instrument was defeated five times running -- by a comment, by a
+    /// comment naming a receiver, by `//` inside a string literal, by a literal supplying the
+    /// token, and by string interpolation -- because approximating a compiler in a test is
+    /// the wrong shape for the claim. Split apart, the claim is just a function's behaviour.
+    ///
+    /// **The sweep happens here, once, and deliberately NOT before each unpack.** Two
+    /// concurrent unpacks stage to distinct UUID paths and both complete safely, so a
+    /// per-unpack sweep would delete a concurrent call's in-flight staging file and turn a
+    /// race that is safe today into a corrupt one. See the doc comment on
+    /// `ImageRootfsUnpacker.reapOrphanedStagingFiles`.
+    ///
+    /// **WHY HERE IS THE SAFE POINT, and the bound on that claim:** within this process
+    /// `initialize()` runs before any unpack can start, so there is no in-flight work to
+    /// destroy. That is process-local. Two `arca-engine` processes over one state root -- a
+    /// stale engine and a new one -- would have the second's sweep delete the first's
+    /// in-flight staging files, which is the corrupt race this ordering avoids everywhere
+    /// else. Nothing in this plan runs two engines on one state root, and nothing here
+    /// enforces that.
+    ///
+    /// Not caught: an unreadable cache root is a broken state root, and starting over it
+    /// would leave every later unpack writing somewhere the engine cannot audit -- so the
+    /// sweep's error propagates and initialisation fails.
+    ///
+    /// `static` because it reads no actor state: the three things it needs are its
+    /// arguments. That also lets a test call it without an actor, a kernel or a VM.
+    static func openImageRootfsCache(
+        at cacheRoot: URL,
+        capacityInBytes: UInt64,
+        logger: Logger
+    ) throws -> ImageRootfsUnpacker {
+        let unpacker = ImageRootfsUnpacker(
+            cacheRoot: cacheRoot,
+            capacityInBytes: capacityInBytes,
+            logger: logger
+        )
+        try unpacker.reapOrphanedStagingFiles()
+        return unpacker
     }
 
     /// Load persisted containers from StateStore and reconcile with actual state

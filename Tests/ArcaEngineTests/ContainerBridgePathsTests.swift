@@ -471,30 +471,18 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// the test above is for, and neither test covers the other's gap at
     /// runtime.
     ///
-    /// It counts over `SwiftSource.codeWithFlattenedLiterals`, not over raw
-    /// text, and that reverses an earlier decision here deliberately. The old
-    /// raw count also forbade the token in a *comment*, which read as a second
-    /// prohibition but was really a false-RED generator -- and it carried a
-    /// false PASS with it, which is the direction that matters: delete the real
-    /// derivation, leave a doc comment quoting the token, and the count is
-    /// still one. `CreatePathSeamTests` was rebuilt three times over exactly
-    /// that shape of hole. Losing the prose prohibition costs a rule no reader
-    /// could discover without opening this test; keeping it cost a silent pass.
-    ///
-    /// Literal *text* is kept, unlike the sibling guard
-    /// `CreatePathSeamTests`.`testTheStagingReaperIsCalledExactlyOnceAndFromInitialize`,
-    /// which reads this same file through `SwiftSource.codeOnly`. This token is
-    /// itself a literal: strip `"containers"` and this stops telling the
-    /// containers directory from any other. The flattening in
-    /// `codeWithFlattenedLiterals` is what keeps that from reopening the hole
-    /// -- a raw string spelling the token verbatim re-emits without its
-    /// interior quotes and matches nothing.
+    /// It counts over the whole file, comments included, so a doc comment that
+    /// *quotes* this token fails the suite. That is why the comment on
+    /// `containerDirectory(in:dockerID:)` describes the join instead of spelling
+    /// it, and a future reader who does not know that will be puzzled by a red
+    /// suite after writing prose. Left as-is rather than narrowed to code: a
+    /// counter that skipped comments would stop forbidding the wrong store in a
+    /// comment, which is the other half of what these two tests are for.
     func testTheContainersDirectoryIsDerivedInExactlyOnePlace() throws {
         let source = try Self.containerManagerSource()
 
         XCTAssertEqual(
-            SwiftSource.codeWithFlattenedLiterals(source)
-                .components(separatedBy: #".appendingPathComponent("containers")"#).count - 1,
+            source.components(separatedBy: #".appendingPathComponent("containers")"#).count - 1,
             1,
             "the <store>/containers/<id> join must be derived once, in "
                 + "containerDirectory(in:dockerID:), and reached by every caller "

@@ -1,114 +1,114 @@
 import Containerization
+import ContainerizationOCI
 import Foundation
+import Logging
 import XCTest
 @testable import ContainerBridge
 
 /// Two seams on the create path that the rest of the suite cannot see.
 ///
-/// READ THIS BEFORE TRUSTING THE FIRST TEST BELOW. It reads
-/// `Sources/ContainerBridge/ContainerManager.swift` as text. It executes none of it and
-/// proves nothing about runtime. It is text because the runtime is out of reach:
-/// `ContainerManager.initialize()` builds a `Kernel` and a `Containerization.VmnetNetwork`,
-/// so it needs a kernel image and a VM and this target has neither. That is the same reason
-/// `ContainerBridgePathsTests` gives for its own two source-text guards, and this file uses
-/// the same reader.
+/// **Both tests below run the code they are about. Neither reads a source file.** That is
+/// worth stating because until this commit the first one did read source text and count a
+/// string, and it was defeated five times in a row: by a comment naming the symbol, by a
+/// comment naming it with its receiver, by `//` inside a string literal eating the line after
+/// it, by a string literal supplying the token, and by string interpolation smuggling quotes
+/// past a tokenizer. Each repair closed one spelling and left the class open, and the fifth
+/// left a sibling guard weaker than it had been before. The instrument was the defect:
+/// approximating a compiler well enough to say "this is code" is not something a test should
+/// be doing.
 ///
-/// The second test is not a text guard. `ContainerManager.writableLayer(at:sizeInBytes:)` is
-/// `internal`, so it can be called directly, and the mutation it has to catch lives inside
-/// the function. What it does NOT prove is that `createNativeContainer` calls it -- nothing
-/// in this repository can prove that, and Gas Can's live `Create` test is the instrument
-/// that can.
+/// What made a text guard look necessary was a design problem in the production code, not a
+/// missing test technique. `ContainerManager.initialize()` builds a `Kernel` and a
+/// `Containerization.VmnetNetwork`, so it needs a kernel image and a VM that this target does
+/// not have -- and preparing the image rootfs cache was welded to it, out of reach for that
+/// reason alone. `ContainerManager.openImageRootfsCache(at:capacityInBytes:logger:)` is that
+/// preparation on its own, so the first test simply calls it.
+///
+/// `ContainerManager.writableLayer(at:sizeInBytes:)` is `internal` and was always callable
+/// directly, and the mutation the second test has to catch lives inside the function. What it
+/// does NOT prove is that `createNativeContainer` calls it -- nothing in this repository can
+/// prove that, and Gas Can's live `Create` test is the instrument that can.
 final class CreatePathSeamTests: XCTestCase {
 
-    // MARK: - The staging reaper's only production caller
+    // MARK: - Opening the image rootfs cache
 
-    /// `initialize()` sweeps orphaned staging files exactly once, and nothing else does.
+    /// Opening the cache sweeps the orphans a crash left, spares promoted slots, and hands
+    /// back an unpacker rooted where it swept.
     ///
-    /// **MEASURED that nothing else catches this:** with
-    /// `try unpacker.reapOrphanedStagingFiles()` deleted from `initialize()` and a clean
-    /// `.build`, `swift test --filter ArcaEngineTests` reported `Executed 260 tests, with 0
-    /// failures`. `ImageRootfsUnpackerTests` drives the reaper directly, so the reaper is
-    /// tested; its only caller was not, and deleting the call was silent.
+    /// **Why this is the claim and not "the reaper is called from initialize()".** Nothing
+    /// else assigns `ContainerManager.rootfsUnpacker`, and `createNativeContainer` reads it
+    /// through a `guard let` that throws `.notInitialized`, so an `initialize()` that stopped
+    /// calling this seam could not create a container at all. That half needs no test; it is
+    /// enforced by the optional. What is not enforced anywhere else is what the seam *does*,
+    /// which is this test.
     ///
-    /// **Both halves of the assertion are load-bearing, and they guard opposite mistakes.**
-    /// A staging file is left behind by the failure that runs no cleanup at all -- a crash,
-    /// a `SIGKILL`, a power loss between the unpack and the `rename`. Each is a fully sized
-    /// rootfs, gigabytes in production, under a UUID no later call will choose again.
+    /// **The three assertions guard three different mistakes.**
     ///
-    /// - **Not fewer.** Drop the call and they accumulate one per crash, forever.
-    /// - **Not more.** Sweeping before each unpack would delete a concurrent call's
-    ///   in-flight staging file out from under it, turning a race that is safe today --
-    ///   distinct UUID paths, verify, atomic `rename(2)` -- into a corrupt one. That is why
-    ///   the whole-file count is asserted and not just the presence inside `initialize()`.
+    /// - **The orphan must go.** A staging file is what a failure that runs no cleanup leaves
+    ///   behind -- a crash, a `SIGKILL`, a power loss between the unpack and the `rename`.
+    ///   Each is a fully sized rootfs, gigabytes in production, under a UUID no later call
+    ///   will choose again, so they accumulate one per crash forever. Drop the sweep from the
+    ///   seam and this assertion is the only thing that notices.
+    /// - **The promoted slot must survive.** A sweep that took the whole directory, or that
+    ///   matched `rootfs.ext4` as a prefix, would satisfy the first assertion while deleting
+    ///   every cached image on the machine.
+    /// - **The returned unpacker must be rooted at the cache root that was swept.** A seam
+    ///   that swept one root and returned an unpacker over another would pass the first two
+    ///   and leave every real unpack writing somewhere nothing ever sweeps.
     ///
-    /// **Both assertions scan `SwiftSource.codeOnly`, and neither is sound over raw text.**
-    /// Two different things can supply this token without a call existing. The call-site
-    /// comment at `ContainerManager.swift:327` names the symbol and sits *inside* the
-    /// `initialize()` window the second assertion scans, so an edit that deleted the call and
-    /// rewrote that comment to name what it had removed would leave both assertions green. So
-    /// would replacing the call with `logger.info("reapOrphanedStagingFiles() moved")` -- a
-    /// string literal, measured green at `0e9dad1`. No choice of searched-for spelling fixes
-    /// either, because any spelling a call can have, a comment or a literal can have too.
-    /// Counting only code closes the class rather than one shape of it.
-    ///
-    /// **A comment-only strip is not enough, and the reason is the count.** Stripping is a
-    /// shrinking transform, so for the *presence* check its failure direction is a false RED.
-    /// For an equality-to-one it is not: over-stripping carries a failing 2 down to a passing
-    /// 1. Measured at `0e9dad1` with a comment-only stripper, a real second sweep written
-    /// `if config.image.reference.hasPrefix("oci://") { try rootfsUnpacker.reapOrphanedStagingFiles() }`
-    /// passed, because the `//` inside `"oci://"` ate the rest of the line and took the second
-    /// call with it. `codeOnly` is literal-aware, so that `//` is text inside a literal and
-    /// nothing is eaten.
-    ///
-    /// The sibling guard `ContainerBridgePathsTests`.`testTheContainersDirectoryIsDerivedInExactlyOnePlace`
-    /// counts a token in this same file and had the same two holes; it uses
-    /// `SwiftSource.codeWithFlattenedLiterals` because its token is a literal. Change one of
-    /// these two and look at the other.
-    func testTheStagingReaperIsCalledExactlyOnceAndFromInitialize() throws {
-        let source = try BridgeSources.containerManager()
-        let call = "reapOrphanedStagingFiles()"
+    /// The opposite mistake -- sweeping *before each unpack*, which would delete a concurrent
+    /// call's in-flight staging file and turn a safe race into a corrupt one -- cannot be seen
+    /// from here, because it is a property of the unpack path rather than of this seam. It is
+    /// pinned by `ImageRootfsUnpackerTests`.`testAnUnpackSparesAConcurrentCallsStagingFile`.
+    func testOpeningTheCacheSweepsOrphansSparesSlotsAndIsRootedWhereItSwept() throws {
+        let cacheRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arca-cache-seam-\(UUID().uuidString)")
+        let imageDirectory = cacheRoot
+            .appendingPathComponent("sha256-cafebabe")
+            .appendingPathComponent("linux-arm64")
+        try FileManager.default.createDirectory(
+            at: imageDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: cacheRoot) }
 
-        XCTAssertEqual(
-            SwiftSource.codeOnly(source).components(separatedBy: call).count - 1, 1,
-            "exactly one occurrence of the staging reaper must survive in the code of this "
-                + "file, comments and string-literal text excluded: zero means orphaned "
-                + "staging files accumulate one full rootfs per crash forever, and more than "
-                + "once means something sweeps outside initialize(), which would delete a "
-                + "concurrent unpack's in-flight staging file. This counts code text and not "
-                + "execution -- an occurrence in unreachable code would still count"
+        // Exactly what a SIGKILL between the unpack and the rename leaves behind, beside
+        // exactly what a completed unpack leaves behind.
+        let orphan = imageDirectory
+            .appendingPathComponent("rootfs.ext4.staging-\(UUID().uuidString)")
+        let promoted = imageDirectory.appendingPathComponent("rootfs.ext4")
+        for file in [orphan, promoted] {
+            XCTAssertTrue(
+                FileManager.default.createFile(
+                    atPath: file.path, contents: Data(repeating: 0, count: 4096)
+                ),
+                "the fixture must create the file it is about to assert on: \(file.path)"
+            )
+        }
+
+        let unpacker = try ContainerManager.openImageRootfsCache(
+            at: cacheRoot,
+            capacityInBytes: 4096,
+            logger: Logger(label: "arca-engine-tests")
         )
 
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: orphan.path),
+            "opening the cache left a staging file orphaned by a crash in place; each one is "
+                + "a full rootfs and they accumulate one per crash, forever"
+        )
         XCTAssertTrue(
-            try SwiftSource.codeOnly(String(Self.initializeBody(of: source))).contains(call),
-            "the one surviving occurrence of the staging reaper must be inside initialize(), "
-                + "the only point in a process with no in-flight unpack to destroy"
+            FileManager.default.fileExists(atPath: promoted.path),
+            "opening the cache deleted a promoted rootfs, not just the orphan beside it"
         )
-    }
-
-    /// The text of `initialize()`, bounded by its own signature and the next member's doc
-    /// comment.
-    ///
-    /// Bounded rather than "appears somewhere after the signature": `createNativeContainer`
-    /// is also after it, and moving the sweep onto the unpack path is precisely the mistake
-    /// the second assertion above exists to catch. A brace-counting parse would be more
-    /// exact and more to go wrong; if either marker stops matching this throws, and the test
-    /// goes red rather than quietly checking the whole file.
-    ///
-    /// **Takes raw source, and must.** Its closing marker is a `///` doc comment, so the
-    /// window has to be cut before comments are stripped, not after. The caller passes the
-    /// window this returns through `SwiftSource.codeOnly`.
-    private static func initializeBody(of source: String) throws -> Substring {
-        let opening = "    public func initialize() async throws {"
-        let next = "    /// Load persisted containers from StateStore and reconcile"
-
-        let start = try XCTUnwrap(
-            source.range(of: opening), "initialize()'s signature is no longer spelt \(opening)"
+        XCTAssertEqual(
+            unpacker.rootfsPath(
+                forImageDigest: "sha256:cafebabe",
+                platform: SystemPlatform.linuxArm.ociPlatform()
+            ),
+            promoted,
+            "the unpacker handed back must be rooted at the cache root that was swept, or "
+                + "every real unpack writes somewhere nothing ever sweeps"
         )
-        let end = try XCTUnwrap(
-            source.range(of: next, range: start.upperBound..<source.endIndex),
-            "the member after initialize() is no longer the one this guard bounds against"
-        )
-        return source[start.upperBound..<end.lowerBound]
     }
 
     // MARK: - The writable upper layer
