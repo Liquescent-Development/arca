@@ -68,7 +68,7 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             XCTFail("an unreadable staged filesystem was expected to be refused")
         } catch {
             XCTAssertTrue(
-                "\(error)".contains("below the 2097152-byte floor"),
+                "\(error)".contains("below the \(Self.capacityInBytes)-byte floor"),
                 "the refusal must be `verifyReadable`'s size assertion and not some earlier "
                     + "error, or this test is not about verification-before-promotion at "
                     + "all. Got: \(error)"
@@ -80,6 +80,44 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             "an artefact with no readable superblock was promoted into the cache slot"
         )
         _ = cacheRoot
+    }
+
+    /// Mechanism 3, second half: a correctly sized artefact that is not an ext4 at all is
+    /// not promoted.
+    ///
+    /// **This is what the `EXT4.EXT4Reader` line in `verifyReadable` actually buys, and
+    /// nothing else here pinned it.** MEASURED: deleting that line while leaving the size
+    /// guard intact left all eight other tests passing, because the only fixture that
+    /// reached `verifyReadable` in a bad state was truncated to 1536 bytes -- far below the
+    /// floor -- so the size guard always fired first and the reader was never the check that
+    /// refused.
+    ///
+    /// It pins the reader for what it does rather than for what an earlier version of
+    /// `verifyReadable`'s doc comment claimed it did. MEASURED against the real promoted
+    /// artefact, `EXT4.EXT4Reader` ACCEPTS that filesystem truncated to 1.56% of its length
+    /// and accepts it with a megabyte of zeros over its metadata region; it refuses an
+    /// artefact with no valid superblock magic. So the property is "not an ext4 at all", not
+    /// "incomplete".
+    func testACorrectlySizedStagedFileThatIsNotAnExt4IsNotPromoted() async throws {
+        let (unpacker, image, _) = try await Self.fixtureWhoseStagedFileIsNotAnExt4()
+        let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
+
+        do {
+            _ = try await unpacker.rootfs(for: image, platform: Self.platform)
+            XCTFail("a staged file that is not an ext4 was expected to be refused")
+        } catch {
+            XCTAssertTrue(
+                "\(error)".contains("not a valid EXT4 superblock"),
+                "the refusal must come from the READER, not from the size guard -- the "
+                    + "artefact is exactly the floor size, so a size-guard failure here "
+                    + "would mean this test is not about the reader at all. Got: \(error)"
+            )
+        }
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: slot.path),
+            "an artefact that is not an ext4 filesystem was promoted into the cache slot"
+        )
     }
 
     /// A second call for the same image reuses the slot instead of unpacking again.
@@ -442,6 +480,27 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         unpacker.willPromote = { staging in
             let handle = try FileHandle(forWritingTo: staging)
             try handle.truncate(atOffset: 1536)
+            try handle.close()
+        }
+        return (unpacker, image, cacheRoot)
+    }
+
+    /// An image that unpacks, wired so the staged file is replaced with exactly
+    /// `capacityInBytes` bytes of zeros before verification.
+    ///
+    /// **The size is the point: it is exactly the floor, so the size guard passes and the
+    /// reader is the only check left.** That is the half of `verifyReadable` the truncating
+    /// fixture above can never reach, since 1536 bytes fails the size guard first.
+    /// MEASURED standalone: `EXT4.EXT4Reader` on 2 MiB of zeros, and on 2 MiB of `0xAB`,
+    /// both give `not a valid EXT4 superblock`.
+    private static func fixtureWhoseStagedFileIsNotAnExt4() async throws
+        -> (ImageRootfsUnpacker, Containerization.Image, URL)
+    {
+        var (unpacker, image, cacheRoot) = try await fixtureThatUnpacksCleanly()
+        unpacker.willPromote = { staging in
+            let handle = try FileHandle(forWritingTo: staging)
+            try handle.truncate(atOffset: 0)
+            try handle.write(contentsOf: Data(repeating: 0, count: Int(capacityInBytes)))
             try handle.close()
         }
         return (unpacker, image, cacheRoot)

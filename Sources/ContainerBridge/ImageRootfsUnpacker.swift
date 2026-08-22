@@ -250,11 +250,47 @@ public struct ImageRootfsUnpacker: Sendable {
     ///
     /// The threshold that actually matters for memory safety is **2048** -- a 1024-byte load
     /// at offset 1024 -- and `capacityInBytes` dominates it by seven orders of magnitude
-    /// (Task 7 constructs with 32 GiB). So the memory-safety property is satisfied
-    /// absolutely rather than marginally, and the gap this bound leaves -- a file truncated
-    /// to somewhere between the floor and its true length -- is a valid-looking but
-    /// incomplete filesystem, which is precisely what the `EXT4Reader` tree walk below
-    /// catches. The two checks divide the space; neither is a weakened version of the other.
+    /// (Task 7 constructs with 32 GiB), so the memory-safety property is satisfied
+    /// absolutely rather than marginally.
+    ///
+    /// **The gap this bound leaves is NOT covered by the reader below.** An earlier version
+    /// of this comment claimed the `EXT4Reader` tree walk caught a file truncated between
+    /// the floor and its true length. MEASURED against a promoted artefact from the test
+    /// fixture -- `capacityInBytes` 2 MiB, real file 128 MiB, because the formatter pads out
+    /// to one whole block group (`contentRequiredSize = blocksPerGroup * blockSize`,
+    /// `EXT4+Formatter.swift:690-700`) -- `EXT4.EXT4Reader` ACCEPTED that artefact truncated
+    /// to 2 MiB (1.5% of it), truncated to 50%, truncated 4 KiB short of full length, and
+    /// with 1 MiB of zeros written over the metadata region at offsets 4096, 8192 and 32768.
+    /// It refused only artefacts with no valid superblock magic: 2 MiB of zeros and 2 MiB of
+    /// `0xAB` each gave `not a valid EXT4 superblock`.
+    ///
+    /// The honest division is therefore narrower than "short versus incomplete":
+    ///
+    /// - **size guard** -> an artefact below the floor;
+    /// - **reader** -> a correctly sized artefact that is not an ext4 at all;
+    /// - **neither** -> a correctly sized, truncated-but-still-parseable filesystem.
+    ///
+    /// Sparse metadata layout is why the third case escapes: a small image's inode table,
+    /// bitmaps and group descriptors all land in the first few blocks, and the tail is
+    /// padding the walk never visits.
+    ///
+    /// **That residue is acceptable, and here is the reason -- which is NOT that the case
+    /// cannot arise before promotion.** It can: `EXT4Unpacker` closes the formatter in
+    /// `defer { try? filesystem.close() }`, so a `close()` that fails part-way is swallowed
+    /// and `unpack` returns normally, all of it before anything is promoted. What makes that
+    /// safe is the ORDER `EXT4.Formatter.close()` writes in. The file is extended to its
+    /// final size early (`EXT4+Formatter.swift:738-750`, `lseek` + one-byte write) and the
+    /// superblock is written LAST, after the inode table, the bitmaps and the group
+    /// descriptors (`:906-908`). So a partial close leaves a correctly sized file with no
+    /// valid superblock -- which the reader refuses -- or a short file, which the size guard
+    /// refuses. The two checks cover both realistic outcomes of the one failure mode that
+    /// reaches this point.
+    ///
+    /// Beyond that, the slot is only ever created by a promotion, so a crash at any point
+    /// during the unpack leaves the artefact at the staging path and never in the slot. For
+    /// a correctly sized but internally truncated filesystem to occupy the slot it would
+    /// have to be corrupted AFTER a successful promotion -- disk-level corruption, a
+    /// different threat, and not one this type is positioned to detect.
     private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
         let size = try FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64
         guard let size, size >= capacityInBytes else {
