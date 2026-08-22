@@ -87,6 +87,17 @@ let package = Package(
             dependencies: [
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationEXT4", package: "containerization"),
+                // `ContainerizationOCI` was reached only through an implicit transitive
+                // import until `ImageRootfsUnpacker` needed `Platform` by name; this makes
+                // it a declared edge. `ContainerizationError` deliberately gets no line of
+                // its own: the containerization package vends NO product under that name --
+                // `.library(name: "Containerization", targets: ["Containerization",
+                // "ContainerizationError"])` (containerization/Package.swift:28) is the only
+                // product carrying that target, and it is already declared above. Asking for
+                // `.product(name: "ContainerizationError", ...)` fails the build with
+                // `product 'ContainerizationError' ... not found in package
+                // 'containerization'`, and `swift package describe` does NOT catch it.
+                .product(name: "ContainerizationOCI", package: "containerization"),
                 .product(name: "ContainerizationOS", package: "containerization"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "GRPC", package: "grpc-swift"),
@@ -153,7 +164,7 @@ let package = Package(
             // shutdown open is an RPC in flight, and making one needs the
             // request and response types off the wire. See
             // `SocketFixtures.holdAnExecOpen`.
-            dependencies: ["ArcaEngine", "SandboxEngineProto"]
+            dependencies: ["ArcaEngine", "SandboxEngineProto", "ContainerBridge"]
         ),
 
         // The `arca-engine` executable: binds SandboxEngineService to a Unix
