@@ -21,6 +21,7 @@
 - Baselines to beat, measured 2026-08-21: 1-layer alpine `2 passed (1 suite, 5.03s)`; 35-layer workspace `create failed ... no free indices are available for allocation`; unpack of 36 layers `duration_seconds=14.83`.
 - **Never run `swift test --disable-swift-testing` in the submodule.** Measured 2026-08-21 in `containerization/`: it returns exit 0 and `Executed 0 tests, with 0 failures` — the suite is entirely swift-testing, so that flag proves compilation and nothing else. Plain `swift test` runs the real suite (608 tests in 84 suites as of `ecdcdd6`). Earlier drafts of this plan specified the flag at 13 sites; every "tests pass" it produced would have been green for the wrong reason. In the **parent** repo the flag does run XCTest — `EVIDENCE-layer-cache-poisoning.md` records 250 tests under it — but plain `swift test` is a superset there too, so use it in both.
 - **On macOS, `swift build` compiles none of the guest.** Everything in `vminitd/Sources/VminitdCore/ArcaBoot.swift` and its callers sits inside `#if os(Linux)`. Guest changes are only compiled by `make vminitd`, which builds for `aarch64-swift-linux-musl`. A green `swift build` is not evidence about guest code.
+- **Take no build-based conclusion from an incremental build.** Measured in Task 4: after `EXT4.Formatter`'s public signature changed, SwiftPM linked `Sources/Integration/ContainerTests.swift.o` from cache and failed with `Undefined symbols ... volumeLabel: Swift.String?`, naming a parameter no source text passes — the eleven call sites rely on the default argument, so the stale mangled symbol carried it. Re-running reproduced it identically; `touch` on the source then linked clean. A stale object can equally *hide* a real breakage as invent a fake one. Before trusting any build or test result a change's correctness rests on — and in every mutation round of Task 6 — `rm -rf .build` first, or at minimum `touch` the dependent sources.
 - **Re-derive the per-file overlay/total counts; do not trust §4.1's table.** Those counts are keyword matches over changed lines, and a doc-comment block about overlay contributes lines that carry none of the keywords. Measured on `Kernel+Commandline.swift`: the table implies 6 overlay lines of 43, while the actual delta is 41+/3− and *all* of it is one `ARCA PATCH` block about `attachedOverlayLayers`. The table is a map of where to look, not a budget of what to change. Before restoring any file from `upstream/main`, read its full diff and decide hunk by hunk.
 
 ---
@@ -277,7 +278,39 @@ rtk proxy grep -c "LayerUnpackFailure" Sources/Containerization/Image/Unpacker/E
 
 Expected: non-zero for both.
 
-- [ ] **Step 6: Commit and open the PR**
+- [ ] **Step 6: Delete the empty-destination mount filter**
+
+Task 3 established, with evidence, that `LinuxContainer.swift`'s `.filter` dropping
+mounts with an empty destination is **not** inert: its producer is in the *parent*
+repository — `Sources/ContainerBridge/OverlayFS/OverlayFSMounter.swift:109` (the
+writable device) and `:135` (each layer device), reached from
+`ContainerBridge/ContainerManager.swift:1288`. So Task 3 correctly kept it.
+
+It goes now, because PR 2 removes the producer and moves the submodule pointer in
+the same merge: Task 9 deletes `Sources/ContainerBridge/OverlayFS/` and Task 12
+bumps the pointer. There is no state in which the parent has the producer and
+lacks the filter — before PR 2 the parent points at `6304122`, which has both;
+after PR 2 it has neither.
+
+Delete `LinuxContainer.swift:786` and the `// ARCA PATCH: skip the OverlayFS block
+devices` comment and `.filter` at `:794-830`, keeping the mount filter's
+non-overlay parts (`holdingTags`, `dropFirst(mountsToSkip)`, the virtiofs
+transform). Leaving it would keep fork-local code that silently drops mounts with
+no producer to justify it — which is what the fail-fast constraint forbids, and it
+would swallow a future bug instead of surfacing it.
+
+**PR 1's description must state the constraint this creates:** arca's submodule
+pointer may only be advanced by PR 2, which removes the producer in the same
+change. A pointer bump without Task 9 would send empty-destination block mounts
+into the OCI spec for every container.
+
+Verify the unrelated fork work survives:
+
+```bash
+rtk proxy grep -n "useNetworkNamespace\|networkNamespacePath\|LinuxNamespace(type: .network\|dialVsock" Sources/Containerization/LinuxContainer.swift > /tmp/t4b.txt 2>&1; cat /tmp/t4b.txt
+```
+
+- [ ] **Step 7: Commit and open the PR**
 
 ```bash
 git add -A
@@ -508,7 +541,7 @@ public struct ImageRootfsUnpacker: Sendable {
             let unpacker = EXT4Unpacker(capacityInBytes: capacityInBytes)
             _ = try await unpacker.unpack(image, for: platform, at: staging, progress: nil)
             if let willPromote { try willPromote(staging) }
-            try Self.verifyReadable(staging)
+            try Self.verifyReadable(staging, expecting: capacityInBytes)
         } catch {
             // The staging file must not outlive the failure: a later run would otherwise
             // find scratch beside a slot that was never promoted.
@@ -523,8 +556,27 @@ public struct ImageRootfsUnpacker: Sendable {
     /// Refuses an artefact whose superblock did not land.
     ///
     /// `EXT4Unpacker` swallows a failing `close()`, so `unpack` returning is not proof the
-    /// filesystem is complete. Opening it is.
-    private static func verifyReadable(_ path: URL) throws {
+    /// filesystem is complete. Opening it is — but only with the size check below.
+    ///
+    /// **Why the size check is not belt-and-braces.** Task 4 restored
+    /// `ContainerizationEXT4/EXT4+Reader.swift` to upstream, which inlines the superblock
+    /// read as `guard let data = try? self.handle.read(upToCount: superBlockSize) else`.
+    /// It checks only that the read did not throw, so a SHORT read reaches
+    /// `loadLittleEndian(as: EXT4.SuperBlock.self)` on an undersized `Data`. The fork's
+    /// deleted version had `data.count == superBlockSize`; that guard arrived with the
+    /// volume-label work and went out with it. The magic number rejects most garbage, but
+    /// a truncated file whose `s_magic` survives is exactly the artefact this function
+    /// exists to catch, so opening it alone is not enough.
+    private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
+        let size = try FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64
+        guard let size, size >= capacityInBytes else {
+            throw ContainerizationError(
+                .internalError,
+                message: "staged rootfs at \(path.path) is \(size.map(String.init) ?? "unreadable") "
+                    + "bytes, short of the \(capacityInBytes) it was formatted for; refusing to "
+                    + "promote it into the image cache"
+            )
+        }
         _ = try EXT4.Reader(blockPath: FilePath(path.path))
     }
 
@@ -611,7 +663,7 @@ Run the same filter. Expected: `testARefusedUnpackLeavesNoScratchBesideTheSlot` 
 
 - [ ] **Step 5: Mutation C — remove the verification**
 
-Delete the `try Self.verifyReadable(staging)` call.
+Delete the `try Self.verifyReadable(staging, expecting: capacityInBytes)` call.
 
 Run the same filter. Expected: `testAStagedFileWithNoReadableSuperblockIsNotPromoted` fails and the other three pass. Restore and re-check the checksum.
 
