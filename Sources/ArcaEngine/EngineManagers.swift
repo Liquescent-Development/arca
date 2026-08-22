@@ -57,6 +57,16 @@ public struct EngineManagers: Sendable {
         self.paths = paths
         self.logger = logger
 
+        // Before any manager opens the state root, and before the StateStore
+        // below drops the `layer_cache` table that indexed these files: the
+        // per-layer ext4 cache the single-composed-rootfs revert orphaned.
+        // Nothing else can reach it now that the live cache is `image-rootfs`,
+        // so a start that skipped it would leave that disk claimed forever. See
+        // `LayerCacheReclaim` for why it refuses rather than guesses. ArcaDaemon
+        // reclaims its own copy under `~/.arca`; this state root is private to
+        // the engine and cannot reach the daemon's tree.
+        try LayerCacheReclaim.run(stateRoot: paths.stateRoot, logger: logger)
+
         self.stateStore = try StateStore(path: paths.stateDatabase.path, logger: logger)
         self.imageManager = try Self.makeImageManager(paths: paths, logger: logger)
         self.containerManager = ContainerManager(

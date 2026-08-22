@@ -66,6 +66,26 @@ public final class ArcaDaemon: @unchecked Sendable {
             }
         }
 
+        // `~/.arca`, the tree this daemon owns. The two paths below that used to
+        // expand the tilde for themselves -- `state.db` and `image-rootfs` --
+        // now hang off this, so that the directory the reclaim on the next line
+        // deletes and the directory `image-rootfs` is created in are the same
+        // parent by construction rather than by two spellings agreeing. Not
+        // every `~/.arca` in this file: `vminitPath` below reaches the home
+        // directory through `FileManager.homeDirectoryForCurrentUser` instead,
+        // and moving it onto this root would be a behaviour change to where
+        // vminit is looked for, which is not this revert's business.
+        let arcaRoot = URL(fileURLWithPath: NSString(string: "~/.arca").expandingTildeInPath)
+
+        // The per-layer ext4 cache the single-composed-rootfs revert orphaned.
+        // ArcaDaemon has its own copy, beside the live `image-rootfs` cache, and
+        // nothing else can reach it now that the live cache has been renamed --
+        // so a start that skipped this would leave that disk claimed forever.
+        // The engine reclaims the copy under its own state root; neither process
+        // can reclaim the other's. A refusal here fails the start rather than
+        // guessing: see `LayerCacheReclaim`.
+        try LayerCacheReclaim.run(arcaRoot: arcaRoot, logger: logger)
+
         // Initialize ImageManager
         let imageManager = try ImageManager(logger: logger, imageStorePath: nil)
         self.imageManager = imageManager
@@ -152,7 +172,7 @@ public final class ArcaDaemon: @unchecked Sendable {
         // WireGuard backend runs services directly in each container VM - no central control plane needed
 
         // Initialize StateStore (shared by ContainerManager and NetworkManager)
-        let stateDBPath = NSString(string: "~/.arca/state.db").expandingTildeInPath
+        let stateDBPath = arcaRoot.appendingPathComponent("state.db").path
         let stateStore: StateStore
         do {
             stateStore = try StateStore(path: stateDBPath, logger: logger)
@@ -196,9 +216,7 @@ public final class ArcaDaemon: @unchecked Sendable {
             // it, and a hand-rolled `urls(for:in:)[0]` traps on an empty array
             // where ImageStore.defaultRoot() throws.
             imageStoreRoot: ImageStore.default.path,
-            imageRootfsCachePath: URL(
-                fileURLWithPath: NSString(string: "~/.arca/image-rootfs").expandingTildeInPath
-            ),
+            imageRootfsCachePath: arcaRoot.appendingPathComponent("image-rootfs"),
             logRoot: daemonLogRoot,
             stateStore: stateStore,
             logger: logger

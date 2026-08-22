@@ -164,7 +164,19 @@ let package = Package(
             // shutdown open is an RPC in flight, and making one needs the
             // request and response types off the wire. See
             // `SocketFixtures.holdAnExecOpen`.
-            dependencies: ["ArcaEngine", "SandboxEngineProto", "ContainerBridge"]
+            //
+            // `SQLite` is declared rather than reached transitively through
+            // `ContainerBridge`, for the reason ArcaDaemon's `Containerization`
+            // edge is declared above: the drop of the `layer_cache` table is
+            // asserted by opening the database beside `StateStore` and reading
+            // `sqlite_master`, and a transitive import compiles right up until
+            // ContainerBridge stops depending on SQLite.swift.
+            dependencies: [
+                "ArcaEngine",
+                "SandboxEngineProto",
+                "ContainerBridge",
+                .product(name: "SQLite", package: "SQLite.swift"),
+            ]
         ),
 
         // The `arca-engine` executable: binds SandboxEngineService to a Unix
