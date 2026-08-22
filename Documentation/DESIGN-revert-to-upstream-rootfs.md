@@ -252,6 +252,40 @@ all four `vmexec/` files, `ArchiveReaderTests.swift` (0/200),
 `TestFormatterUnpack.swift` (1/201), and the entire `vminitd/extensions/arca-services`
 Go tree.
 
+**"Leave alone" means no edits, not "unaffected".** The arca-services tree needs no
+change here, but it holds two live assumptions about guest state this revert
+removes, and both were found by review rather than by the triage above — an
+`OVL`-count over the *submodule's Swift diff* cannot see a Go tree that depends on
+runtime behaviour:
+
+- **A writable `/mnt`.** `ArcaBoot.mountScratch` was the only tmpfs at `/mnt`, and
+  §4.1 removes it. The initfs root is read-only (`Kernel+Commandline.swift:56-57`,
+  `args.append("ro")`) and nothing else mounts `/mnt`, so writes under it return
+  `EROFS`. `filesystem.go:672,677` does `os.MkdirAll("/mnt/virtiofs-volumes/…")`
+  in the VM's root mount namespace, which its own header at `:600-604` states.
+- **A `/dev/vdb` in `/proc/mounts`.** `findWritableMountPath()`
+  (`filesystem.go:810-838`) scans for that device literally. With
+  `prepareOverlayFS` gone the guest mounts no block device, so the miss branch —
+  `"/dev/vdb not found in /proc/mounts - writable filesystem not mounted"`, under a
+  comment asserting it cannot happen — becomes the only outcome.
+
+Both are reached only from `CreateVolumeOverlay` (`filesystem.go:604`), which has
+**no caller**: every reference across `Sources/`, `ArcaApp/`, `Tests/` and the
+arca-services tree is its own definition or a generated stub
+(`filesystem.pb.swift`, `filesystem.grpc.swift`, `proto/filesystem/*.pb.go`).
+
+They are also **already broken, before this change**. `filesystem.go` hardcodes two
+inconsistent conventions — `/mnt/vdb/upper` (`:149`, `:151`) and
+`/mnt/writable/volumes/` (`:760`) — and `:609` hedges "already mounted by vminitd
+at `/mnt/vdb` (or similar path)". The fork's `prepareOverlayFS` mounted at
+`/mnt/writable`, so `:151` never resolved. `ContainerManager.swift:4350` calls
+`enumerateUpperdir()`, which reaches `:151` and returns
+`upperdir not found at /mnt/vdb/upper` today.
+
+So this revert changes which way an unwired subsystem is broken, not whether it is,
+and §7 records that it does not repair it. Whoever wires named volumes on top of
+upstream's rootfs starts from these two file:line citations.
+
 Edit, guest side:
 
 - `vminitd/Sources/VminitdCore/ArcaBoot.swift` — remove `labelledBlockDevices`
@@ -477,5 +511,11 @@ principle, but no one has yet put a figure on it.
   running `skopeo` and `arca-engine image load` on its own machine; a shipped
   `.pkg` cannot. A green arca suite is evidence about the product on arca and is
   not evidence about U5.
+- **It does not repair named volumes.** `CreateVolumeOverlay` in arca-services
+  depends on a writable `/mnt` and on `/dev/vdb` appearing in `/proc/mounts`, and
+  §4.1 removes both. It has no caller, and it already fails today against
+  `/mnt/vdb/upper`, a path the fork never created. Rewiring it onto upstream's
+  rootfs is separate work with its own verification; doing it inside a revert
+  would put it behind the ceiling fix. §4.1 carries the file:line citations.
 - **It does not change Apple's `container` backend**, which is out of scope here
   and slated for removal in the consumer's own roadmap.
