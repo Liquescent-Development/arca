@@ -145,7 +145,7 @@ final class CrashRecoveryTests: XCTestCase {
             ),
             kernelPath: unbootedKernel.path,
             imageStoreRoot: paths.imageStoreRoot,
-            layerCachePath: paths.layerCache,
+            imageRootfsCachePath: paths.imageRootfs,
             logRoot: paths.logsRoot,
             stateStore: stateStore,
             logger: logger

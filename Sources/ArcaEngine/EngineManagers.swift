@@ -8,7 +8,7 @@ import Logging
 /// path reaches which constructor argument, which was the half still spelt out
 /// twice -- once in `ServeCommand.run()` and once in the tests' own
 /// `SandboxEngineService.forTesting`. Task 1's review measured that arrangement:
-/// swapping `imageStoreRoot: paths.layerCache` in the command alone left all 34
+/// swapping `imageStoreRoot: paths.imageRootfs` in the command alone left all 34
 /// tests of the day green, because the tests drove a parallel wiring over the
 /// shared derivation rather than the wiring itself.
 ///
@@ -63,7 +63,7 @@ public struct EngineManagers: Sendable {
             imageManager: imageManager,
             kernelPath: kernelPath.path,
             imageStoreRoot: paths.imageStoreRoot,
-            layerCachePath: paths.layerCache,
+            imageRootfsCachePath: paths.imageRootfs,
             logRoot: paths.logsRoot,
             stateStore: stateStore,
             logger: logger

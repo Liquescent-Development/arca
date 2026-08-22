@@ -48,22 +48,24 @@ final class ContainerBridgePathsTests: XCTestCase {
         )
     }
 
-    /// `~/.arca/layers` was hardcoded, so a dev.gascan-rooted engine would still
-    /// write its layer cache into Arca's tree.
-    func testTheEngineLayerCacheIsUnderItsStateRootAndNotArcas() {
+    /// The cache path was hardcoded under `~/.arca`, so a dev.gascan-rooted engine
+    /// would still write its image rootfs cache into Arca's tree. ArcaDaemon still
+    /// names that tree (`~/.arca/image-rootfs`); the engine must not.
+    func testTheEngineImageRootfsCacheIsUnderItsStateRootAndNotArcas() {
         let root = temporaryRoot()
         let service = SandboxEngineService.forTesting(
             stateRoot: root, kernelPath: Self.externalKernel
         )
 
-        let cache = service.containerManager.layerCachePath
+        let cache = service.containerManager.imageRootfsCachePath
         XCTAssertTrue(
             cache.path.hasPrefix(root.path + "/"),
-            "the engine's layer cache must live under the state root it was given, got \(cache.path)"
+            "the engine's image rootfs cache must live under the state root it was "
+                + "given, got \(cache.path)"
         )
         XCTAssertFalse(
-            cache.path.hasSuffix(".arca/layers"),
-            "the engine's layer cache must not resolve into Arca's tree"
+            cache.path.hasSuffix(".arca/image-rootfs"),
+            "the engine's image rootfs cache must not resolve into Arca's tree"
         )
     }
 
@@ -108,7 +110,7 @@ final class ContainerBridgePathsTests: XCTestCase {
     }
 
     /// Nothing the engine derives escapes the state root. The two tests above
-    /// cover the image store and the layer cache through the wiring; this
+    /// cover the image store and the image rootfs cache through the wiring; this
     /// covers the rest of `EnginePaths` -- the state database, the volumes
     /// directory and the configured socket -- which are handed to managers this
     /// suite does not otherwise read back.
@@ -130,19 +132,19 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// Under the state root is not enough: they must also be different places.
     ///
     /// The containment test above, and the two through the wiring, are each
-    /// satisfied by every path collapsing onto one directory. MEASURED with
-    /// `EnginePaths.layerCache` set to `stateRoot/"images"`:
+    /// satisfied by every path collapsing onto one directory. MEASURED with this
+    /// member -- then spelt `EnginePaths.layerCache` -- set to `stateRoot/"images"`:
     /// `swift test --filter ArcaEngineTests` reported `Executed 60 tests, with 1
     /// failure`, and that one failure was this test -- the other six in this
     /// file, and every other test in the target, passed over an engine whose
-    /// OverlayFS layer cache would be unpacking layers directly into the
-    /// Containerization content store, beside the blobs and the 512MB
-    /// initfs.ext4 (that size MEASURED on a real start; see Task 6's report).
+    /// image cache would be unpacking straight into the Containerization content
+    /// store, beside the blobs and the 512MB initfs.ext4 (that size MEASURED on a
+    /// real start; see Task 6's report).
     ///
     /// Pairwise on the derived values rather than a restatement of the
-    /// derivation: spelling `stateRoot/"layers"` out here again is the tautology
-    /// Task 1's review removed, and it would pass over a collapse it had itself
-    /// copied.
+    /// derivation: spelling `stateRoot/"image-rootfs"` out here again is the
+    /// tautology Task 1's review removed, and it would pass over a collapse it had
+    /// itself copied.
     func testNoTwoEnginePathsNameTheSamePlace() {
         let root = temporaryRoot()
         let derived = Self.derivedPaths(under: root)
@@ -172,7 +174,7 @@ final class ContainerBridgePathsTests: XCTestCase {
             ("imageStoreRoot", paths.imageStoreRoot),
             ("initfs", paths.initfs),
             ("vminitDigest", paths.vminitDigest),
-            ("layerCache", paths.layerCache),
+            ("imageRootfs", paths.imageRootfs),
             ("stateDatabase", paths.stateDatabase),
             ("volumesRoot", paths.volumesRoot),
             ("logsRoot", paths.logsRoot),
@@ -192,13 +194,13 @@ final class ContainerBridgePathsTests: XCTestCase {
             logger: logger
         )
         let imageStoreRoot = root.appendingPathComponent("images")
-        let layerCachePath = root.appendingPathComponent("layers")
+        let imageRootfsCachePath = root.appendingPathComponent("image-rootfs")
         let logRoot = root.appendingPathComponent("logs")
         let manager = ContainerManager(
             imageManager: try ImageManager(logger: logger, imageStorePath: imageStoreRoot),
             kernelPath: root.appendingPathComponent("vmlinux").path,
             imageStoreRoot: imageStoreRoot,
-            layerCachePath: layerCachePath,
+            imageRootfsCachePath: imageRootfsCachePath,
             logRoot: logRoot,
             stateStore: stateStore,
             logger: logger
@@ -209,7 +211,7 @@ final class ContainerBridgePathsTests: XCTestCase {
         // reverted to pass no `root:` at all, assertions on the property alone
         // reported "Executed 2 tests, with 0 failures".
         XCTAssertEqual(manager.containerizationRoot(), imageStoreRoot)
-        XCTAssertEqual(manager.layerCachePath, layerCachePath)
+        XCTAssertEqual(manager.imageRootfsCachePath, imageRootfsCachePath)
 
         // The log root through `logManager.containerLogDir(dockerID:)` -- the
         // resolution the create path (`createLogWriters`), the reload path and

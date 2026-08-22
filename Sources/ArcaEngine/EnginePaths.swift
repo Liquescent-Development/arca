@@ -44,9 +44,15 @@ public struct EnginePaths: Sendable, Equatable {
     /// Apple's shared store on every start, and this one is not that file.
     public let initfs: URL
 
-    /// OverlayFS layer cache. Under the state root rather than `~/.arca/layers`,
-    /// which is Arca's tree.
-    public let layerCache: URL
+    /// One composed ext4 rootfs per image, keyed by digest and platform, shared by
+    /// every container built from that image. Under the state root rather than
+    /// `~/.arca/image-rootfs`, which is Arca's tree.
+    ///
+    /// **Deliberately NOT `<state-root>/layers`, and that is not cosmetic.** That
+    /// directory held the per-layer OverlayFS cache this revert removes, and the engine
+    /// reclaims it on every start. A live per-image cache sharing the name would be
+    /// deleted by the reclaim meant for the orphaned per-layer garbage.
+    public let imageRootfs: URL
 
     /// Digest of the vminit image `initfs` was built from, so that a start can
     /// tell an unchanged vminit from a new one. Beside the state root's other
@@ -87,7 +93,7 @@ public struct EnginePaths: Sendable, Equatable {
         self.imageStoreRoot = stateRoot.appendingPathComponent("images")
         self.initfs = self.imageStoreRoot.appendingPathComponent("initfs.ext4")
         self.vminitDigest = stateRoot.appendingPathComponent("vminit-digest")
-        self.layerCache = stateRoot.appendingPathComponent("layers")
+        self.imageRootfs = stateRoot.appendingPathComponent("image-rootfs")
         self.stateDatabase = stateRoot.appendingPathComponent("state.db")
         self.volumesRoot = stateRoot.appendingPathComponent("volumes")
         self.logsRoot = stateRoot.appendingPathComponent("logs")

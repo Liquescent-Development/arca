@@ -137,6 +137,46 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         )
     }
 
+    /// The mount this type hands out is read-only, on BOTH the fresh-unpack and the
+    /// cache-hit path.
+    ///
+    /// **The flag is a host-side property, not a guest-side one.** `Mount.readonly` is
+    /// `options.contains("ro")`
+    /// (`containerization/Sources/Containerization/Mount.swift:440-442`) and it is what
+    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` is given (ibid.`:370-375`). One file
+    /// backs every container built from the image, so without it the hypervisor opens the
+    /// shared per-image slot read-write for each of them.
+    ///
+    /// `LinuxContainer` appending `"ro"` to the lower mount when absent
+    /// (`LinuxContainer.swift:591-593`) does not make this redundant: that runs only on the
+    /// `writableLayer != nil` branch, and it is a guest mount option over a device the VMM
+    /// has already opened read-write. A caller taking upstream's supported
+    /// `writableLayer == nil` path (`LinuxContainer.swift:617-621`) gets neither.
+    ///
+    /// Both calls are asserted because the two paths build the mount through the same
+    /// helper today and need not tomorrow; a cache hit returning a writable mount is the
+    /// same defect and the common case.
+    ///
+    /// WHAT THIS DOES NOT PROVE: that a guest boots from a read-only attachment. Nothing in
+    /// this target starts a VM. That is Task 13/14's 35-layer create-and-run.
+    func testTheRootfsMountIsReadOnlyOnBothTheUnpackAndTheCacheHit() async throws {
+        let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
+
+        let fresh = try await unpacker.rootfs(for: image, platform: Self.platform)
+        XCTAssertTrue(
+            fresh.options.contains("ro"),
+            "the freshly promoted rootfs mount attaches writable; the shared per-image slot "
+                + "would be opened read-write by the VMM, got options \(fresh.options)"
+        )
+
+        let hit = try await unpacker.rootfs(for: image, platform: Self.platform)
+        XCTAssertTrue(
+            hit.options.contains("ro"),
+            "the cache-hit rootfs mount attaches writable, and the hit is the common case; "
+                + "got options \(hit.options)"
+        )
+    }
+
     /// Mechanism 1, isolated: the unpack's destination is a sibling of the slot, never the
     /// slot itself.
     ///

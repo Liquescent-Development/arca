@@ -487,7 +487,7 @@ final class ListFilterTests: XCTestCase {
             imageManager: try ImageManager(logger: logger, imageStorePath: paths.imageStoreRoot),
             kernelPath: unbootedKernel.path,
             imageStoreRoot: paths.imageStoreRoot,
-            layerCachePath: paths.layerCache,
+            imageRootfsCachePath: paths.imageRootfs,
             logRoot: paths.logsRoot,
             stateStore: stateStore,
             logger: logger

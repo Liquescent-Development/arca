@@ -196,8 +196,8 @@ public final class ArcaDaemon: @unchecked Sendable {
             // it, and a hand-rolled `urls(for:in:)[0]` traps on an empty array
             // where ImageStore.defaultRoot() throws.
             imageStoreRoot: ImageStore.default.path,
-            layerCachePath: URL(
-                fileURLWithPath: NSString(string: "~/.arca/layers").expandingTildeInPath
+            imageRootfsCachePath: URL(
+                fileURLWithPath: NSString(string: "~/.arca/image-rootfs").expandingTildeInPath
             ),
             logRoot: daemonLogRoot,
             stateStore: stateStore,

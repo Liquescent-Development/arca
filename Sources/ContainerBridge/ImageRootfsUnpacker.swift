@@ -24,6 +24,11 @@ import SystemPackage
 /// to upstream's single composed rootfs deletes, so it is reimplemented here -- where the
 /// cache path is now chosen -- rather than in the submodule, which this work is bringing
 /// back toward upstream.
+///
+/// **The slot is shared, so the mount this type returns is read-only.** One file backs
+/// every container built from the image, and the read-only flag that keeps a guest from
+/// writing into it has to be set on the mount the VMM attaches, not in the guest. See
+/// `blockMount(at:)` for why the guest-side `"ro"` upstream appends is not sufficient.
 public struct ImageRootfsUnpacker: Sendable {
     private let cacheRoot: URL
     private let capacityInBytes: UInt64
@@ -320,8 +325,34 @@ public struct ImageRootfsUnpacker: Sendable {
         }
     }
 
+    /// **`"ro"` is load-bearing on the HOST side, and it is not the guest-side `"ro"`.**
+    /// This slot is shared: every container built from the image is handed the same file.
+    /// `Mount.readonly` is `options.contains("ro")`
+    /// (`containerization/Sources/Containerization/Mount.swift:440-442`) and the host
+    /// attachment is `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)`
+    /// (ibid.`:370-375`), so with empty options the hypervisor attaches the shared
+    /// per-image cache slot WRITABLE to each guest.
+    ///
+    /// `LinuxContainer` appending `"ro"` to the lower mount when it is absent
+    /// (`LinuxContainer.swift:591-593`) is not sufficient: that is a guest-side mount
+    /// option over a device the VMM already opened read-write, and it only runs on the
+    /// `writableLayer != nil` branch. The hole this closes is a FUTURE caller taking
+    /// upstream's supported `writableLayer == nil` path (`LinuxContainer.swift:617-621`),
+    /// where the guest mounts the rootfs directly and every container writes into the
+    /// shared slot. Setting it here rather than at the call site is what makes that
+    /// impossible to get wrong.
+    ///
+    /// It is behaviour-preserving at the two other sites that read the option.
+    /// `LinuxContainer.swift:434` is
+    /// `spec.root?.readonly = rootfs.options.contains("ro") && writableLayer == nil`,
+    /// which stays `false` while arca passes a writable layer; and the lower-mount append
+    /// above becomes a no-op.
+    ///
+    /// NOT PROVEN HERE: that a guest boots from a read-only attachment. No test in this
+    /// target starts a VM. The confirming experiment is Task 13/14's 35-layer image
+    /// create-and-run.
     private static func blockMount(at path: URL) -> Containerization.Mount {
-        .block(format: "ext4", source: path.path, destination: "/", options: [])
+        .block(format: "ext4", source: path.path, destination: "/", options: ["ro"])
     }
 }
 

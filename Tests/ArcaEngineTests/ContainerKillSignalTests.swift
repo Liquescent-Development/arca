@@ -37,7 +37,7 @@ final class ContainerKillSignalTests: XCTestCase {
             imageManager: try ImageManager(logger: logger, imageStorePath: imageStoreRoot),
             kernelPath: root.appendingPathComponent("vmlinux").path,
             imageStoreRoot: imageStoreRoot,
-            layerCachePath: root.appendingPathComponent("layers"),
+            imageRootfsCachePath: root.appendingPathComponent("image-rootfs"),
             logRoot: root.appendingPathComponent("logs"),
             stateStore: try StateStore(
                 path: root.appendingPathComponent("state.db").path,

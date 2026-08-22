@@ -189,7 +189,7 @@ private struct PruneFixture {
             imageManager: imageManager,
             kernelPath: stateRoot.appendingPathComponent("vmlinux").path,
             imageStoreRoot: stateRoot.appendingPathComponent("images"),
-            layerCachePath: stateRoot.appendingPathComponent("layers"),
+            imageRootfsCachePath: stateRoot.appendingPathComponent("image-rootfs"),
             logRoot: stateRoot.appendingPathComponent("logs"),
             stateStore: stateStore,
             logger: logger

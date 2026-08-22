@@ -74,13 +74,22 @@ public actor ContainerManager {
     /// and `URL` is `Sendable`, so nothing is given up by saying so.
     nonisolated public let imageStoreRoot: URL
 
-    /// Directory holding the OverlayFS layer cache. Was hardcoded to
-    /// ~/.arca/layers, which meant every consumer wrote into Arca's tree
-    /// regardless of the state root it was given.
-    nonisolated public let layerCachePath: URL
+    /// Directory holding one composed ext4 rootfs per image, keyed by digest and
+    /// platform. Was hardcoded to ~/.arca/layers, which meant every consumer wrote
+    /// into Arca's tree regardless of the state root it was given.
+    nonisolated public let imageRootfsCachePath: URL
 
-    // Layer unpacker for OverlayFS
-    private var overlayUnpacker: OverlayFSUnpacker?
+    /// Composes and caches one rootfs per image. Set by `initialize()`.
+    private var rootfsUnpacker: ImageRootfsUnpacker?
+
+    /// Capacity of a composed image rootfs. Sparse, so this costs nothing until written;
+    /// it only has to exceed the largest image's unpacked size. The approved workspace
+    /// image is 2.9 GB compressed across 35 layers.
+    private static let imageRootfsCapacityInBytes: UInt64 = 32 * 1024 * 1024 * 1024
+
+    /// The container's writable upper layer, 64 GB thin-provisioned. Matches what the
+    /// OverlayFS writable layer was given, and sparse for the same reason.
+    private static let writableLayerSizeInBytes: UInt64 = 64 * 1024 * 1024 * 1024
 
     /// Configuration for a container whose .create() was deferred
     private struct DeferredContainerConfig {
@@ -209,7 +218,7 @@ public actor ContainerManager {
         imageManager: ImageManager,
         kernelPath: String,
         imageStoreRoot: URL,
-        layerCachePath: URL,
+        imageRootfsCachePath: URL,
         logRoot: URL,
         stateStore: StateStore,
         logger: Logger
@@ -217,7 +226,7 @@ public actor ContainerManager {
         self.imageManager = imageManager
         self.kernelPath = kernelPath
         self.imageStoreRoot = imageStoreRoot
-        self.layerCachePath = layerCachePath
+        self.imageRootfsCachePath = imageRootfsCachePath
         self.stateStore = stateStore
         self.logger = logger
         self.logManager = ContainerLogManager(logRoot: logRoot, logger: logger)
@@ -301,12 +310,23 @@ public actor ContainerManager {
             network: try Containerization.VmnetNetwork()
         )
 
-        // Initialize OverlayFS unpacker for parallel layer caching
-        overlayUnpacker = OverlayFSUnpacker(
-            layerCachePath: layerCachePath,
-            stateStore: stateStore,
+        // One composed rootfs per image, shared by every container from it.
+        let unpacker = ImageRootfsUnpacker(
+            cacheRoot: imageRootfsCachePath,
+            capacityInBytes: Self.imageRootfsCapacityInBytes,
             logger: logger
         )
+
+        // Sweep the cache root once, here, and deliberately NOT before each unpack: two
+        // concurrent unpacks stage to distinct UUID paths and both complete safely, so a
+        // per-unpack sweep would delete a concurrent call's in-flight file and turn a safe
+        // race into a corrupt one. Initialisation is the only point at which there is
+        // provably no in-flight work to destroy. See `reapOrphanedStagingFiles`.
+        //
+        // Not caught: an unreadable cache root is a broken state root, and starting over it
+        // would leave every later unpack writing somewhere the engine cannot audit.
+        try unpacker.reapOrphanedStagingFiles()
+        rootfsUnpacker = unpacker
 
         logger.info("ContainerManager initialized successfully")
 
@@ -1228,129 +1248,46 @@ public actor ContainerManager {
         // Ensure container directory exists (base manager expects this)
         try FileManager.default.createDirectory(at: containerPath, withIntermediateDirectories: true)
 
-        // Unpack image layers with OverlayFS (if not already provided)
-        let effectiveOverlayConfig: Containerization.OverlayFSConfig
-        if let providedConfig = config.overlayConfig {
-            // Config already provided (e.g., from recreateContainerFromState)
-            effectiveOverlayConfig = providedConfig
-            logger.debug("Using provided OverlayFS config", metadata: [
-                "docker_id": "\(dockerID)",
-                "layers": "\(providedConfig.lowerLayers.count)"
-            ])
-        } else {
-            // Unpack image using OverlayFS layer cache
-            logger.debug("⏱️ Unpacking image with OverlayFS", metadata: ["docker_id": "\(dockerID)"])
-            let unpackStart = Date()
-
-            guard let unpacker = overlayUnpacker else {
-                throw ContainerManagerError.notInitialized
-            }
-
-            effectiveOverlayConfig = try await unpacker.unpack(
-                config.image,
-                for: imagePlatform,
-                at: containerPath
-            )
-
-            let unpackDuration = Date().timeIntervalSince(unpackStart)
-            logger.info("⏱️ Image unpacked with OverlayFS", metadata: [
-                "docker_id": "\(dockerID)",
-                "layers": "\(effectiveOverlayConfig.lowerLayers.count)",
-                "duration_seconds": "\(String(format: "%.2f", unpackDuration))"
-            ])
+        // One composed rootfs for the image, and one writable layer for this container.
+        // Upstream's LinuxContainer mounts the rootfs as the overlay's lower layer and the
+        // writable mount as its upper, so the device count is the same for a 1-layer image
+        // and a 35-layer one. That constancy is the whole point of this path: the engine
+        // allocates block device tags from a 26-letter alphabet, and one device per layer
+        // exhausted it at roughly 24 layers.
+        guard let rootfsUnpacker else {
+            throw ContainerManagerError.notInitialized
         }
 
-        // Create writable filesystem for OverlayFS upper/work directories
-        // This is a sparse EXT4 filesystem that will be mounted as /dev/vdc in the guest
+        // ACCEPTED CONTRACT, not an oversight: this call is not serialised. N concurrent
+        // creates that all miss on a cold image do N full unpacks and cost N x peak disk
+        // until they collapse onto one slot. That is safe -- each artefact is verified
+        // before it is promoted and `rename(2)` is atomic, so the losers' work is simply
+        // replaced -- and it is deliberately preferred to a lock, which would make one
+        // container's cold unpack block every other create in the engine.
+        let unpackStart = Date()
+        let rootfs = try await rootfsUnpacker.rootfs(for: config.image, platform: imagePlatform)
+        logger.info("image rootfs ready", metadata: [
+            "docker_id": "\(dockerID)",
+            "source": "\(rootfs.source)",
+            "duration_seconds": "\(String(format: "%.2f", Date().timeIntervalSince(unpackStart)))"
+        ])
+
         let writablePath = containerPath.appendingPathComponent("writable.ext4")
-        let mounter = OverlayFSMounter(logger: logger)
-
-        if !FileManager.default.fileExists(atPath: writablePath.path) {
-            // 64 GB provides sufficient space for build caches and large workloads
-            // Thin-provisioned (sparse file) so only actual data consumes disk space
-            try mounter.createWritableFilesystem(at: writablePath.path, sizeMB: 65536)
-            logger.info("Created writable filesystem", metadata: [
-                "docker_id": "\(dockerID)",
-                "path": "\(writablePath.path)"
-            ])
-        } else {
-            logger.debug("Writable filesystem already exists", metadata: [
-                "docker_id": "\(dockerID)",
-                "path": "\(writablePath.path)"
-            ])
-        }
-
-        // Build VZ mounts from OverlayFS configuration
-        // This creates:
-        // - Bind mount from `/` to container rootfs path (FIRST mount - critical!)
-        // - Writable block device for upper/work directories (/dev/vdc)
-        // - Block device mounts for each layer (read-only EXT4, /dev/vdd onwards)
-        let overlayPlan = mounter.buildMounts(
-            containerID: dockerID,
-            overlayConfig: effectiveOverlayConfig,
-            writablePath: writablePath.path,
-            additionalMounts: []  // Will be added in configuration closure
+        let writableLayer = try Self.writableLayer(
+            at: writablePath, sizeInBytes: Self.writableLayerSizeInBytes
         )
-        let overlayMounts = overlayPlan.mounts
-        // How many layer devices this VM is being given, taken from the plan that attached
-        // them and told to the guest below. The guest compares it with what it can identify:
-        // an image with no layers and layers it failed to identify are otherwise the same
-        // observation there. See OverlayFSMountPlan and ArcaLayerAttachment.
-        let attachedOverlayLayers = overlayPlan.attachedLayerCount
-        logger.debug("Built OverlayFS mounts", metadata: [
-            "docker_id": "\(dockerID)",
-            "overlay_mounts": "\(overlayMounts.count)",
-            "attached_overlay_layers": "\(attachedOverlayLayers)"
-        ])
 
-        // Log layer paths for debugging
-        logger.info("OverlayFS layer paths:", metadata: [
-            "docker_id": "\(dockerID)",
-            "layer_count": "\(effectiveOverlayConfig.lowerLayers.count)",
-            "first_layer": "\(effectiveOverlayConfig.lowerLayers.first?.path ?? "none")",
-            "upper": "\(effectiveOverlayConfig.upperDir.path)",
-            "work": "\(effectiveOverlayConfig.workDir.path)"
-        ])
-
-        // Verify first layer file exists
-        if let firstLayer = effectiveOverlayConfig.lowerLayers.first {
-            let exists = FileManager.default.fileExists(atPath: firstLayer.path)
-            logger.info("First layer file check:", metadata: [
-                "docker_id": "\(dockerID)",
-                "path": "\(firstLayer.path)",
-                "exists": "\(exists)"
-            ])
-        }
-
-        // Extract rootfs mount (the bind mount) and remaining mounts from overlayMounts
-        // The FIRST mount in overlayMounts is the bind mount from `/` to container rootfs path
-        // This MUST be passed as the `rootfs` parameter to manager.create()
-        guard let rootfsMount = overlayMounts.first else {
-            throw ContainerManagerError.invalidConfiguration("No rootfs mount in overlayMounts")
-        }
-        let additionalMounts = Array(overlayMounts.dropFirst())
-
-        logger.debug("⏱️ Calling manager.create() with bind mount rootfs", metadata: [
-            "docker_id": "\(dockerID)",
-            "rootfs_type": "\(rootfsMount.type)",
-            "rootfs_source": "\(rootfsMount.source)",
-            "rootfs_destination": "\(rootfsMount.destination)",
-            "additional_mounts": "\(additionalMounts.count)"
-        ])
         let managerCreateStart = Date()
         let container = try await manager.create(
             dockerID,
             image: config.image,
-            rootfs: rootfsMount
+            rootfs: rootfs,
+            writableLayer: writableLayer
         ) { @Sendable containerConfig in
             let closureStartTime = Date()
             configLogger.debug("⏱️ Configuration closure started", metadata: [
                 "docker_id": "\(dockerID)"
             ])
-
-            // Tell the guest how many layer devices came with these mounts. Set from the same
-            // plan that built them, so the number and the devices cannot drift apart.
-            containerConfig.attachedOverlayLayers = attachedOverlayLayers
 
             // Configure the container process (OCI-compliant)
             // Implement proper Docker entrypoint/cmd semantics:
@@ -1483,16 +1420,6 @@ public actor ContainerManager {
             if let stdin = stdinReader {
                 containerConfig.process.stdin = stdin
             }
-
-            // Configure OverlayFS mounts (block devices + VirtioFS shares)
-            // These mounts provide the layer stack that will be mounted as overlay in guest
-            // Add additional block device mounts (writable + layers)
-            // The rootfs bind mount was already passed as the `rootfs` parameter
-            containerConfig.mounts.append(contentsOf: additionalMounts)
-            configLogger.info("Configured OverlayFS block device mounts", metadata: [
-                "docker_id": "\(dockerID)",
-                "block_device_count": "\(additionalMounts.count)"
-            ])
 
             // Configure volume mounts (VirtioFS directory shares)
             // Append to existing mounts (don't replace default system mounts like /proc, /sys, etc.)
@@ -4316,6 +4243,30 @@ public actor ContainerManager {
         manager.imageStore.path
             .appendingPathComponent("containers")
             .appendingPathComponent(dockerID)
+    }
+
+    /// The container's writable upper layer. Created once; reused if the container is
+    /// recreated from state, which is why an existing file is a hit and not an error.
+    ///
+    /// Options are empty and must stay empty: this is the ONE mount in the pair the guest
+    /// writes to. `Mount.readonly` is `options.contains("ro")` and drives
+    /// `VZDiskImageStorageDeviceAttachment(readOnly:)`, so an `"ro"` here would attach the
+    /// upper layer read-only and the overlay would fail to mount. The shared per-image
+    /// rootfs carries `"ro"` instead -- see `ImageRootfsUnpacker.blockMount(at:)`.
+    ///
+    /// No `volumeLabel:`. `OverlayFSMounter.createWritableFilesystem` passed one so that
+    /// vminitd could find this device among many; upstream's `LinuxContainer` is handed the
+    /// writable layer as a named parameter and attaches it in a fixed position
+    /// (`LinuxContainer.swift:581`, `:597-599`), so there is nothing to search for. The label
+    /// machinery is deleted from the submodule by this plan's revert.
+    private static func writableLayer(
+        at path: URL, sizeInBytes: UInt64
+    ) throws -> Containerization.Mount {
+        if !FileManager.default.fileExists(atPath: path.path) {
+            let filesystem = try EXT4.Formatter(FilePath(path.path), minDiskSize: sizeInBytes)
+            try filesystem.close()
+        }
+        return .block(format: "ext4", source: path.path, destination: "/", options: [])
     }
 
     /// Get filesystem changes for a container using OverlayFS upperdir enumeration
