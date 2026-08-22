@@ -75,8 +75,13 @@ public actor ContainerManager {
     nonisolated public let imageStoreRoot: URL
 
     /// Directory holding one composed ext4 rootfs per image, keyed by digest and
-    /// platform. Was hardcoded to ~/.arca/layers, which meant every consumer wrote
-    /// into Arca's tree regardless of the state root it was given.
+    /// platform.
+    ///
+    /// A parameter and not a derivation, because the value differs by consumer and one of
+    /// them still hardcodes Arca's tree: `ArcaDaemon.swift:199` passes
+    /// `~/.arca/image-rootfs`. `arca-engine` passes `EnginePaths.imageRootfs`, under
+    /// whichever state root it was given. Before this was a parameter, every consumer got
+    /// the daemon's value whatever root it owned.
     nonisolated public let imageRootfsCachePath: URL
 
     /// Composes and caches one rootfs per image. Set by `initialize()`.
@@ -320,8 +325,15 @@ public actor ContainerManager {
         // Sweep the cache root once, here, and deliberately NOT before each unpack: two
         // concurrent unpacks stage to distinct UUID paths and both complete safely, so a
         // per-unpack sweep would delete a concurrent call's in-flight file and turn a safe
-        // race into a corrupt one. Initialisation is the only point at which there is
-        // provably no in-flight work to destroy. See `reapOrphanedStagingFiles`.
+        // race into a corrupt one. See the doc comment on the reaper.
+        //
+        // WHY HERE IS THE SAFE POINT, and the bound on that claim: within this process
+        // `initialize()` runs before any unpack can start, so there is no in-flight work
+        // to destroy. That is process-local. Two `arca-engine` processes over one state
+        // root -- a stale engine and a new one -- would have the second's sweep delete the
+        // first's in-flight staging files, which is the corrupt race this ordering avoids
+        // everywhere else. Nothing in this plan runs two engines on one state root, and
+        // nothing here enforces that.
         //
         // Not caught: an unreadable cache root is a broken state root, and starting over it
         // would leave every later unpack writing somewhere the engine cannot audit.
@@ -1266,23 +1278,40 @@ public actor ContainerManager {
         // container's cold unpack block every other create in the engine.
         let unpackStart = Date()
         let rootfs = try await rootfsUnpacker.rootfs(for: config.image, platform: imagePlatform)
+        // `origin` and not just `duration_seconds`: the slot path is identical on a hit and
+        // on a cold unpack, so without it no reader can tell which of the two a given
+        // duration measures -- and the first-create unpack duration is the number this
+        // revert has to put against the fork's 14.83 s for 36 layers.
         logger.info("image rootfs ready", metadata: [
             "docker_id": "\(dockerID)",
-            "source": "\(rootfs.source)",
+            "source": "\(rootfs.mount.source)",
+            "origin": "\(rootfs.origin.rawValue)",
             "duration_seconds": "\(String(format: "%.2f", Date().timeIntervalSince(unpackStart)))"
         ])
 
         let writablePath = containerPath.appendingPathComponent("writable.ext4")
-        let writableLayer = try Self.writableLayer(
+        let writable = try Self.writableLayer(
             at: writablePath, sizeInBytes: Self.writableLayerSizeInBytes
         )
+        if writable.created {
+            logger.info("Created writable filesystem", metadata: [
+                "docker_id": "\(dockerID)",
+                "path": "\(writablePath.path)",
+                "size_bytes": "\(Self.writableLayerSizeInBytes)"
+            ])
+        } else {
+            logger.debug("Writable filesystem already exists", metadata: [
+                "docker_id": "\(dockerID)",
+                "path": "\(writablePath.path)"
+            ])
+        }
 
         let managerCreateStart = Date()
         let container = try await manager.create(
             dockerID,
             image: config.image,
-            rootfs: rootfs,
-            writableLayer: writableLayer
+            rootfs: rootfs.mount,
+            writableLayer: writable.mount
         ) { @Sendable containerConfig in
             let closureStartTime = Date()
             configLogger.debug("⏱️ Configuration closure started", metadata: [
@@ -4248,25 +4277,40 @@ public actor ContainerManager {
     /// The container's writable upper layer. Created once; reused if the container is
     /// recreated from state, which is why an existing file is a hit and not an error.
     ///
-    /// Options are empty and must stay empty: this is the ONE mount in the pair the guest
-    /// writes to. `Mount.readonly` is `options.contains("ro")` and drives
-    /// `VZDiskImageStorageDeviceAttachment(readOnly:)`, so an `"ro"` here would attach the
-    /// upper layer read-only and the overlay would fail to mount. The shared per-image
-    /// rootfs carries `"ro"` instead -- see `ImageRootfsUnpacker.blockMount(at:)`.
+    /// **Options are empty and must stay empty, and unlike the rootfs this one is not
+    /// stripped.** `LinuxContainer.create()` removes `"ro"` from the rootfs before building
+    /// the VZ mount array (`LinuxContainer.swift:639-640`) but inserts the writable layer
+    /// verbatim (`:654`), so `Mount.readonly` (`Mount.swift:441`) does reach
+    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` (`Mount.swift:372`) for this mount.
+    /// A `"ro"` here would attach the overlay's upper layer read-only. The shared per-image
+    /// rootfs is the one that carries the flag -- see `ImageRootfsUnpacker.blockMount(at:)`,
+    /// which also records why it is inert there.
     ///
     /// No `volumeLabel:`. `OverlayFSMounter.createWritableFilesystem` passed one so that
     /// vminitd could find this device among many; upstream's `LinuxContainer` is handed the
     /// writable layer as a named parameter and attaches it in a fixed position
     /// (`LinuxContainer.swift:581`, `:597-599`), so there is nothing to search for. The label
     /// machinery is deleted from the submodule by this plan's revert.
-    private static func writableLayer(
+    ///
+    /// `internal` rather than `private` so that `CreatePathSeamTests` can drive it: its only
+    /// production caller is inside `createNativeContainer`, which no test in this repository
+    /// can reach. That buys the function's contract and NOT the call site -- see the
+    /// preamble on the source-text guards in `ContainerBridgePathsTests`.
+    ///
+    /// `created` is returned rather than logged here so that the log line can name the
+    /// container, which this static has no way to know.
+    internal static func writableLayer(
         at path: URL, sizeInBytes: UInt64
-    ) throws -> Containerization.Mount {
-        if !FileManager.default.fileExists(atPath: path.path) {
+    ) throws -> (mount: Containerization.Mount, created: Bool) {
+        let created = !FileManager.default.fileExists(atPath: path.path)
+        if created {
             let filesystem = try EXT4.Formatter(FilePath(path.path), minDiskSize: sizeInBytes)
             try filesystem.close()
         }
-        return .block(format: "ext4", source: path.path, destination: "/", options: [])
+        return (
+            .block(format: "ext4", source: path.path, destination: "/", options: []),
+            created
+        )
     }
 
     /// Get filesystem changes for a container using OverlayFS upperdir enumeration

@@ -25,11 +25,31 @@ import SystemPackage
 /// cache path is now chosen -- rather than in the submodule, which this work is bringing
 /// back toward upstream.
 ///
-/// **The slot is shared, so the mount this type returns is read-only.** One file backs
-/// every container built from the image, and the read-only flag that keeps a guest from
-/// writing into it has to be set on the mount the VMM attaches, not in the guest. See
-/// `blockMount(at:)` for why the guest-side `"ro"` upstream appends is not sufficient.
+/// **The slot is shared, and the host cannot be stopped from writing to it at this pin.**
+/// One file backs every container built from the image. The mount carries `"ro"`, but
+/// upstream strips that option before the device is attached, so the guarantee is a
+/// guest-side remount and not a hypervisor-level one. `blockMount(at:)` records the
+/// mechanism, what the flag does still buy, and the hole that stays open.
 public struct ImageRootfsUnpacker: Sendable {
+
+    /// Where a returned rootfs came from.
+    ///
+    /// Carried out of `rootfs(for:platform:)` rather than logged inside it, because the
+    /// only log line that can name the container is the caller's. Without it a cold unpack
+    /// and a cache hit are the same `info` record with a different number in it, and the
+    /// measurement the revert owes -- first-create unpack duration against the fork's
+    /// `duration_seconds=14.83` for 36 layers -- cannot be read off the log at all.
+    public enum Origin: String, Sendable {
+        case unpacked
+        case cacheHit = "cache-hit"
+    }
+
+    /// A composed rootfs and how it was obtained.
+    public struct Rootfs: Sendable {
+        public let mount: Containerization.Mount
+        public let origin: Origin
+    }
+
     private let cacheRoot: URL
     private let capacityInBytes: UInt64
     private let logger: Logger
@@ -131,11 +151,11 @@ public struct ImageRootfsUnpacker: Sendable {
     public func rootfs(
         for image: Containerization.Image,
         platform: ContainerizationOCI.Platform
-    ) async throws -> Containerization.Mount {
+    ) async throws -> Rootfs {
         let slot = rootfsPath(forImageDigest: image.digest, platform: platform)
         if FileManager.default.fileExists(atPath: slot.path) {
             logger.debug("image rootfs cache hit", metadata: ["path": "\(slot.path)"])
-            return Self.blockMount(at: slot)
+            return Rootfs(mount: Self.blockMount(at: slot), origin: .cacheHit)
         }
 
         let directory = slot.deletingLastPathComponent()
@@ -156,7 +176,7 @@ public struct ImageRootfsUnpacker: Sendable {
         }
 
         try Self.promote(at: staging, to: slot)
-        return Self.blockMount(at: slot)
+        return Rootfs(mount: Self.blockMount(at: slot), origin: .unpacked)
     }
 
     /// Refuses an artefact whose superblock did not land.
@@ -325,32 +345,47 @@ public struct ImageRootfsUnpacker: Sendable {
         }
     }
 
-    /// **`"ro"` is load-bearing on the HOST side, and it is not the guest-side `"ro"`.**
-    /// This slot is shared: every container built from the image is handed the same file.
-    /// `Mount.readonly` is `options.contains("ro")`
-    /// (`containerization/Sources/Containerization/Mount.swift:440-442`) and the host
-    /// attachment is `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)`
-    /// (ibid.`:370-375`), so with empty options the hypervisor attaches the shared
-    /// per-image cache slot WRITABLE to each guest.
+    /// **`"ro"` here does NOT make the attachment read-only, and an earlier version of
+    /// this comment claimed it did.** The option is stripped before the device reaches the
+    /// hypervisor. VERIFIED against the pinned submodule object, not the worktree
+    /// (`git show 6304122:Sources/Containerization/LinuxContainer.swift`):
     ///
-    /// `LinuxContainer` appending `"ro"` to the lower mount when it is absent
-    /// (`LinuxContainer.swift:591-593`) is not sufficient: that is a guest-side mount
-    /// option over a device the VMM already opened read-write, and it only runs on the
-    /// `writableLayer != nil` branch. The hole this closes is a FUTURE caller taking
-    /// upstream's supported `writableLayer == nil` path (`LinuxContainer.swift:617-621`),
-    /// where the guest mounts the rootfs directly and every container writes into the
-    /// shared slot. Setting it here rather than at the call site is what makes that
-    /// impossible to get wrong.
+    /// ```
+    /// :639   var modifiedRootfs = self.rootfs
+    /// :640   modifiedRootfs.options.removeAll(where: { $0 == "ro" })
+    /// :652   var containerMounts = [modifiedRootfs] + fileMountContext.transformedMounts
+    /// :661   mountsByID: [self.id: containerMounts],
+    /// ```
     ///
-    /// It is behaviour-preserving at the two other sites that read the option.
-    /// `LinuxContainer.swift:434` is
-    /// `spec.root?.readonly = rootfs.options.contains("ro") && writableLayer == nil`,
-    /// which stays `false` while arca passes a writable layer; and the lower-mount append
-    /// above becomes a no-op.
+    /// `mountsByID` is the only thing that becomes a VZ storage device for this path
+    /// (`VZVirtualMachineInstance.swift:585`; `grep -rn mountsByID Sources/` finds no other
+    /// producer besides `LinuxPod`, which arca does not use), and it carries the STRIPPED
+    /// copy. So `Mount.readonly` (`Mount.swift:441`) is false for the rootfs whatever this
+    /// function puts in `options`, and
+    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` (`Mount.swift:372`)
+    /// opens the shared slot read-write for every guest.
     ///
-    /// NOT PROVEN HERE: that a guest boots from a read-only attachment. No test in this
-    /// target starts a VM. The confirming experiment is Task 13/14's 35-layer image
-    /// create-and-run.
+    /// Upstream does this deliberately and says why at `:632-638`: a rootfs attached `ro`
+    /// gives `EROFS` when it writes `/etc/hosts` and `/etc/resolv.conf`, and it prefers to
+    /// have the OCI runtime remount `ro` in the guest instead.
+    ///
+    /// **THE HOST-SIDE HOLE IS OPEN.** Nothing the parent can set on this mount closes it
+    /// at this pin, and closing it would mean diverging from the upstream this plan is
+    /// converging toward. `chmod 0444` on the slot is not the way round it either: the
+    /// attachment is opened read-write, so a read-only file fails the attach.
+    ///
+    /// **What the flag does buy, and why it stays.** `LinuxContainer.swift:434` reads the
+    /// UNSTRIPPED `self.rootfs`:
+    /// `spec.root?.readonly = self.rootfs.options.contains("ro") && self.writableLayer == nil`.
+    /// So on a `writableLayer == nil` caller (`LinuxContainer.swift:617-621`, upstream's
+    /// supported no-overlay path) the option makes the OCI runtime remount the root
+    /// read-only inside the guest -- which is upstream's own stated preference. It costs
+    /// nothing, and it is behaviour-preserving today: arca always passes a writable layer,
+    /// so `spec.root?.readonly` stays false, and the lower-mount append at
+    /// `LinuxContainer.swift:591-593` was already going to add `"ro"` on that branch.
+    ///
+    /// NOT PROVEN HERE, and not provable in this target: anything about a running guest.
+    /// Nothing here starts a VM. Task 13/14's 35-layer create-and-run is the instrument.
     private static func blockMount(at path: URL) -> Containerization.Mount {
         .block(format: "ext4", source: path.path, destination: "/", options: ["ro"])
     }

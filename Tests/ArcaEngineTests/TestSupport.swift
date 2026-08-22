@@ -3,6 +3,32 @@ import Foundation
 import Logging
 @testable import ArcaEngine
 
+/// The ContainerBridge sources this target's source-text guards read.
+///
+/// Shared rather than copied into each guard's own file. Two spellings of "find the repo
+/// root from `#filePath`" would be free to drift, and the way that drifts is that one
+/// guard silently starts reading a file that is not the one it names -- which for a text
+/// guard is indistinguishable from the guard passing.
+///
+/// Located from `#filePath` rather than from the test bundle, because the bundle holds no
+/// sources. A missing or unreadable file throws and fails the test; it is never skipped. A
+/// guard that quietly passes when it cannot find what it guards is worse than no guard.
+enum BridgeSources {
+    static func containerManager(testFile: StaticString = #filePath) throws -> String {
+        try read("Sources/ContainerBridge/ContainerManager.swift", testFile: testFile)
+    }
+
+    private static func read(_ relativePath: String, testFile: StaticString) throws -> String {
+        let repoRoot = URL(fileURLWithPath: "\(testFile)")
+            .deletingLastPathComponent()  // ArcaEngineTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // repo root
+        return try String(
+            contentsOf: repoRoot.appendingPathComponent(relativePath), encoding: .utf8
+        )
+    }
+}
+
 extension SandboxEngineService {
     /// A service over real ContainerBridge managers against a throwaway state
     /// root. Nothing in Tasks 1-6's tests starts a VM; these managers exist

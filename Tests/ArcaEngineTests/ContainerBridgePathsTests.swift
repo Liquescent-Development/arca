@@ -109,6 +109,40 @@ final class ContainerBridgePathsTests: XCTestCase {
         )
     }
 
+    /// The image rootfs cache must not be named `layers`, and this is the one assertion
+    /// in this file that is about a literal value rather than a relationship.
+    ///
+    /// **It is here because the value has a consequence outside this type.** Task 10 adds a
+    /// reclaim that deletes `<state-root>/layers` on every engine start, to clear the
+    /// per-layer OverlayFS cache the revert to a single composed rootfs orphans. If this
+    /// member ever names that directory again, that reclaim deletes the LIVE per-image
+    /// cache on every start: each `gascan up` silently pays a full 35-layer unpack, and
+    /// nothing else in the suite goes red.
+    ///
+    /// MEASURED, which is why this test exists at all: with `EnginePaths.swift:90` reverted
+    /// to `stateRoot.appendingPathComponent("layers")` and a clean `.build`,
+    /// `swift test --filter ArcaEngineTests` reported `Executed 260 tests, with 0
+    /// failures`. Neither of the two tests through the wiring can see it -- `<root>/layers`
+    /// is under the state root, does not end in `.arca/image-rootfs`, and is as distinct
+    /// from `images`/`volumes`/`logs` as `image-rootfs` is.
+    ///
+    /// Written as a negative keyed to the hazard rather than
+    /// `XCTAssertEqual(paths.imageRootfs, root.appendingPathComponent("image-rootfs"))`,
+    /// which would be the restatement of the derivation this file's other tests were
+    /// rewritten to remove -- it would pass over any rename and fail over a harmless one.
+    /// What must never happen is this one collision, so that is what is asserted.
+    func testTheImageRootfsCacheIsNotTheDirectoryTheLayerReclaimDeletes() {
+        let root = temporaryRoot()
+        let paths = EnginePaths(stateRoot: root)
+
+        XCTAssertNotEqual(
+            paths.imageRootfs.lastPathComponent, "layers",
+            "the image rootfs cache must not be <state-root>/layers: the layer reclaim "
+                + "deletes that directory on every engine start, so a live per-image cache "
+                + "there is destroyed on each start and re-unpacked in full"
+        )
+    }
+
     /// Nothing the engine derives escapes the state root. The two tests above
     /// cover the image store and the image rootfs cache through the wiring; this
     /// covers the rest of `EnginePaths` -- the state database, the volumes
@@ -443,20 +477,12 @@ final class ContainerBridgePathsTests: XCTestCase {
 
     /// The ContainerBridge source both tests above read.
     ///
-    /// Located from `#filePath` rather than from the test bundle, because the
-    /// bundle holds no sources. A missing or unreadable file fails the test and
-    /// is never skipped: a guard that quietly passes when it cannot find what it
-    /// guards is worse than no guard, and these two are already the weaker half
-    /// of this task's evidence.
-    private static func containerManagerSource(
-        testFile: StaticString = #filePath
-    ) throws -> String {
-        let repoRoot = URL(fileURLWithPath: "\(testFile)")
-            .deletingLastPathComponent()  // ArcaEngineTests
-            .deletingLastPathComponent()  // Tests
-            .deletingLastPathComponent()  // repo root
-        let source = repoRoot
-            .appendingPathComponent("Sources/ContainerBridge/ContainerManager.swift")
-        return try String(contentsOf: source, encoding: .utf8)
+    /// The derivation lives in `BridgeSources` because `CreatePathSeamTests` reads the same
+    /// file, and two spellings of it would be free to drift -- which for a text guard shows
+    /// up as the guard silently passing over a file it never opened. A missing or
+    /// unreadable file throws and fails the test and is never skipped; these two are
+    /// already the weaker half of this task's evidence.
+    private static func containerManagerSource() throws -> String {
+        try BridgeSources.containerManager()
     }
 }

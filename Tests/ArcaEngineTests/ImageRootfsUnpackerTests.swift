@@ -125,55 +125,69 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
 
         let first = try await unpacker.rootfs(for: image, platform: Self.platform)
-        let firstModified = try Self.modificationDate(of: first)
+        let firstModified = try Self.modificationDate(of: first.mount)
 
         let second = try await unpacker.rootfs(for: image, platform: Self.platform)
-        let secondModified = try Self.modificationDate(of: second)
+        let secondModified = try Self.modificationDate(of: second.mount)
 
-        XCTAssertEqual(first.source, second.source)
+        XCTAssertEqual(first.mount.source, second.mount.source)
         XCTAssertEqual(
             firstModified, secondModified,
             "the second call rewrote the rootfs; the per-image cache is not being hit"
         )
+
+        // `origin` is what the create path logs to tell a cold unpack from a hit, and the
+        // mtime check above is exactly the state that distinction is reporting on. Pinned
+        // here rather than in a test of its own so the two cannot disagree: an `origin`
+        // that said `cache-hit` for a call that rewrote the file would be worse than none.
+        XCTAssertEqual(first.origin, .unpacked, "the first call composed the rootfs")
+        XCTAssertEqual(second.origin, .cacheHit, "the second call answered from the slot")
     }
 
-    /// The mount this type hands out is read-only, on BOTH the fresh-unpack and the
+    /// The mount this type hands out carries `"ro"`, on BOTH the fresh-unpack and the
     /// cache-hit path.
     ///
-    /// **The flag is a host-side property, not a guest-side one.** `Mount.readonly` is
-    /// `options.contains("ro")`
-    /// (`containerization/Sources/Containerization/Mount.swift:440-442`) and it is what
-    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` is given (ibid.`:370-375`). One file
-    /// backs every container built from the image, so without it the hypervisor opens the
-    /// shared per-image slot read-write for each of them.
+    /// **READ THIS BEFORE CONCLUDING THE SHARED SLOT IS PROTECTED FROM THE HOST. IT IS
+    /// NOT.** An earlier version of this test asserted the flag made the attachment
+    /// read-only. It does not. `LinuxContainer.create()` strips it before the VZ mount
+    /// array is built -- VERIFIED against the pinned object,
+    /// `git show 6304122:Sources/Containerization/LinuxContainer.swift`:
+    /// `:639-640` `var modifiedRootfs = self.rootfs` /
+    /// `modifiedRootfs.options.removeAll(where: { $0 == "ro" })`, and `:652`/`:661` put
+    /// that stripped copy into `mountsByID`, which is the only thing
+    /// `VZVirtualMachineInstance.swift:585` turns into a storage device. So
+    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` (`Mount.swift:372`)
+    /// always gets `false` for the rootfs. Upstream does this on purpose (`:632-638`:
+    /// `EROFS` writing `/etc/hosts`). **The host-side hole is open and this test does not
+    /// close it.**
     ///
-    /// `LinuxContainer` appending `"ro"` to the lower mount when absent
-    /// (`LinuxContainer.swift:591-593`) does not make this redundant: that runs only on the
-    /// `writableLayer != nil` branch, and it is a guest mount option over a device the VMM
-    /// has already opened read-write. A caller taking upstream's supported
-    /// `writableLayer == nil` path (`LinuxContainer.swift:617-621`) gets neither.
+    /// **What it does pin.** `LinuxContainer.swift:434` reads the UNSTRIPPED `self.rootfs`
+    /// for `spec.root?.readonly = … && self.writableLayer == nil`, so on upstream's
+    /// no-overlay path (`LinuxContainer.swift:617-621`) this option is what makes the OCI
+    /// runtime remount the guest root read-only. That is a real effect on a real supported
+    /// path, it is free, and it is upstream's own stated preference -- so the flag stays
+    /// and this test keeps it from being dropped as decoration.
     ///
     /// Both calls are asserted because the two paths build the mount through the same
-    /// helper today and need not tomorrow; a cache hit returning a writable mount is the
-    /// same defect and the common case.
+    /// helper today and need not tomorrow.
     ///
-    /// WHAT THIS DOES NOT PROVE: that a guest boots from a read-only attachment. Nothing in
-    /// this target starts a VM. That is Task 13/14's 35-layer create-and-run.
-    func testTheRootfsMountIsReadOnlyOnBothTheUnpackAndTheCacheHit() async throws {
+    /// WHAT THIS DOES NOT PROVE: anything about a running guest. Nothing in this target
+    /// starts a VM. That is Task 13/14's 35-layer create-and-run.
+    func testTheRootfsMountCarriesReadOnlyOnBothTheUnpackAndTheCacheHit() async throws {
         let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
 
         let fresh = try await unpacker.rootfs(for: image, platform: Self.platform)
         XCTAssertTrue(
-            fresh.options.contains("ro"),
-            "the freshly promoted rootfs mount attaches writable; the shared per-image slot "
-                + "would be opened read-write by the VMM, got options \(fresh.options)"
+            fresh.mount.options.contains("ro"),
+            "the freshly promoted rootfs mount dropped \"ro\", so a writableLayer == nil "
+                + "caller would no longer get spec.root.readonly; got \(fresh.mount.options)"
         )
 
         let hit = try await unpacker.rootfs(for: image, platform: Self.platform)
         XCTAssertTrue(
-            hit.options.contains("ro"),
-            "the cache-hit rootfs mount attaches writable, and the hit is the common case; "
-                + "got options \(hit.options)"
+            hit.mount.options.contains("ro"),
+            "the cache-hit rootfs mount dropped \"ro\", and the hit is the common case; "
+                + "got \(hit.mount.options)"
         )
     }
 
@@ -254,7 +268,7 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         )
 
         let promoted = try await unpacker.rootfs(for: image, platform: Self.platform)
-        XCTAssertEqual(promoted.source, slot.path)
+        XCTAssertEqual(promoted.mount.source, slot.path)
 
         // The fixture image carries an arm64 manifest and nothing else, so the amd64
         // request has nothing to unpack and must SAY so rather than quietly answering out
@@ -262,7 +276,7 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         do {
             let wrong = try await unpacker.rootfs(for: image, platform: Self.otherPlatform)
             XCTFail(
-                "an amd64 request was answered with \(wrong.source); the fixture image is "
+                "an amd64 request was answered with \(wrong.mount.source); the fixture image is "
                     + "arm64-only, so this can only have come from the arm64 slot"
             )
         } catch {
