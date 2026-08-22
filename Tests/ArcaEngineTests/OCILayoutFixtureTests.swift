@@ -155,8 +155,10 @@ final class OCILayoutFixtureTests: XCTestCase {
     ///
     /// **The test that made this concrete was `LayerCacheRoleTests`, deleted in `2d1f8db`
     /// with the per-layer cache, so the guard is currently forward-looking**: after that
-    /// commit the only multi-layer callers of `write(at:reference:layers:)` are the tests in
-    /// this file. It is kept rather than dropped because the fixture still offers the
+    /// commit every call site passing more than one layer to `write(at:reference:layers:)` is
+    /// in this file. (`ImageRootfsUnpackerTests` reaches `write` through a pass-through
+    /// `fixture(reference:layers:)`, and both of its callers supply a single layer.) The guard
+    /// is kept rather than dropped because the fixture still offers the
     /// multi-layer entry point, and a guard removed here is one the next caller has to
     /// rediscover by writing the vacuous test first.
     ///

@@ -33,7 +33,8 @@ enum OCILayoutFixture {
     /// structurally, and the content is what a right filename over wrong or
     /// absent bytes shows.
     ///
-    /// **No test in the tree reads either half today.** The per-layer suite that
+    /// **No test in the tree reads either half back out of an unpacked
+    /// filesystem today.** The per-layer suite that
     /// did -- `LayerCacheRoleTests`, which recorded that finding twice for the
     /// one-layer case, one level down each time -- was deleted in `2d1f8db`
     /// along with the per-layer cache it covered, and the unpack tests that
@@ -54,11 +55,29 @@ enum OCILayoutFixture {
         /// in-tree producer, and what the unpacker's CALLER does with that
         /// refusal could not be tested at all. It is the caller, not the refusal,
         /// that its one consumer uses this for:
-        /// `ImageRootfsUnpackerTests.fixtureRefusingItsLayer`, which drives the
-        /// three tests pinning that a refused unpack leaves no cache slot, no
-        /// scratch file beside it, and nothing for the next create to reuse.
-        /// (`LayerCacheRoleTests` was the previous consumer, deleted in
-        /// `2d1f8db`.)
+        /// `ImageRootfsUnpackerTests.fixtureRefusingItsLayer`, which drives
+        /// exactly TWO tests -- `testARefusedUnpackLeavesNoCacheSlot` and
+        /// `testARefusedUnpackLeavesNoScratchBesideTheSlot`.
+        ///
+        /// **The layer-granularity suite drove a third, and it has no
+        /// successor.**
+        /// `LayerCacheRoleTests.testARefusedLayerLeavesNoPartialSlotForItsSiblings`
+        /// -- deleted with the rest of that file in `2d1f8db` -- pinned that one
+        /// refused layer leaves no SIBLING slot reusable-but-incomplete. The
+        /// per-layer `unpack` ran its layers in a throwing task group, so a
+        /// refusal cancelled the siblings mid-unpack, a formatter closed there
+        /// wrote a correctly labelled but partially populated slot, and slots
+        /// keyed by digest alone were shared with every other image carrying
+        /// that layer.
+        ///
+        /// **That property cannot be expressed at image granularity**, which is
+        /// why nothing replaced it: there is one slot per image and platform, so
+        /// there are no siblings to leave partial and no digest-keyed sharing
+        /// between images for a partial artefact to travel through. What carries
+        /// over is narrower -- that a partial or unreadable artefact is not
+        /// promoted into the image's OWN slot, which is Mechanism 3 in
+        /// `ImageRootfsUnpackerTests`. Read the difference as coverage that went
+        /// away with the thing it covered, not as coverage retained.
         enum Blob {
             /// A real uncompressed pax tar holding `content` at `path`.
             case archive
@@ -243,8 +262,11 @@ enum OCILayoutFixture {
     /// the per-layer cache, so the measurement above is a record of what was
     /// observed then and not a check a reader can re-run at HEAD.
     ///
-    /// **Nothing at HEAD reads the unpacked filesystem back at all**, which
-    /// makes the requirement to write a real tar rest on the refusal path
+    /// **No test at HEAD reads a file back out of the unpacked filesystem** --
+    /// production's `verifyReadable` opens one only far enough to construct an
+    /// `EXT4.EXT4Reader` (`ImageRootfsUnpacker.verifyReadable`) and never looks
+    /// up a path. That makes the requirement to write a real tar rest on the
+    /// refusal path
     /// below rather than on a content assertion. That is enough to keep it:
     /// the requirement is restated on its own terms below, under **That fix
     /// does not weaken the requirement to write a real tar**, against the

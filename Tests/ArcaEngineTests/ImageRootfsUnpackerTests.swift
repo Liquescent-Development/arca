@@ -545,8 +545,10 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     ///
     /// Naming the same platform the fixture writes removes both the shim dependence and the
     /// vacuity. The convention came from `LayerCacheRoleTests`, which named the platform
-    /// explicitly at each of its fixtures; that file was deleted in `2d1f8db`, so this suite
-    /// is now the only place the convention lives and it is stated here rather than cited.
+    /// explicitly at each of its fixtures; that file was deleted in `2d1f8db`, so the reasoning
+    /// is written out here rather than cited to it. It is not unique to this suite:
+    /// `CreatePathSeamTests.testOpeningTheCacheSweepsOrphansSparesSlotsAndIsRootedWhereItSwept`
+    /// names the same platform against its own hand-built `linux-arm64` path.
     private static let platform = SystemPlatform.linuxArm.ociPlatform()
 
     /// A platform the fixture image does NOT carry, for the cache-key test below.
