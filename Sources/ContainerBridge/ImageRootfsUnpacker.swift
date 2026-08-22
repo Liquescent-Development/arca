@@ -201,30 +201,68 @@ public struct ImageRootfsUnpacker: Sendable {
     /// pattern, all of it upstream. Asserting the file's size at the caller, before the
     /// reader is constructed at all, is the right place for this.
     ///
-    /// **Do not delete this as dead code on the evidence of a green suite.** At the
-    /// submodule pointer this was written against (`6304122`, before Task 12's bump) the
-    /// fork's guard is still in the tree, at
+    /// **Do not delete this as dead code.** At the submodule pointer this was written
+    /// against (`6304122`, before Task 12's bump) the fork's guard is still in the tree, at
     /// `containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`
-    /// (`data.count == superBlockSize`), and it is what refuses the truncated artefact
-    /// today. MEASURED: weakening the guard below to `size >= 0` and running
-    /// `swift test --filter ImageRootfsUnpackerTests` leaves every test passing, and the
-    /// error `testAStagedFileWithNoReadableSuperblockIsNotPromoted` observes becomes
+    /// (`data.count == superBlockSize`), and *something* would refuse the truncated artefact
+    /// even with this check gone. MEASURED: weakening the guard below to `size >= 0` makes
+    /// the error `testAStagedFileWithNoReadableSuperblockIsNotPromoted` observes become
     /// `could not read 1024 bytes of superblock from ... at offset 1024` -- the fork guard,
-    /// not this one. That guard goes out with the volume-label work, so no test in this
-    /// suite can distinguish a live size check from a dead one until the pointer moves.
-    /// After the bump the fixture's 1536-byte artefact reaches upstream's nil-check as a
-    /// 512-byte `Data`, upstream lets it through, and this check becomes the only thing
-    /// left -- so weakening it should then fail
-    /// `testAStagedFileWithNoReadableSuperblockIsNotPromoted`, and Task 12 should confirm
-    /// that it does.
+    /// not this one.
+    ///
+    /// **What that test pins TODAY is which check reports, not whether the artefact is
+    /// refused.** It asserts on this check's own message, so the weakening fails it; but the
+    /// safety property underneath is still being provided by the fork guard, and no test at
+    /// this pointer can show otherwise. The distinction matters because the fork guard goes
+    /// out with the volume-label work, and then nothing is underneath.
+    /// **Task 12: after the bump, weakening this check does not fail a test -- it TRAPS, and
+    /// the trap IS the kill.** The fixture's 1536-byte artefact reaches upstream's nil-check
+    /// as a 512-byte `Data`, the `guard let` succeeds, and `loadLittleEndian` -- which on a
+    /// little-endian host is literally `self.load(as: T.self)`
+    /// (`ContainerizationEXT4/UnsafeLittleEndianBytes.swift:54-57`) -- reads a 1024-byte
+    /// struct out of it. MEASURED by simulating the post-bump reader exactly (seek to 1024
+    /// in a 1536-byte file, `read(upToCount: 1024)`, `load(as:)` a 1024-byte struct):
+    ///
+    /// ```
+    /// Swift/UnsafeRawBufferPointer.swift:1446: Fatal error: UnsafeRawBufferPointer.load out of bounds
+    /// exit 133   (128 + 5, SIGTRAP)
+    /// ```
+    ///
+    /// The process dies and takes the whole test bundle with it; no `catch` can see it and
+    /// no `XCTAssert` reports it. **Do not read `Fatal error: … load out of bounds` plus
+    /// SIGTRAP as an unrelated environment fault and call the mutation inconclusive** -- it
+    /// is the mutation working. Restoring the check makes the trap go away, which is the
+    /// confirmation.
+    ///
+    /// That is the *debug* outcome, and `swift test` builds debug. `_debugPrecondition` is
+    /// `@inlinable` and so evaluated in the client's build configuration, so a **release**
+    /// build of the same weakened code does not trap: it reads 1024 bytes out of a 512-byte
+    /// buffer and returns whatever follows it in memory, silently.
+    ///
+    /// Post-bump this is therefore not defence-in-depth. Nothing else stands between a short
+    /// staged artefact and that load: it is the only check left.
+    /// **`capacityInBytes` is a FLOOR, and comparing against it is deliberate -- do not
+    /// "fix" this into an exact-size comparison.** `EXT4.Formatter` treats its `minDiskSize`
+    /// as usable capacity and writes more when the content or the journal needs it
+    /// (`EXT4+Formatter.swift:697-702`), so the artefact's true final size is not knowable
+    /// here; upstream's `unpack` does not report it, and obtaining it would mean an upstream
+    /// API change inside a plan whose purpose is converging *toward* upstream.
+    ///
+    /// The threshold that actually matters for memory safety is **2048** -- a 1024-byte load
+    /// at offset 1024 -- and `capacityInBytes` dominates it by seven orders of magnitude
+    /// (Task 7 constructs with 32 GiB). So the memory-safety property is satisfied
+    /// absolutely rather than marginally, and the gap this bound leaves -- a file truncated
+    /// to somewhere between the floor and its true length -- is a valid-looking but
+    /// incomplete filesystem, which is precisely what the `EXT4Reader` tree walk below
+    /// catches. The two checks divide the space; neither is a weakened version of the other.
     private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
         let size = try FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64
         guard let size, size >= capacityInBytes else {
             throw ContainerizationError(
                 .internalError,
                 message: "staged rootfs at \(path.path) is \(size.map { String($0) } ?? "unreadable") "
-                    + "bytes, short of the \(capacityInBytes) it was formatted for; refusing to "
-                    + "promote it into the image cache"
+                    + "bytes, below the \(capacityInBytes)-byte floor it was formatted with "
+                    + "(a minimum, not an expected size); refusing to promote it into the image cache"
             )
         }
         _ = try EXT4.EXT4Reader(blockDevice: FilePath(path.path))

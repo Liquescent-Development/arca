@@ -23,7 +23,7 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             _ = try await unpacker.rootfs(for: image, platform: Self.platform)
             XCTFail("the unpack was expected to refuse the layer")
         } catch {
-            // expected
+            Self.assertIsTheLayerRefusal(error)
         }
 
         XCTAssertFalse(
@@ -38,7 +38,12 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         let (unpacker, image, cacheRoot) = try await Self.fixtureRefusingItsLayer()
         let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
 
-        _ = try? await unpacker.rootfs(for: image, platform: Self.platform)
+        do {
+            _ = try await unpacker.rootfs(for: image, platform: Self.platform)
+            XCTFail("the unpack was expected to refuse the layer")
+        } catch {
+            Self.assertIsTheLayerRefusal(error)
+        }
 
         let residue = (try? FileManager.default.contentsOfDirectory(
             atPath: slot.deletingLastPathComponent().path)) ?? []
@@ -62,7 +67,12 @@ final class ImageRootfsUnpackerTests: XCTestCase {
             _ = try await unpacker.rootfs(for: image, platform: Self.platform)
             XCTFail("an unreadable staged filesystem was expected to be refused")
         } catch {
-            // expected
+            XCTAssertTrue(
+                "\(error)".contains("below the 2097152-byte floor"),
+                "the refusal must be `verifyReadable`'s size assertion and not some earlier "
+                    + "error, or this test is not about verification-before-promotion at "
+                    + "all. Got: \(error)"
+            )
         }
 
         XCTAssertFalse(
@@ -226,6 +236,80 @@ final class ImageRootfsUnpackerTests: XCTestCase {
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: slot.path),
             "the reaper deleted the promoted rootfs, not just the orphan beside it"
+        )
+    }
+
+    /// An unreadable directory stops the sweep loudly rather than being walked past.
+    ///
+    /// **MEASURED that nothing else pins this**: reducing the enumerator's `errorHandler` to
+    /// `{ _, _ in true }` -- skip the entry, record nothing, return normally -- survives
+    /// every other test in this file. A sweep that walks past what it cannot read reports
+    /// success over a cache it has only partly seen, and the orphans it missed are
+    /// indistinguishable from a cache that had none.
+    ///
+    /// `chmod 000` on a directory inside the cache root is the cheapest real instance: the
+    /// enumerator cannot descend and hands the error to the handler.
+    func testAnUnreadableDirectoryMakesTheReaperThrowRatherThanReportSuccess() async throws {
+        try XCTSkipIf(
+            geteuid() == 0,
+            "root ignores the mode bits, so `chmod 000` cannot make the enumerator fail"
+        )
+
+        let (unpacker, image, cacheRoot) = try await Self.fixtureThatUnpacksCleanly()
+        _ = try await unpacker.rootfs(for: image, platform: Self.platform)
+
+        let unreadable = cacheRoot.appendingPathComponent("unreadable-image")
+        try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: unreadable.path
+        )
+        // Restored so the suite's own tearDown can still delete the scratch tree.
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: unreadable.path
+            )
+        }
+
+        do {
+            try unpacker.reapOrphanedStagingFiles()
+            XCTFail(
+                "the reaper reported success over a cache root it could not fully read; "
+                    + "an orphan it never saw is indistinguishable from no orphan at all"
+            )
+        } catch {
+            // expected
+        }
+    }
+
+    /// That the error came from the unpack REFUSING the layer, and not from never having
+    /// reached the unpack.
+    ///
+    /// **Without this, T1, T2 and T3 assert only that *something* threw**, and a `do/catch`
+    /// plus `XCTAssertFalse(fileExists)` is satisfied just as well by an error raised before
+    /// `EXT4.Formatter` is ever constructed -- at which point no slot could exist whatever
+    /// the promotion rule did. MEASURED (mutation K, requesting `linuxAmd` against this
+    /// arm64 fixture): all three passed on `unsupported: "platform linux/amd64"`, having
+    /// never run the mechanism they exist to pin.
+    ///
+    /// Both halves are checked, as `LayerCacheRoleTests` does. The wrapper proves the
+    /// failure happened *inside* the per-layer unpack loop, so the formatter existed and the
+    /// staging file was already on disk; the cause proves it is Task 6's archive refusal
+    /// rather than some other mid-unpack failure.
+    private static func assertIsTheLayerRefusal(
+        _ error: Error, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            "\(error)".contains("could not be unpacked into"),
+            "the failure must be the per-layer refusal raised INSIDE the unpack -- an error "
+                + "from before the formatter exists leaves no slot for reasons that have "
+                + "nothing to do with the mechanism under test. Got: \(error)",
+            file: file, line: line
+        )
+        XCTAssertTrue(
+            "\(error)".contains("is not a paxRestricted archive with filter none"),
+            "the refusal must be the archive refusal the fixture provokes and not some "
+                + "other mid-unpack failure. Got: \(error)",
+            file: file, line: line
         )
     }
 
