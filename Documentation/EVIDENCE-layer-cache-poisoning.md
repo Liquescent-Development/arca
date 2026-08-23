@@ -168,15 +168,77 @@ upstream.
 ## Mutation matrix
 
 **Do not read the layer-granularity matrix that this section used to hold as though
-it still ran.** The tests it measured are deleted. What follows is the matrix for
-`ImageRootfsUnpacker`: twelve mutations, at per-assertion granularity, accumulated
-over four review rounds. Every row was measured against a separately rebuilt
-binary, and an independent reviewer reproduced the implementer's failing sets
-rather than accepting them.
+it still ran.** The tests it measured are deleted. What follows replaces it.
+
+**Provenance, because a matrix without one is not evidence.** These rows were not
+all taken at the same commit or against the same suite. The suite grew as the
+review rounds added tests, so a row's failing set is a statement about the suite it
+ran against:
+
+| Measured at | Date | Suite size | Rows taken there |
+|---|---|---|---|
+| `7c2a40a` | 2026-08-21 | 5 tests | A, B, C, D, E, F |
+| `69ad815` | 2026-08-21 | 7 tests | A–F re-run, plus H, I, J, K, L |
+| `8ae55a9` | 2026-08-21 | 8 tests | all twelve; F changed from surviving to killed; **M survived** |
+| `f1a7f28` | 2026-08-21 | 9 tests | C, F and M re-run after T9 was added to kill M |
+| `63b30ce` | 2026-08-22 | **12 tests** | A, B, C, F, M **re-derived at the commit that carries this document** |
+
+Every mutation, in every round, was applied to a restored copy of the source and
+**rebuilt** — `--skip-build` was never used for a mutation — then reverted, with
+`git status --porcelain` checked clean afterwards.
+
+Mutations A–J were proposed by the implementer and independently reproduced by a
+reviewer. **K, L and M were the reviewer's own**, not reproductions of anything,
+and M is the one that mattered: it **survived** when first run, which is why T9
+exists at all.
 
 This table is the record. It is deliberately not a pointer at one, because the
 review notes it was assembled from are not in any repository — which is the failure
 the `!EVIDENCE-*.md` rule was written about.
+
+### Re-derived at this commit, against all twelve tests
+
+MEASURED on 2026-08-22 at `63b30ce`, this document's parent commit, against the
+twelve-test suite. Each mutation was applied to a restored copy of
+`ImageRootfsUnpacker.swift`, **rebuilt** (never `--skip-build`), and run with
+`swift test --disable-swift-testing --filter ImageRootfsUnpackerTests`; the file was
+then restored byte-identical (`shasum -a 256`
+`f09722d0b4ec4baf38150ae1854d8501f23488095eb4d55ff27f54a9d585489a`, checked before
+and after every mutation) and the restored suite re-run green.
+
+The commit carrying this document changes only doc comments in that test file — zero
+non-comment lines — so the failing sets hold for it too. Mutation A was re-run at
+this commit to check that rather than assume it, and gave the same two failures in
+the same one test.
+
+Assertions are named by what they say rather than by line offset, because a line
+offset in this plan has decayed twice inside a single round.
+
+| Mut | Failing tests | Which assertions fired |
+|---|---|---|
+| **A** `let staging = slot` | **T5 only — T1 PASSES** | both of T5's: "the unpack wrote the cache slot directly" and "the cache slot existed before the promotion" |
+| **B** drop the `catch` cleanup | T2 | T2's one: "a refused unpack left … in the image's cache directory" |
+| **C** delete the `verifyReadable` call | **T3 and T9** | all four: each test's "was expected to be refused" and each test's "was promoted into the cache slot" |
+| **F** `size >= capacityInBytes` → `size >= 0` | T3 | **only T3's error-identity assertion** ("the refusal must be `verifyReadable`'s size assertion and not some earlier error"). T3's slot assertion PASSES |
+| **M** delete only the `EXT4Reader` line | T9 | both of T9's |
+
+**A's result is the one to read twice.** Mechanism 1 is pinned by T5 and by nothing
+else. `testARefusedUnpackLeavesNoCacheSlot` passes with the unpack writing straight
+into the slot, because the error-path cleanup then deletes it and hides that it was
+ever the destination. A maintainer who trims T5 as an incidental test reintroduces
+upstream's write-straight-to-the-destination behaviour with nothing going red.
+
+**F's result confirms the bound stated below**, at HEAD rather than by transcription:
+the artefact is still refused with the size guard weakened — the failure message
+carries the fork guard's own `could not read 1024 bytes of superblock … at offset
+1024` — so what T3 pins today is which check reports, not whether the slot is
+protected.
+
+### Transcribed rows
+
+The remaining seven rows — **D, E, H, I, J, K, L** — are transcribed from the rounds
+above and were **not** re-derived at `63b30ce`. Their failing sets are statements
+about the 5-, 7- and 8-test suites they ran against.
 
 Test abbreviations, all in `Tests/ArcaEngineTests/ImageRootfsUnpackerTests.swift`:
 
@@ -191,6 +253,14 @@ Test abbreviations, all in `Tests/ArcaEngineTests/ImageRootfsUnpackerTests.swift
 | **T7** | `testTheReaperRemovesAnOrphanedStagingFileAndSparesThePromotedSlot` |
 | **T8** | `testAnUnreadableDirectoryMakesTheReaperThrowRatherThanReportSuccess` |
 | **T9** | `testACorrectlySizedStagedFileThatIsNotAnExt4IsNotPromoted` |
+
+**Three tests in the file appear in no row and have no T-number**, and no mutation
+here says anything about them:
+`testTheRootfsMountCarriesReadOnlyOnBothTheUnpackAndTheCacheHit`,
+`testTheRootfsMountDeclaresExt4OnBothTheUnpackAndTheCacheHit` and
+`testAnUnpackSparesAConcurrentCallsStagingFile`. They arrived with later tasks. Nine
+of the twelve tests are covered by this matrix; the mount-flag pair and the
+concurrent-staging test are not.
 
 The letters run A–F and H–M; there is no G in this table. G was an earlier
 platform-mismatch mutation over the test file, superseded by K, which asks the same
@@ -211,19 +281,18 @@ question by changing only the request.
 | **L** | `errorHandler` skips instead of stopping and rethrowing | {T8} |
 | **M** | delete only `_ = try EXT4.EXT4Reader(blockDevice:)`, keeping the size guard | {T9} |
 
-**All twelve kill.** Each row was measured; none is inferred from another. M and
-T9 arrived together and in that order: M survived the suite as it stood before T9
-existed, and T9 was written to kill it.
+**All twelve kill** — M only after T9 was written for it, which is recorded above
+rather than smoothed over.
 
 **What the shape of the failing sets shows.** A, B and C/F/M land on the three
-mechanisms above and nothing else: mechanism 1 on T5, mechanism 2 on T2, mechanism
-3 on T3 and T9. D, H and I/J/L pin the properties that surround them — that the
-cache is a cache at all, that the key includes the platform, and that the orphan
-reaper removes what it should and spares what it should.
+mechanisms and nothing else: mechanism 1 on T5, mechanism 2 on T2, mechanism 3 on T3
+and T9. D, H and I/J/L pin the properties that surround them — that the cache is a
+cache at all, that the key includes the platform, and that the orphan reaper removes
+what it should and spares what it should.
 
 C kills **two** because it deletes the feature that contains both halves of
-mechanism 3. That is the correct signal for such a mutation; a mutation that
-removed two behaviours and killed only one test would be the problem. F and M kill
+mechanism 3. That is the correct signal for such a mutation; a mutation that removed
+two behaviours and killed only one test would be the problem. F and M kill
 **disjoint singletons** — T3 and T9 — so the two halves stay independently pinned
 and neither stands in for the other. The same holds for the reaper: I kills both of
 T7 and T8, while J and L kill one each.
@@ -231,9 +300,10 @@ T7 and T8, while J and L kill one each.
 ### The bounds on two of these rows
 
 **Read F narrowly.** At the pinned submodule pointer it pins *which check reports*,
-not *whether the artefact is refused*. Measured at the per-assertion level, only
-T3's error-identity assertion fails under F; T3's slot assertion still passes,
-because the fork's own guard in
+not *whether the artefact is refused*. Confirmed at `63b30ce` in the table above and
+not merely transcribed: under F only T3's error-identity assertion fails, and T3's
+slot assertion — that the artefact was not promoted — still passes, because the
+fork's own guard in
 `containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`
 (`data.count == superBlockSize`) refuses the truncated artefact underneath. That
 guard goes out with the volume-label work at the pointer bump, and then nothing is

@@ -585,11 +585,11 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// whether it holds the content in full: an image under exactly this digest,
     /// and every blob that image names present in the content store. That last
     /// part is the substance -- an image row can outlive its layer blobs, and
-    /// the cheap answer, `imageExists(nameOrId:)`
-    /// (`ContainerBridge/ImageManager.swift:616-624`), says `true` for one that
-    /// has: it is built on `inspectImage`, which reads the index, the manifest
-    /// and the config and never a layer. `Ack` carries no payload, so an `Ack`
-    /// granted on that answer is a report the consumer has no way to check.
+    /// the cheap answer, `ContainerBridge.ImageManager.imageExists(nameOrId:)`,
+    /// says `true` for one that has: it is built on `inspectImage(nameOrId:)`,
+    /// which reads the index, the manifest and the config and never a layer.
+    /// `Ack` carries no payload, so an `Ack` granted on that answer is a report
+    /// the consumer has no way to check.
     ///
     /// It does **not** materialise a rootfs, which is what
     /// `PrepareImageRequest`'s own comment in `proto/arca/engine/v1/engine.proto`
@@ -627,10 +627,10 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// **The repository is checked as well as the digest.** Answering `Ack` for
     /// content held under a different repository would be a success followed by
     /// a `Create` failure, since `ContainerManager.createContainer` resolves the
-    /// image by the reference it is given
-    /// (`ContainerBridge/ContainerManager.swift:1696-1698`). The comparison
-    /// splits both sides by Gas Can's own rule -- see
-    /// `imageRepository(ofReference:)` -- and is exact. It normalizes no
+    /// image by the reference it is given -- its one call to
+    /// `imageManager.getImage(nameOrId:)`, passing the caller's `image` string
+    /// through unchanged. The comparison splits both sides by Gas Can's own rule
+    /// -- see `imageRepository(ofReference:)` -- and is exact. It normalizes no
     /// registry prefix, so content stored as `docker.io/library/alpine:3.19` is
     /// not found under a requested repository of `alpine`. That is the safe
     /// direction and it is chosen deliberately: a false `not_found` is visible

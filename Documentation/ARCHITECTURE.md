@@ -437,6 +437,10 @@ The image therefore contributes exactly one block device whatever its layer coun
 <image-store>/containers/<container-id>/writable.ext4              private, one per container
 ```
 
+`<image-digest>` has its `:` rewritten to `-`, so the directory is
+`sha256-<hex>` and not `sha256:<hex>` — `rootfsPath(forImageDigest:platform:)` does
+that rewrite, and a reader looking for the literal digest on disk will not find it.
+
 `ImageRootfsUnpacker` (`Sources/ContainerBridge/ImageRootfsUnpacker.swift`) owns
 the first of those. The second is `ContainerManager.writableLayer(at:sizeInBytes:)`.
 Upstream's `LinuxContainer` stacks them inside the guest — the image rootfs as the
@@ -531,7 +535,7 @@ graph TB
 
         subgraph "Extensions"
             WG[wireguard-service/<br/>WireGuard management]
-            FS[filesystem-service/<br/>diff and volume RPCs<br/>see caveat below]
+            FS[filesystem-service/<br/>guest filesystem RPCs<br/>see caveat below]
         end
     end
 
@@ -561,10 +565,14 @@ graph TB
     style Binary fill:#e1ffe1
 ```
 
-**Caveat on `filesystem-service`.** The binary is built and shipped, but its two
-OverlayFS-based RPCs do not work, and did not work before the revert to a single
-composed rootfs either. Both hardcode guest paths that nothing creates. Verified
-against the pinned submodule object
+**Caveat on `filesystem-service`.** The binary is built and shipped and serves ten
+RPCs — `Ready`, `SyncFilesystem`, `EnumerateUpperdir`, `ReadArchive`,
+`WriteArchive`, `CreateBindMount`, `StatPath`, `CreateVolumeOverlay`,
+`CreateDirectMount` and `GenerateHostsFile`, per the method descriptors in
+`Sources/ContainerBridge/Generated/filesystem.grpc.swift`.
+**Two of them are OverlayFS-based, and those two do not work** — and did not
+work before the revert to a single composed rootfs either. They are broken in
+different ways, not one way. Verified against the pinned submodule object
 (`git show 6304122:vminitd/extensions/arca-services/internal/filesystem/filesystem.go`):
 
 - `EnumerateUpperdir`, which `docker diff` reaches, looks for `/mnt/vdb/upper`

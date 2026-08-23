@@ -9,18 +9,44 @@ import ContainerizationOCI
 
 /// The per-image cache slot is created only by a promotion.
 ///
-/// The first three tests below pin the three mechanisms that make that true, one each, and
-/// the fourth pins the second half of the third. The rest pin the surrounding properties:
-/// the cache hit, the platform component of the key, the mount's flags, and how staging
-/// files are reaped and spared.
+/// **Which test pins which mechanism, MEASURED. Do not infer it from the order of the
+/// tests or from the `Mechanism N` label on any one of them.** Each mutation below was
+/// applied to this commit's source, rebuilt, and run against all twelve tests here:
+///
+/// - **Mechanism 1, promotion-on-success --
+///   `testTheUnpackWritesASiblingOfTheSlotAndNeverTheSlotItself` ALONE.** `let staging =
+///   slot` fails that test twice and nothing else; `testARefusedUnpackLeavesNoCacheSlot`
+///   PASSES, because the error-path cleanup then deletes the slot and hides that it was
+///   ever the destination. **That test is not a surrounding property and must not be
+///   trimmed as one.** It is the only thing standing between this type and upstream's
+///   write-straight-to-the-destination behaviour, which is the defect this whole design
+///   exists to prevent.
+/// - **Mechanism 2, staging-cleanup-on-failure --
+///   `testARefusedUnpackLeavesNoScratchBesideTheSlot`.** Dropping the `catch`'s
+///   `removeItem` fails that test and nothing else.
+/// - **Mechanism 3, verification-before-promotion -- two halves, one test each.** Deleting
+///   the whole `verifyReadable` call fails BOTH
+///   `testAStagedFileWithNoReadableSuperblockIsNotPromoted` and
+///   `testACorrectlySizedStagedFileThatIsNotAnExt4IsNotPromoted`. Weakening only the size
+///   guard fails the first; deleting only the `EXT4Reader` line fails the second. The
+///   halves are independently pinned.
+///
+/// The remaining tests pin properties around those three: the cache hit, the platform
+/// component of the key, the mount's type and flags, and how staging files are reaped and
+/// spared.
 ///
 /// `EVIDENCE-layer-cache-poisoning.md` records the layer-granularity version of this defect
 /// -- an unpack that threw left a valid, correctly labelled, EMPTY ext4 in the slot and the
-/// next create reused it -- and carries the mutation matrix for this file, with the
-/// test-name mapping it uses and the bounds on two of its rows.
+/// next create reused it -- and carries the full mutation matrix, with the test-name
+/// mapping it uses, what was measured where, and the bounds on two of its rows.
 final class ImageRootfsUnpackerTests: XCTestCase {
 
-    /// Mechanism 1: a refused unpack leaves no slot for the next create to hit.
+    /// The refusal path's observable outcome: a refused unpack leaves no slot for the next
+    /// create to hit.
+    ///
+    /// **This does NOT pin mechanism 1 on its own, MEASURED**: it passes with the unpack
+    /// writing straight to the slot, because the error-path cleanup then deletes it.
+    /// `testTheUnpackWritesASiblingOfTheSlotAndNeverTheSlotItself` is what pins that.
     func testARefusedUnpackLeavesNoCacheSlot() async throws {
         let (unpacker, image, cacheRoot) = try await Self.fixtureRefusingItsLayer()
         let slot = unpacker.rootfsPath(forImageDigest: image.digest, platform: Self.platform)
