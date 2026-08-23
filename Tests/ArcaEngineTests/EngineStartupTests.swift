@@ -14,6 +14,113 @@ final class EngineStartupTests: XCTestCase {
         return root
     }
 
+    // MARK: - `--state-root`
+
+    /// `--state-root` is the one option the engine deletes out of: `EngineManagers.init`
+    /// reclaims `<state-root>/layers` on every start. Until this refusal existed the option
+    /// was validated by nothing at all, and `arca-engine serve --state-root ""` recursively
+    /// removed `$CWD/layers` -- MEASURED on 2026-08-22, in the round committed as `fc96ee1`
+    /// on this branch.
+    ///
+    /// The four forms below are refused **before any check reads the filesystem**, which is
+    /// what `EngineInputs` keeping the raw option text buys: `URL(fileURLWithPath:)` resolves
+    /// every one of them against the working directory, so a `URL`-typed input would arrive
+    /// here indistinguishable from a state root the operator meant.
+    func testAnEmptyOrRelativeStateRootIsRefusedAndNamesTheOption() throws {
+        // `~/foo` is here rather than among the absolute forms because `URL` would have
+        // resolved it too -- against `$HOME`, MEASURED on 2026-08-22 -- so it belongs to the
+        // same class: a value the engine would not have taken literally.
+        for value in ["", ".", "..", "relative/root", "~/foo", "~"] {
+            let root = temporaryRoot()
+            let kernelPath = root.appendingPathComponent("vmlinux")
+            FileManager.default.createFile(atPath: kernelPath.path, contents: Data())
+            let layout = root.appendingPathComponent("vminit")
+            try FileManager.default.createDirectory(at: layout, withIntermediateDirectories: true)
+            for marker in ["oci-layout", "index.json"] {
+                FileManager.default.createFile(
+                    atPath: layout.appendingPathComponent(marker).path, contents: Data()
+                )
+            }
+
+            XCTAssertThrowsError(
+                try validateEngineInputs(
+                    EngineInputs(
+                        stateRoot: value,
+                        kernelPath: kernelPath.path,
+                        vminitLayout: layout.path
+                    )
+                ),
+                "expected \(value.debugDescription) to be refused"
+            ) { error in
+                guard let startupError = error as? EngineStartupError,
+                    case .unusableOptionValue(let name, let raw, _) = startupError
+                else {
+                    return XCTFail("expected unusableOptionValue, got \(error)")
+                }
+                XCTAssertEqual(name, "--state-root")
+                XCTAssertEqual(raw, value)
+            }
+        }
+    }
+
+    /// An absolute state root is not enough: `.`, `..` and empty components survive into the
+    /// `URL` verbatim and are resolved by the filesystem afterwards, so the path checked and
+    /// the path deleted from need not be the same directory. The all-slashes spellings are
+    /// refused for their own reason -- they name the filesystem root.
+    ///
+    /// The kernel and layout here are deliberately absent. The assertion is that the
+    /// state-root refusal comes first -- a `missingInput` for `--kernel-path` would mean the
+    /// engine had already begun reading the filesystem on the strength of an unchecked root.
+    func testANonCanonicalOrFilesystemRootStateRootIsRefusedBeforeAnyOtherCheck() {
+        // `"//"` and `"///"` are the reason this list grew in round 2: while the rule compared
+        // against `"/"` by string they returned nil here, passed the boundary, and were stopped
+        // only by the reclaim's own copy of the check -- which prevents the deletion but loses
+        // the ordering property this test is about. MEASURED on 2026-08-22:
+        // `URL(fileURLWithPath:)` maps both to `"/"`.
+        for value in ["/a/../b", "/a/./b", "/", "//", "///", "/a//b"] {
+            XCTAssertThrowsError(
+                try validateEngineInputs(
+                    EngineInputs(
+                        stateRoot: value,
+                        kernelPath: "/nonexistent/vmlinux",
+                        vminitLayout: "/nonexistent/vminit"
+                    )
+                ),
+                "expected \(value.debugDescription) to be refused"
+            ) { error in
+                guard let startupError = error as? EngineStartupError,
+                    case .unusableOptionValue(let name, _, _) = startupError
+                else {
+                    return XCTFail("expected unusableOptionValue for \(value), got \(error)")
+                }
+                XCTAssertEqual(name, "--state-root")
+            }
+        }
+    }
+
+    /// A canonical absolute state root passes this check, so the refusals above are refusing
+    /// the form and not the option.
+    func testACanonicalAbsoluteStateRootIsAccepted() throws {
+        let root = temporaryRoot()
+        let kernelPath = root.appendingPathComponent("vmlinux")
+        FileManager.default.createFile(atPath: kernelPath.path, contents: Data())
+        let layout = root.appendingPathComponent("vminit")
+        try FileManager.default.createDirectory(at: layout, withIntermediateDirectories: true)
+        for marker in ["oci-layout", "index.json"] {
+            FileManager.default.createFile(
+                atPath: layout.appendingPathComponent(marker).path, contents: Data()
+            )
+        }
+
+        XCTAssertNoThrow(
+            try validateEngineInputs(
+                EngineInputs(
+                    stateRoot: root.path, kernelPath: kernelPath.path, vminitLayout: layout.path
+                )
+            )
+        )
+    }
+
     /// A missing kernel is a refusal to start, not a degraded engine. An engine
     /// that starts and answers unsupported_capability for everything that
     /// matters is the state the C1 review finding was raised against.
@@ -21,9 +128,9 @@ final class EngineStartupTests: XCTestCase {
         let root = temporaryRoot()
         let kernelPath = root.appendingPathComponent("vmlinux")
         let inputs = EngineInputs(
-            stateRoot: root,
-            kernelPath: kernelPath,
-            vminitLayout: root.appendingPathComponent("vminit")
+            stateRoot: root.path,
+            kernelPath: kernelPath.path,
+            vminitLayout: root.appendingPathComponent("vminit").path
         )
 
         XCTAssertThrowsError(try validateEngineInputs(inputs)) { error in
@@ -48,7 +155,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root, kernelPath: kernelPath, vminitLayout: layout)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         ) { error in
             guard let startupError = error as? EngineStartupError,
@@ -73,7 +184,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root, kernelPath: kernelPath, vminitLayout: layout)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         ) { error in
             guard let startupError = error as? EngineStartupError,
@@ -100,7 +215,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root, kernelPath: kernelPath, vminitLayout: layout)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         )
     }
@@ -123,7 +242,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root, kernelPath: kernelPath, vminitLayout: layout)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         ) { error in
             guard let startupError = error as? EngineStartupError,
@@ -156,7 +279,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertNoThrow(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root, kernelPath: kernelPath, vminitLayout: layout)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         )
     }

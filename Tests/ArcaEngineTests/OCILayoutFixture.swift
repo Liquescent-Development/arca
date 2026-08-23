@@ -31,8 +31,19 @@ enum OCILayoutFixture {
     /// was ASKED FOR by layers that differ, and the two readings differ in what
     /// they can see: the path is what a whole wrong layer in a slot shows
     /// structurally, and the content is what a right filename over wrong or
-    /// absent bytes shows -- which is the finding `LayerCacheRoleTests` already
-    /// records twice for the one-layer case, one level down each time.
+    /// absent bytes shows.
+    ///
+    /// **No test in the tree reads either half back out of an unpacked
+    /// filesystem today.** The per-layer suite that
+    /// did -- `LayerCacheRoleTests`, which recorded that finding twice for the
+    /// one-layer case, one level down each time -- was deleted in `2d1f8db`
+    /// along with the per-layer cache it covered, and the unpack tests that
+    /// survive it (`ImageRootfsUnpackerTests`) assert at image granularity
+    /// without ever opening the filesystem. Both fields are kept anyway,
+    /// because the sentence above is a claim about what the two readings can
+    /// SEE, which is a property of the fixture rather than of any one suite: a
+    /// per-layer assertion added back with only one of them would be blind to
+    /// exactly one of the two failures, and silently.
     struct Layer {
         /// How the blob under the layer's media type is written.
         ///
@@ -43,7 +54,30 @@ enum OCILayoutFixture {
         /// bytes that are not the archive their media type declares -- had no
         /// in-tree producer, and what the unpacker's CALLER does with that
         /// refusal could not be tested at all. It is the caller, not the refusal,
-        /// that `LayerCacheRoleTests` uses this for.
+        /// that its one consumer uses this for:
+        /// `ImageRootfsUnpackerTests.fixtureRefusingItsLayer`, which drives
+        /// exactly TWO tests -- `testARefusedUnpackLeavesNoCacheSlot` and
+        /// `testARefusedUnpackLeavesNoScratchBesideTheSlot`.
+        ///
+        /// **The layer-granularity suite drove a third, and it has no
+        /// successor.**
+        /// `LayerCacheRoleTests.testARefusedLayerLeavesNoPartialSlotForItsSiblings`
+        /// -- deleted with the rest of that file in `2d1f8db` -- pinned that one
+        /// refused layer leaves no SIBLING slot reusable-but-incomplete. The
+        /// per-layer `unpack` ran its layers in a throwing task group, so a
+        /// refusal cancelled the siblings mid-unpack, a formatter closed there
+        /// wrote a correctly labelled but partially populated slot, and slots
+        /// keyed by digest alone were shared with every other image carrying
+        /// that layer.
+        ///
+        /// **That property cannot be expressed at image granularity**, which is
+        /// why nothing replaced it: there is one slot per image and platform, so
+        /// there are no siblings to leave partial and no digest-keyed sharing
+        /// between images for a partial artefact to travel through. What carries
+        /// over is narrower -- that a partial or unreadable artefact is not
+        /// promoted into the image's OWN slot, which is Mechanism 3 in
+        /// `ImageRootfsUnpackerTests`. Read the difference as coverage that went
+        /// away with the thing it covered, not as coverage retained.
         enum Blob {
             /// A real uncompressed pax tar holding `content` at `path`.
             case archive
@@ -222,8 +256,21 @@ enum OCILayoutFixture {
     /// asserting only on the label cannot tell that apart from a layer that
     /// holds its image, and a labelled empty layer is this milestone's own
     /// defect signature -- a rootfs built from none of its image, with `Start`
-    /// succeeding. `testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt`
-    /// asserts on `/payload`, and the revert above is what makes it fail.
+    /// succeeding. The test that revert turned red was
+    /// `LayerCacheRoleTests.testUnpackingOverAStaleCacheEntryRelabelsItRatherThanReusingIt`,
+    /// which asserted on `/payload`; it is history, deleted in `2d1f8db` with
+    /// the per-layer cache, so the measurement above is a record of what was
+    /// observed then and not a check a reader can re-run at HEAD.
+    ///
+    /// **No test at HEAD reads a file back out of the unpacked filesystem** --
+    /// production's `verifyReadable` opens one only far enough to construct an
+    /// `EXT4.EXT4Reader` (`ImageRootfsUnpacker.verifyReadable`) and never looks
+    /// up a path. That makes the requirement to write a real tar rest on the
+    /// refusal path
+    /// below rather than on a content assertion. That is enough to keep it:
+    /// the requirement is restated on its own terms below, under **That fix
+    /// does not weaken the requirement to write a real tar**, against the
+    /// unpacker this fixture actually runs against.
     ///
     /// **The unpacker defect that measurement exposed is CLOSED at submodule
     /// `6ede1d5`, so the paragraph above describes `3f68806` and not the code
@@ -232,9 +279,16 @@ enum OCILayoutFixture {
     /// valid, correctly labelled, empty `layer.ext4`. MEASURED after that commit,
     /// the same revert -- `Data($0.content.utf8)` in place of `layerArchive`,
     /// under this fixture's `MediaTypes.imageLayer` -- fails the same test
-    /// through production, `OverlayFSUnpacker.swift:84` reporting `the source is
+    /// through production, the then-current `OverlayFSUnpacker` reporting `the source is
     /// not a paxRestricted archive with filter none: … reading the next archive
-    /// header failed with code -30: Truncated tar archive`.
+    /// header failed with code -30: Truncated tar archive`. (That type is deleted at the
+    /// `a5803b6` pointer this repository now carries; `EXT4Unpacker` is the unpacker in its
+    /// place, and it raises the same `UnpackError.sourceIsNotDeclaredArchive` from the same
+    /// `EXT4.Formatter.unpack` call. An earlier version of this paragraph cited
+    /// `OverlayFSUnpacker.swift:84` for the report. At `6ede1d5` that offset lands on the
+    /// `let layerPaths = try await withThrowingTaskGroup(...)` binding that fans the layer
+    /// walk out -- not on a throw site and nowhere near the refusal. It is dropped rather
+    /// than replaced with a second number: naming the type is what survives the next edit.)
     ///
     /// **The quoted text is what `6ede1d5` reported and is no longer what a
     /// reader at HEAD sees**, because the refusal is now wrapped with the layer's
@@ -243,8 +297,13 @@ enum OCILayoutFixture {
     /// could not be unpacked into …` carrying the sentence above as its cause.
     /// The revert is also no longer the way to produce one --
     /// `Layer.Blob.bytesThatAreNotTheDeclaredArchive` is, and
-    /// `LayerCacheRoleTests.testAnUnpackThatRefusesALayerLeavesNoCacheEntryForTheNextCreateToReuse`
-    /// asserts on both halves of the message rather than quoting it here.
+    /// `ImageRootfsUnpackerTests.assertIsTheLayerRefusal` asserts on both
+    /// halves of the message -- the `could not be unpacked into` wrapper and
+    /// the `is not a paxRestricted archive with filter none` cause -- rather
+    /// than quoting it here. (The per-layer test that used to hold that
+    /// assertion,
+    /// `LayerCacheRoleTests.testAnUnpackThatRefusesALayerLeavesNoCacheEntryForTheNextCreateToReuse`,
+    /// was deleted in `2d1f8db`; the property survives at image granularity.)
     ///
     /// **That fix does not weaken the requirement to write a real tar.** A
     /// fixture handing the unpacker a blob it refuses tests the refusal, and
@@ -285,9 +344,12 @@ enum OCILayoutFixture {
     /// `path` is relative, which is the shape a real OCI layer tar has;
     /// `/usr/bin/tar -tvf` prints `Removing leading '/' from member names` for
     /// an absolute one. It lands at `/<path>` in the unpacked filesystem either
-    /// way, which is what `LayerCacheRoleTests` asserts on -- `/payload` for the
-    /// one-layer wrapper, and one path per layer for a multi-layer layout, where
-    /// telling the slots apart is the point.
+    /// way -- `/payload` for the one-layer wrapper, and one path per layer for a
+    /// multi-layer layout, where telling the slots apart is the point. The suite
+    /// that asserted on those paths was `LayerCacheRoleTests`, deleted in
+    /// `2d1f8db`. The relative shape stays regardless: it is the shape a real
+    /// OCI layer tar has, which is a fact about this fixture's fidelity to the
+    /// format rather than about any test that reads it.
     private static func layerArchive(at path: String, containing payload: String) throws -> Data {
         let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("arca-oci-layer-\(UUID().uuidString).tar")

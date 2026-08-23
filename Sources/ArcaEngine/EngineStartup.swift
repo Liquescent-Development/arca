@@ -5,24 +5,44 @@ import Logging
 /// The engine's inputs, split by mutability.
 ///
 /// `stateRoot` is mutable and private to this engine: state.db, images/,
-/// volumes/, layers/. Sharing it with a live ArcaDaemon is the hazard the C1
-/// review finding named -- ContainerManager's restore loop marks persisted
-/// "running" containers exited 137 and writes that back.
+/// image-rootfs/, volumes/, logs/. (`layers/` was in this list until the
+/// single-composed-rootfs revert; `image-rootfs/` replaced it, and `volumes/`
+/// was dropped from the sentence by mistake in the same edit --
+/// `EnginePaths.volumesRoot` never went anywhere. The list names the children
+/// this sentence is about and is not an inventory of `EnginePaths.init`, which
+/// also assigns `vminit-digest` and `arca.sock`.) Sharing it with a live
+/// ArcaDaemon is the hazard the C1 review finding named -- ContainerManager's
+/// restore loop marks persisted "running" containers exited 137 and writes that
+/// back.
 ///
 /// `kernelPath` and `vminitLayout` are read-only inputs. A file two processes
 /// read is safe to share; a state root is not. They are separate options so
 /// that the CLI cannot express the confusion, and it is why the kernel is no
 /// longer one of `EnginePaths`' derivations: deriving it from the state root
 /// forced a read-only file to live inside the one directory the engine owns.
+///
+/// **Constructed from the raw option strings, not from `URL`s, and that is load
+/// bearing.** `URL(fileURLWithPath:)` resolves a relative path against the
+/// working directory, so `""`, `"."`, `".."` and `"a/b"` all become ordinary
+/// absolute paths at the moment of the parse -- MEASURED with a `swiftc` probe
+/// on 2026-08-22. Taking `URL`s here would destroy, before any validation ran,
+/// the only evidence that distinguishes those four from a state root the
+/// operator meant. `--state-root ""` recursively removed `$CWD/layers` while
+/// this type took a `URL`. The raw text is kept so `validateEngineInputs` can
+/// refuse them; see `LayerCacheReclaim.rootRefusal(for:)`.
 public struct EngineInputs: Sendable {
+    /// Exactly what `--state-root` carried, before any resolution.
+    public let stateRootOption: String
+
     public let stateRoot: URL
     public let kernelPath: URL
     public let vminitLayout: URL
 
-    public init(stateRoot: URL, kernelPath: URL, vminitLayout: URL) {
-        self.stateRoot = stateRoot
-        self.kernelPath = kernelPath
-        self.vminitLayout = vminitLayout
+    public init(stateRoot: String, kernelPath: String, vminitLayout: String) {
+        self.stateRootOption = stateRoot
+        self.stateRoot = URL(fileURLWithPath: stateRoot)
+        self.kernelPath = URL(fileURLWithPath: kernelPath)
+        self.vminitLayout = URL(fileURLWithPath: vminitLayout)
     }
 }
 
@@ -35,6 +55,11 @@ public enum EngineStartupError: Error, CustomStringConvertible {
     /// nor the layout that was read. A refusal that does not say what to fix is
     /// a worse failure than a crash.
     case unexpectedVminitReference(name: String, path: String, expected: String, actual: String)
+    /// An option whose *text* is wrong, as distinct from an option naming a path
+    /// that is wrong. It carries the raw value rather than a resolved path
+    /// because for `--state-root` the two differ: the empty and relative forms
+    /// are gone by the time a `URL` exists. See `EngineInputs`.
+    case unusableOptionValue(name: String, value: String, cause: String)
 
     public var description: String {
         switch self {
@@ -44,6 +69,9 @@ public enum EngineStartupError: Error, CustomStringConvertible {
             return "\(name) is unusable at \(path): \(cause)"
         case .unexpectedVminitReference(let name, let path, let expected, let actual):
             return "\(name) at \(path) holds \(actual), not \(expected)"
+        case .unusableOptionValue(let name, let value, let cause):
+            return "\(name) \(cause): \(value.isEmpty ? "\"\"" : value). Pass a canonical "
+                + "absolute directory."
         }
     }
 }
@@ -52,6 +80,23 @@ public enum EngineStartupError: Error, CustomStringConvertible {
 /// error rather than a partially-initialised engine.
 public func validateEngineInputs(_ inputs: EngineInputs) throws {
     let fileManager = FileManager.default
+
+    // `--state-root` first, and ahead of every check that touches the
+    // filesystem, because it is the one option this engine *deletes* out of:
+    // `EngineManagers.init` reclaims `<state-root>/layers` on every start. The
+    // rule is `LayerCacheReclaim`'s own, applied here to the raw option text
+    // because this is the last point at which the empty and relative forms are
+    // still distinguishable -- the reclaim's copy of the same check sees a path
+    // `URL` has already resolved. Neither check subsumes the other; the doc
+    // comment on `rootRefusal(for:)` says which catches what.
+    //
+    // Unlike the two below, this refusal reads no filesystem at all, so it
+    // cannot itself be the thing that creates or touches a wrong directory.
+    if let reason = LayerCacheReclaim.rootRefusal(for: inputs.stateRootOption) {
+        throw EngineStartupError.unusableOptionValue(
+            name: stateRootOption, value: inputs.stateRootOption, cause: reason
+        )
+    }
 
     var isDirectory: ObjCBool = false
     guard fileManager.fileExists(atPath: inputs.kernelPath.path, isDirectory: &isDirectory) else {
@@ -118,6 +163,10 @@ package func validateOCILayoutDirectory(_ directory: URL, option: String) throws
 /// The option `validateEngineInputs` and `loadVminit` refuse on behalf of, so a
 /// refusal names the thing the user would change.
 private let vminitLayoutOption = "--vminit-layout"
+
+/// The option whose value becomes the directory the engine owns -- and the one
+/// the per-layer cache reclaim deletes a child out of.
+private let stateRootOption = "--state-root"
 
 /// The reference the exported layout carries. VERIFIED against the real one:
 /// `head -c 400 ~/.arca/vminit/index.json` shows its single manifest annotated

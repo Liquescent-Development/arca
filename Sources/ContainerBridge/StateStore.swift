@@ -1,7 +1,6 @@
 import Foundation
 import SQLite
 import Logging
-import Containerization
 import ArcaIP
 
 /// StateStore manages persistent container and network state in SQLite
@@ -19,7 +18,6 @@ public actor StateStore {
     private nonisolated(unsafe) let volumeMounts = Table("volume_mounts")
     private nonisolated(unsafe) let subnetAllocation = Table("subnet_allocation")
     private nonisolated(unsafe) let filesystemBaselines = Table("filesystem_baselines")
-    private nonisolated(unsafe) let layerCache = Table("layer_cache")
     private nonisolated(unsafe) let schemaVersion = Table("schema_version")
 
     // Container columns (nonisolated - immutable and thread-safe)
@@ -94,14 +92,6 @@ public actor StateStore {
     private nonisolated(unsafe) let fileSize = Expression<Int64>("file_size")
     private nonisolated(unsafe) let fileMtime = Expression<Int64>("file_mtime")
     private nonisolated(unsafe) let capturedAt = Expression<String>("captured_at")
-
-    // Layer cache columns (nonisolated - immutable and thread-safe)
-    private nonisolated(unsafe) let layerDigest = Expression<String>("digest")
-    private nonisolated(unsafe) let layerPath = Expression<String>("path")
-    private nonisolated(unsafe) let layerSize = Expression<Int64>("size")
-    private nonisolated(unsafe) let layerCreatedAt = Expression<String>("created_at")
-    private nonisolated(unsafe) let layerLastUsed = Expression<String>("last_used")
-    private nonisolated(unsafe) let layerRefCount = Expression<Int>("ref_count")
 
     // Schema version columns (nonisolated - immutable and thread-safe)
     private nonisolated(unsafe) let version = Expression<Int>("version")
@@ -184,6 +174,30 @@ public actor StateStore {
         // Migration to v2: Add unique index on (network_id, ip_address) to prevent IPAM race conditions
         if currentVersion < 2 {
             try migrateToV2Synchronously()
+        }
+
+        // Migration to v3: drop the layer cache the single-composed-rootfs revert orphaned
+        if currentVersion < 3 {
+            try migrateToV3Synchronously()
+        }
+    }
+
+    /// Migration to v3: drop `layer_cache`.
+    ///
+    /// Removing the table's definition above stops a *new* database growing one; every
+    /// database that already exists keeps its rows until something drops them, and after this
+    /// revert nothing will ever read them again. `LayerCacheReclaim` reclaims the ext4 files
+    /// those rows indexed; this reclaims the index.
+    ///
+    /// Raw SQL because SQLite.swift's `Table` API is reached through the table constants at
+    /// the top of this type, and keeping one alive only to drop it would leave a live handle
+    /// on a table nothing else may touch. `IF EXISTS` because the table is absent on a
+    /// database created after this change and on one created before it and never started
+    /// under the fork -- neither is an error. SQLite drops a table's indexes with the table.
+    private nonisolated func migrateToV3Synchronously() throws {
+        try db.transaction {
+            try db.run("DROP TABLE IF EXISTS layer_cache")
+            try db.run(schemaVersion.insert(or: .replace, version <- 3))
         }
     }
 
@@ -361,20 +375,6 @@ public actor StateStore {
             // Filesystem baseline indexes
             try db.run(filesystemBaselines.createIndex(baselineContainerID, ifNotExists: true))
             try db.run(filesystemBaselines.createIndex(filePath, baselineContainerID, unique: true, ifNotExists: true))
-
-            // Layer cache table (for OverlayFS layer caching - Phase 1, Task 1.3)
-            try db.run(layerCache.create(ifNotExists: true) { t in
-                t.column(layerDigest, primaryKey: true)  // sha256:abc123...
-                t.column(layerPath)                      // ~/.arca/layers/sha256:abc123.../layer.ext4
-                t.column(layerSize)                      // Size in bytes
-                t.column(layerCreatedAt, defaultValue: Date().iso8601String)  // When first cached
-                t.column(layerLastUsed, defaultValue: Date().iso8601String)   // Last access time
-                t.column(layerRefCount, defaultValue: 0)  // Number of containers using this layer
-            })
-
-            // Layer cache indexes
-            try db.run(layerCache.createIndex(layerDigest, unique: true, ifNotExists: true))
-            try db.run(layerCache.createIndex(layerRefCount, ifNotExists: true))
 
             // Mark schema as v1
             try db.run(schemaVersion.insert(version <- 1))
@@ -1415,125 +1415,6 @@ public actor StateStore {
             "container": "\(containerID)",
             "entries": "\(deleted)"
         ])
-    }
-
-    // MARK: - Layer Cache Operations
-
-    /// Record a cached layer in the database
-    public func recordLayerCache(digest: String, path: String, size: Int64) throws {
-        let now = Date()
-        try db.run(layerCache.insert(or: .replace,
-            layerDigest <- digest,
-            layerPath <- path,
-            layerSize <- size,
-            layerCreatedAt <- now.iso8601String,
-            layerLastUsed <- now.iso8601String,
-            layerRefCount <- 0
-        ))
-
-        logger.debug("Layer cache recorded", metadata: [
-            "digest": "\(digest.prefix(19))...",
-            "size_mb": "\(size / 1024 / 1024)"
-        ])
-    }
-
-    /// Increment reference count for a layer
-    public func incrementLayerRefCount(digest: String) throws {
-        let layer = layerCache.filter(layerDigest == digest)
-        try db.run(layer.update(
-            layerRefCount += 1,
-            layerLastUsed <- Date().iso8601String
-        ))
-
-        logger.debug("Layer ref count incremented", metadata: [
-            "digest": "\(digest.prefix(19))..."
-        ])
-    }
-
-    /// Decrement reference count for a layer
-    public func decrementLayerRefCount(digest: String) throws {
-        let layer = layerCache.filter(layerDigest == digest)
-        let updated = try db.run(layer.update(layerRefCount -= 1))
-
-        if updated > 0 {
-            logger.debug("Layer ref count decremented", metadata: [
-                "digest": "\(digest.prefix(19))..."
-            ])
-        }
-    }
-
-    /// Load layer cache information
-    public func loadLayerCache(digest: String) throws -> (path: String, size: Int64, refCount: Int)? {
-        guard let row = try db.pluck(layerCache.filter(layerDigest == digest)) else {
-            return nil
-        }
-        return (
-            path: row[layerPath],
-            size: row[layerSize],
-            refCount: row[layerRefCount]
-        )
-    }
-
-    /// Load all cached layers
-    public func loadAllCachedLayers() throws -> [(digest: String, path: String, size: Int64, refCount: Int, lastUsed: Date)] {
-        var result: [(String, String, Int64, Int, Date)] = []
-        for row in try db.prepare(layerCache) {
-            if let lastUsedDate = Date(iso8601String: row[layerLastUsed]) {
-                result.append((
-                    row[layerDigest],
-                    row[layerPath],
-                    row[layerSize],
-                    row[layerRefCount],
-                    lastUsedDate
-                ))
-            }
-        }
-        return result
-    }
-
-    /// Get unreferenced layers (ref_count == 0)
-    public func getUnreferencedLayers() throws -> [String] {
-        var digests: [String] = []
-        for row in try db.prepare(layerCache.filter(layerRefCount == 0)) {
-            digests.append(row[layerDigest])
-        }
-        return digests
-    }
-
-    /// Delete a cached layer from database
-    public func deleteLayerCache(digest: String) throws {
-        let layer = layerCache.filter(layerDigest == digest)
-        let deleted = try db.run(layer.delete())
-
-        if deleted > 0 {
-            logger.debug("Layer cache entry deleted", metadata: [
-                "digest": "\(digest.prefix(19))..."
-            ])
-        }
-    }
-}
-
-// MARK: - LayerCacheRecorder Protocol Conformance
-
-extension StateStore: Containerization.LayerCacheRecorder {
-    public nonisolated func recordLayer(digest: String, path: String, size: Int64) async throws {
-        let now = Date()
-        try db.run(layerCache.insert(or: .replace,
-            layerDigest <- digest,
-            layerPath <- path,
-            layerSize <- size,
-            layerCreatedAt <- now.iso8601String,
-            layerLastUsed <- now.iso8601String,
-            layerRefCount <- 0
-        ))
-    }
-
-    public nonisolated func incrementLayerRefCount(digest: String) async throws {
-        let layer = layerCache.filter(layerDigest == digest)
-        try db.run(layer.update(
-            layerRefCount += 1,
-            layerLastUsed <- Date().iso8601String
-        ))
     }
 }
 

@@ -148,8 +148,19 @@ final class OCILayoutFixtureTests: XCTestCase {
     /// digest, and so share one cache slot. A per-layer test over them cannot tell a cache that
     /// returned the layer it was asked for from one that returned either -- it would pass
     /// whichever the cache answered with. Refusing here is what keeps that from becoming a
-    /// vacuous pass in `LayerCacheRoleTests`, which is a failure mode no assertion there can
-    /// see; an empty layer list is the same thing with nothing to assert over at all.
+    /// vacuous pass in any per-layer test over such a layout, and it is a failure mode no
+    /// assertion inside that test can see, because it has no reading that tells the two
+    /// answers apart. An empty layer list is the same thing with nothing to assert over at
+    /// all.
+    ///
+    /// **The test that made this concrete was `LayerCacheRoleTests`, deleted in `2d1f8db`
+    /// with the per-layer cache, so the guard is currently forward-looking**: after that
+    /// commit every call site passing more than one layer to `write(at:reference:layers:)` is
+    /// in this file. (`ImageRootfsUnpackerTests` reaches `write` through a pass-through
+    /// `fixture(reference:layers:)`, and both of its callers supply a single layer.) The guard
+    /// is kept rather than dropped because the fixture still offers the
+    /// multi-layer entry point, and a guard removed here is one the next caller has to
+    /// rediscover by writing the vacuous test first.
     ///
     /// **The two `XCTAssertNoThrow`s are the half that stops this being a guard that refuses too
     /// much.** Differing in EITHER the path or the content is enough, because either is enough

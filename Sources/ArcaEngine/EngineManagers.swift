@@ -8,7 +8,7 @@ import Logging
 /// path reaches which constructor argument, which was the half still spelt out
 /// twice -- once in `ServeCommand.run()` and once in the tests' own
 /// `SandboxEngineService.forTesting`. Task 1's review measured that arrangement:
-/// swapping `imageStoreRoot: paths.layerCache` in the command alone left all 34
+/// swapping `imageStoreRoot: paths.imageRootfs` in the command alone left all 34
 /// tests of the day green, because the tests drove a parallel wiring over the
 /// shared derivation rather than the wiring itself.
 ///
@@ -57,13 +57,23 @@ public struct EngineManagers: Sendable {
         self.paths = paths
         self.logger = logger
 
+        // Before any manager opens the state root, and before the StateStore
+        // below drops the `layer_cache` table that indexed these files: the
+        // per-layer ext4 cache the single-composed-rootfs revert orphaned.
+        // Nothing else can reach it now that the live cache is `image-rootfs`,
+        // so a start that skipped it would leave that disk claimed forever. See
+        // `LayerCacheReclaim` for why it refuses rather than guesses. ArcaDaemon
+        // reclaims its own copy under `~/.arca`; this state root is private to
+        // the engine and cannot reach the daemon's tree.
+        try LayerCacheReclaim.run(stateRoot: paths.stateRoot, logger: logger)
+
         self.stateStore = try StateStore(path: paths.stateDatabase.path, logger: logger)
         self.imageManager = try Self.makeImageManager(paths: paths, logger: logger)
         self.containerManager = ContainerManager(
             imageManager: imageManager,
             kernelPath: kernelPath.path,
             imageStoreRoot: paths.imageStoreRoot,
-            layerCachePath: paths.layerCache,
+            imageRootfsCachePath: paths.imageRootfs,
             logRoot: paths.logsRoot,
             stateStore: stateStore,
             logger: logger

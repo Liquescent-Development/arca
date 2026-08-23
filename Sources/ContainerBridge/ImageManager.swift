@@ -889,8 +889,12 @@ public actor ImageManager {
 
         // Every blob the image names, fetched from the content store. This is
         // what separates a store that has a row from a store a container can
-        // actually be created from: `OverlayFSUnpacker.unpack` reads each layer
-        // by digest, and a layer that is not here fails there instead.
+        // actually be created from: the unpack reads each layer by digest, and a
+        // layer that is not here fails there instead. That unpack is now
+        // upstream's `EXT4Unpacker.unpack`, reached through
+        // `ImageRootfsUnpacker.rootfs(for:platform:)`; before the revert to a
+        // single composed rootfs it was `OverlayFSUnpacker.unpack`, and the
+        // property is the same for both.
         //
         // A throw from `getContent` is the blob being absent: its other failure
         // mode is a digest the image does not reference, and every digest here
