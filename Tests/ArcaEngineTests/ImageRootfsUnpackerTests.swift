@@ -9,9 +9,15 @@ import ContainerizationOCI
 
 /// The per-image cache slot is created only by a promotion.
 ///
-/// These three tests pin three separate mechanisms. `EVIDENCE-layer-cache-poisoning.md`
-/// records the layer-granularity version of this defect: an unpack that threw left a
-/// valid, correctly labelled, EMPTY ext4 in the slot and the next create reused it.
+/// The first three tests below pin the three mechanisms that make that true, one each, and
+/// the fourth pins the second half of the third. The rest pin the surrounding properties:
+/// the cache hit, the platform component of the key, the mount's flags, and how staging
+/// files are reaped and spared.
+///
+/// `EVIDENCE-layer-cache-poisoning.md` records the layer-granularity version of this defect
+/// -- an unpack that threw left a valid, correctly labelled, EMPTY ext4 in the slot and the
+/// next create reused it -- and carries the mutation matrix for this file, with the
+/// test-name mapping it uses and the bounds on two of its rows.
 final class ImageRootfsUnpackerTests: XCTestCase {
 
     /// Mechanism 1: a refused unpack leaves no slot for the next create to hit.

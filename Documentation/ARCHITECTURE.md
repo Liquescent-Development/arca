@@ -98,7 +98,7 @@ graph LR
     subgraph "ContainerBridge"
         Managers[Managers/<br/>Container, Image, Network, etc.]
         Backends[Network Backends/<br/>WireGuard, Vmnet]
-        OverlayFS[OverlayFS/<br/>Client, Mounter, Unpacker]
+        Rootfs[ImageRootfsUnpacker<br/>One composed ext4 per image]
         Generated[Generated/<br/>gRPC Clients]
     end
 
@@ -109,7 +109,7 @@ graph LR
     Router --> Handlers
     Handlers --> Managers
     Managers --> Backends
-    Managers --> OverlayFS
+    Managers --> Rootfs
     Managers --> Generated
 
     style Main fill:#e1f5ff
@@ -424,6 +424,58 @@ sequenceDiagram
     Note over IM,CLI: Aggregate progress accurate,<br/>per-layer progress estimated
 ```
 
+### Container Root Filesystem
+
+A pulled image is stored as layers, but a container never sees them as separate
+devices. **The host composes every layer of an image into one ext4 filesystem and
+attaches that single block device**, plus one writable layer for the container.
+The image therefore contributes exactly one block device whatever its layer count
+— the same for a one-layer image and a thirty-five-layer one.
+
+```
+<state-root>/image-rootfs/<image-digest>/<os>-<arch>/rootfs.ext4   shared, one per image+platform
+<image-store>/containers/<container-id>/writable.ext4              private, one per container
+```
+
+`ImageRootfsUnpacker` (`Sources/ContainerBridge/ImageRootfsUnpacker.swift`) owns
+the first of those. The second is `ContainerManager.writableLayer(at:sizeInBytes:)`.
+Upstream's `LinuxContainer` stacks them inside the guest — the image rootfs as the
+overlay's lower layer, the writable layer as its upper — so a container's writes
+land in its own file rather than the shared one.
+
+That last property is a consequence of always passing a writable layer, not
+something the shared file enforces. Upstream strips `"ro"` from the rootfs mount
+before attaching it, so the device reaches the guest writable; a caller that passed
+no writable layer would get the shared slot mounted read-write.
+`ImageRootfsUnpacker.blockMount(at:)` records the mechanism and what stays open.
+
+The cache is keyed on **image digest and platform together**, not on the digest
+alone: a multi-platform image has one index digest and a different layer set per
+platform, so a digest-only key would hand an arm64 rootfs to an amd64 request.
+
+Two properties of that cache are load-bearing and are worth knowing before
+changing it:
+
+- **The slot is created only by a promotion.** The unpack writes to a sibling
+  staging path and is `rename(2)`d onto the slot only after it is verified. An
+  unpack that fails leaves no slot for a later create to mistake for a cache hit.
+  `Documentation/EVIDENCE-layer-cache-poisoning.md` records why, with the
+  measurements.
+- **A second container from the same image skips the unpack.** That is the benefit
+  the earlier per-layer cache bought, and keying the slot per image rather than per
+  container is what preserves it.
+
+**Historical note.** Arca previously ran a fork-local design that unpacked each
+layer into its own ext4 and attached one block device per layer, composing the
+overlay inside the guest at boot. It capped images at roughly 24 layers, because
+the engine allocates block device tags from a 26-letter alphabet, and that ceiling
+is why it was reverted to upstream's model.
+
+The host side of it is gone from this repository. The guest-side boot code still
+exists in the `containerization/` submodule at the pointer this repository carries,
+and goes with the pointer bump; it composes nothing in the meantime, because the
+host no longer attaches per-layer devices for it to find.
+
 ## Container Lifecycle Integration
 
 ```mermaid
@@ -479,7 +531,7 @@ graph TB
 
         subgraph "Extensions"
             WG[wireguard-service/<br/>WireGuard management]
-            FS[filesystem-service/<br/>OverlayFS operations]
+            FS[filesystem-service/<br/>diff and volume RPCs<br/>see caveat below]
         end
     end
 
@@ -508,6 +560,23 @@ graph TB
     style FS fill:#ffe1ff
     style Binary fill:#e1ffe1
 ```
+
+**Caveat on `filesystem-service`.** The binary is built and shipped, but its two
+OverlayFS-based RPCs do not work, and did not work before the revert to a single
+composed rootfs either. Both hardcode guest paths that nothing creates. Verified
+against the pinned submodule object
+(`git show 6304122:vminitd/extensions/arca-services/internal/filesystem/filesystem.go`):
+
+- `EnumerateUpperdir`, which `docker diff` reaches, looks for `/mnt/vdb/upper`
+  (`:151`) and answers `upperdir not found at /mnt/vdb/upper` (`:157`) when it is
+  absent. The fork's guest-side overlay mounted at `/mnt/writable`, so that path
+  never resolved.
+- `CreateVolumeOverlay` has no caller at all, and scans `/proc/mounts` for a
+  literal `/dev/vdb` (`:836-837`) under a comment asserting the miss "shouldn't
+  happen".
+
+The revert changes which way this subsystem is broken, not whether it is. Wiring
+named volumes and `docker diff` onto the single composed rootfs is separate work.
 
 ## HTTP Streaming
 
@@ -596,6 +665,14 @@ graph LR
 ### 5. VM per Container (Apple's Model)
 **Why?** Strong isolation, required by Apple's framework
 **Trade-off:** Higher resource usage vs namespace-based containers
+
+### 6. One Composed Rootfs per Image (Upstream's Model)
+**Why?** A block device per layer exhausts the engine's 26-letter device alphabet at
+roughly 24 layers, and it is fork-local divergence from upstream Containerization
+**Trade-off:** The first create for an image stacks every layer serially where the
+fork unpacked them in parallel. The fork's unpack of 36 layers measured
+`duration_seconds=14.83` on 2026-08-21; the composed equivalent has not been
+measured, and the number belongs here once it is
 
 ## Development Architecture
 

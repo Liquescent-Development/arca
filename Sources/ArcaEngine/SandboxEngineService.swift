@@ -591,21 +591,38 @@ public final class SandboxEngineService: Arca_Engine_V1_SandboxEngineAsyncProvid
     /// and the config and never a layer. `Ack` carries no payload, so an `Ack`
     /// granted on that answer is a report the consumer has no way to check.
     ///
-    /// It does **not** unpack the layers into the OverlayFS layer cache, which
-    /// is the only thing in this codebase that materialises a rootfs. That is
-    /// not a shortcut taken for convenience; the unpacker is not reachable here
-    /// in a way that would be correct. `ContainerManager` builds its
-    /// `OverlayFSUnpacker` inside `initialize()`
-    /// (`ContainerBridge/ContainerManager.swift:280-285`) and keeps it private,
-    /// and `Containerization.OverlayFSUnpacker.unpack` is per-*container*, not
-    /// per-image: it creates `upper` and `work` directories at a container path
-    /// and increments a reference count for each layer
-    /// (`containerization/Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift:123-144`).
-    /// Running it for an image with no container would leak reference counts
-    /// nothing will ever release, and its per-image half, `unpackLayerToCache`,
-    /// is private upstream. `Create` unpacks, scoped to the container that owns
-    /// the result; the promise this method can keep is that `Create` will find
-    /// the content here and will not need to reach a registry for it.
+    /// It does **not** materialise a rootfs, which is what
+    /// `PrepareImageRequest`'s own comment in `proto/arca/engine/v1/engine.proto`
+    /// says the method is for -- "Materialise a rootfs for content THE ENGINE
+    /// ALREADY HOLDS".
+    ///
+    /// **An earlier version of this comment gave a structural reason for that,
+    /// and the reason is now false.** It said the only unpacker was
+    /// `OverlayFSUnpacker`, whose `unpack` was per-*container* -- it created
+    /// `upper` and `work` directories under a container path and
+    /// reference-counted each layer -- so running it for an image with no
+    /// container would have leaked reference counts nothing releases, while its
+    /// per-image half was private upstream. The revert to upstream's single
+    /// composed rootfs deleted that type. What replaced it,
+    /// `ContainerBridge.ImageRootfsUnpacker`, is public, is keyed on image
+    /// digest and platform (`rootfsPath(forImageDigest:platform:)`), and
+    /// produces exactly the artefact a later `Create` reuses. Materialising here
+    /// is therefore possible.
+    ///
+    /// **It is deliberately not done, and that is scope rather than
+    /// impossibility.** Doing it means answering where this method gets a cache
+    /// root and a capacity from -- `ContainerManager` owns both and keeps its
+    /// unpacker private, built by
+    /// `openImageRootfsCache(at:capacityInBytes:logger:)` -- and it means a
+    /// success criterion this method does not have today: that an `Ack` implies
+    /// `Create` will find the content without reaching a registry, pinned by
+    /// tests that fail when it does not. `Ack` carries no payload, so nothing
+    /// the consumer receives tells the two apart. That is separate work.
+    ///
+    /// `Create` is what unpacks, into a per-image slot shared by every container
+    /// built from the image (`ImageRootfsUnpacker.rootfs(for:platform:)`). The
+    /// promise this method can keep meanwhile is the narrower one: that `Create`
+    /// will find the content here and will not need to reach a registry for it.
     ///
     /// **The repository is checked as well as the digest.** Answering `Ack` for
     /// content held under a different repository would be a success followed by

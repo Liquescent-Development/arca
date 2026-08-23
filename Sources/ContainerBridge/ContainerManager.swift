@@ -1653,8 +1653,13 @@ public actor ContainerManager {
             "duration_seconds": "\(String(format: "%.2f", containerCreateDuration))"
         ])
 
-        // OverlayFS is automatically mounted by vminitd during boot if layer block devices are detected
-        // No host-side intervention needed - vminitd handles its own filesystem setup
+        // No host-side mount step follows this. That used to be a claim about vminitd
+        // detecting layer block devices at boot and composing an overlay out of them; the
+        // revert to upstream's single composed rootfs removed that boot path, and the reason
+        // is now simpler. The two mounts this container needs were already decided above --
+        // one shared per-image rootfs and one per-container writable layer -- and
+        // `LinuxContainer.create()` stacks them itself, rootfs as the overlay's lower layer
+        // and the writable mount as its upper.
 
         return container
     }
@@ -4310,11 +4315,20 @@ public actor ContainerManager {
     /// rootfs is the one that carries the flag -- see `ImageRootfsUnpacker.blockMount(at:)`,
     /// which also records why it is inert there.
     ///
-    /// No `volumeLabel:`. `OverlayFSMounter.createWritableFilesystem` passed one so that
-    /// vminitd could find this device among many; upstream's `LinuxContainer` is handed the
-    /// writable layer as a named parameter and attaches it in a fixed position
-    /// (`LinuxContainer.swift:581`, `:597-599`), so there is nothing to search for. The label
-    /// machinery is deleted from the submodule by this plan's revert.
+    /// No `volumeLabel:`, and the reason is that nothing has to search for this device any
+    /// more. The fork's host-side mounter passed one -- `createWritableFilesystem` in
+    /// `Sources/ContainerBridge/OverlayFS/OverlayFSMounter.swift`, deleted at `2d1f8db` --
+    /// because the guest composed the rootfs itself and had to tell one attached block device
+    /// from another by reading its ext4 volume label. Upstream's `LinuxContainer` is handed
+    /// the writable layer as a named parameter and attaches it in a fixed position
+    /// (`LinuxContainer.swift:581`, `:597-599`), so there is nothing to identify.
+    ///
+    /// The label machinery itself is still in the submodule at the pointer this repository
+    /// carries: `git show 6304122:Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift` is a
+    /// 91-line file defining `volumeLabel` and `volumeLabel(ofBlockDevice:)`. This plan's
+    /// submodule revert removes it, and the parent picks that up at the pointer bump. Adding
+    /// a label here would compile today and stop compiling then, for a device nothing reads a
+    /// label off either way.
     ///
     /// `internal` rather than `private` so that `CreatePathSeamTests` can drive it: its only
     /// production caller is inside `createNativeContainer`, which no test in this repository
