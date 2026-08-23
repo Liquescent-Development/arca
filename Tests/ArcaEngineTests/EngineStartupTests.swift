@@ -154,7 +154,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root.path, kernelPath: kernelPath.path, vminitLayout: layout.path)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         ) { error in
             guard let startupError = error as? EngineStartupError,
@@ -179,7 +183,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root.path, kernelPath: kernelPath.path, vminitLayout: layout.path)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         ) { error in
             guard let startupError = error as? EngineStartupError,
@@ -206,7 +214,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root.path, kernelPath: kernelPath.path, vminitLayout: layout.path)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         )
     }
@@ -229,7 +241,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertThrowsError(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root.path, kernelPath: kernelPath.path, vminitLayout: layout.path)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         ) { error in
             guard let startupError = error as? EngineStartupError,
@@ -262,7 +278,11 @@ final class EngineStartupTests: XCTestCase {
 
         XCTAssertNoThrow(
             try validateEngineInputs(
-                EngineInputs(stateRoot: root.path, kernelPath: kernelPath.path, vminitLayout: layout.path)
+                EngineInputs(
+                    stateRoot: root.path,
+                    kernelPath: kernelPath.path,
+                    vminitLayout: layout.path
+                )
             )
         )
     }

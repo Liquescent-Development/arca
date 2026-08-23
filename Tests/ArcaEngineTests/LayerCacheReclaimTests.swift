@@ -10,7 +10,12 @@ import XCTest
 ///
 /// These tests are about **scoping**, not about deletion. `removeItem` works; what has to be
 /// pinned is that the reclaim deletes the one directory it was written for and refuses
-/// anything it does not recognise, because it is the only recursive delete the revert adds.
+/// anything it does not recognise.
+///
+/// It is the revert's *broadest* recursive delete -- a whole directory tree at a path derived
+/// from a CLI option -- and not its only one: `ImageRootfsUnpacker.reapOrphanedStagingFiles`
+/// also removes, though only entries it matched by prefix inside a cache root it was handed.
+/// An earlier revision of this docstring said "only", which was wrong.
 final class LayerCacheReclaimTests: XCTestCase {
 
     /// One directory per process, removed whole in `tearDown`.
@@ -219,8 +224,20 @@ final class LayerCacheReclaimTests: XCTestCase {
     ///
     /// Nothing in `removeItem` can tell it from the directory `lstat` examined -- it looks the
     /// name up again -- so it recurses. MEASURED with a standalone probe on 2026-08-22 before
-    /// this test was written: the check saw a directory, `rename` returned 0, and the file
-    /// three levels inside the renamed-in tree was gone afterwards.
+    /// this test was written: the check saw a directory, `rename` returned 0, and the file two
+    /// levels inside the renamed-in tree was gone afterwards.
+    ///
+    /// **What this pins, exactly.** It cannot interleave the swap *inside* the reclaim -- that
+    /// would need a seam between the `lstat` and the `removeItem`, and there is none -- so it
+    /// pins the consequence rather than the interleaving: the reclaim removes in full whatever
+    /// real directory is sitting at that name, having nothing that could distinguish the
+    /// orphaned cache from a tree that arrived a moment ago. The earlier `lstat` here is the
+    /// state the check would have approved, recorded so the ordering is visible.
+    ///
+    /// It runs `LayerCacheReclaim.run` and not `FileManager.removeItem`, and it asserts the
+    /// **post-rename** location. Round 2's version did neither: it drove `FileManager` directly
+    /// and asserted a path `rename` had already emptied, so it read identically whether the
+    /// removal happened or not and stayed green with the reclaim disabled entirely.
     ///
     /// This test asserts the *unsafe* behaviour on purpose. It exists so that the race note in
     /// `LayerCacheReclaim` cannot drift back to "the residue is bounded" without a test going
@@ -235,10 +252,10 @@ final class LayerCacheReclaimTests: XCTestCase {
         let precious = base.appendingPathComponent("precious")
         let deep = precious.appendingPathComponent("deep")
         try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
-        let treasure = deep.appendingPathComponent("treasure")
-        try Data("do not delete".utf8).write(to: treasure)
+        try Data("do not delete".utf8).write(to: deep.appendingPathComponent("treasure"))
 
-        // The check the reclaim makes, made here, so the ordering under test is the real one.
+        // The state the reclaim's own check would have approved: an empty directory, exactly
+        // the shape the orphaned cache has on a second start.
         var status = stat()
         XCTAssertEqual(lstat(layers.path, &status), 0)
         XCTAssertEqual(status.st_mode & S_IFMT, S_IFDIR)
@@ -246,7 +263,17 @@ final class LayerCacheReclaimTests: XCTestCase {
         // The swap. `layers` is empty, which is what lets `rename` replace it.
         XCTAssertEqual(rename(precious.path, layers.path), 0, "rename failed: errno \(errno)")
 
-        try FileManager.default.removeItem(at: layers)
+        // The post-rename location, which is where the data now lives. Asserting the
+        // pre-rename path is the defect this test carried until round 3: `rename` had already
+        // emptied it, so the assertion read the same whether anything deleted or not.
+        let treasure = layers.appendingPathComponent("deep").appendingPathComponent("treasure")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: treasure.path),
+            "the swap must leave live data under the name the check approved, or this test "
+                + "is not observing anything"
+        )
+
+        try LayerCacheReclaim.run(stateRoot: root)
 
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: treasure.path),
@@ -356,7 +383,14 @@ final class LayerCacheReclaimTests: XCTestCase {
             XCTAssertTrue(
                 message.contains("cannot reach it either"), "no limit stated in: \(message)"
             )
-            XCTAssertTrue(message.contains("chmod u+rx"), "no usable remedy in: \(message)")
+            // `u+rwx`, not `u+rx`. MEASURED on 2026-08-22 by running both: after `chmod u+rx`
+            // on a mode-000 parent, `rm -rf` returns `Permission denied` and exits 1 and the
+            // entry survives; after `chmod u+rwx` it exits 0 and the entry is gone. Removing a
+            // directory entry needs write on the parent, not merely traversal.
+            XCTAssertTrue(message.contains("chmod u+rwx"), "no usable remedy in: \(message)")
+            XCTAssertFalse(
+                message.contains("chmod u+rx "), "offered a remedy that fails: \(message)"
+            )
             XCTAssertFalse(
                 message.contains("To clear it and let the next start proceed"),
                 "offered the blanket remedy anyway: \(message)"

@@ -68,16 +68,21 @@ public enum LayerCacheReclaim {
     ///
     /// **What is accepted, stated rather than left to be inferred from the refusals.** A value
     /// is accepted when it begins with `/`, consists of more than slashes, and carries no `.`,
-    /// `..` or empty component. Everything else is refused, and two of those refusals narrow
-    /// what the engine took before this rule existed:
+    /// `..` or empty component. A trailing slash is accepted too (`/var/arca/` is fine): it
+    /// names the same directory, and refusing it would buy nothing.
     ///
-    ///   - `~/...` is now refused. MEASURED on 2026-08-22: `URL(fileURLWithPath: "~/foo").path`
-    ///     is `/Users/<user>/foo` -- `URL` expands the tilde, resolving against `$HOME` and not
-    ///     the working directory -- so this form used to be accepted and to work. It is refused
-    ///     now because a shell expands `~` before the process sees it, so a `~` that arrives
-    ///     here arrived quoted, and this is the option a directory is deleted out of.
-    ///   - A trailing slash is still accepted (`/var/arca/` is fine): it names the same
-    ///     directory, and refusing it would buy nothing here.
+    /// Two of the refusals **narrow** what the engine took before any of this existed, and both
+    /// are behaviour changes rather than the closing of a hole:
+    ///
+    ///   - `~/...`, refused since round 1. MEASURED on 2026-08-22:
+    ///     `URL(fileURLWithPath: "~/foo").path` is `/Users/<user>/foo` -- `URL` expands the
+    ///     tilde, resolving against `$HOME` and not the working directory -- so this form used
+    ///     to be accepted and to work. It is refused because a shell expands `~` before the
+    ///     process sees it, so a `~` arriving here arrived quoted, and this is the option a
+    ///     directory is deleted out of.
+    ///   - `/a//b`, refused since round 2. It was accepted end to end before that, and it names
+    ///     the same directory it always did, so this narrowing buys consistency with the `.`
+    ///     and `..` refusals rather than safety. No in-repo caller passes such a value.
     ///
     /// Returns a reason rather than throwing, so each caller can raise it in its own error
     /// type -- `EngineStartupError`, which names the CLI option, or `ContainerizationError`
@@ -222,19 +227,35 @@ public enum LayerCacheReclaim {
     private static func inspectionRemedy(for failure: Int32, path: String) -> String {
         switch failure {
         case EACCES, EPERM:
-            // The parent cannot be traversed, so nothing run as this user can remove the child
-            // either. The permission is the thing to change.
+            // `rm` reaches the path the same way this process did, so it fails the same way.
+            //
+            // `u+rwx` and not `u+rx`, MEASURED on 2026-08-22 by running both against a mode-000
+            // parent: after `chmod u+rx` the `rm -rf` prints `Permission denied` and exits 1
+            // with the entry still there; after `chmod u+rwx` it exits 0 and the entry is gone.
+            // Removing a directory entry needs *write* on the parent, and an earlier revision
+            // of this string advised only traversal.
             return "`rm -rf` cannot reach it either, for the same reason. Make the parent "
-                + "traversable -- chmod u+rx \(quoted((path as NSString).deletingLastPathComponent)) "
-                + "-- or run as its owner, then remove \(quoted(path))"
+                + "writable and traversable -- chmod u+rwx "
+                + "\(quoted((path as NSString).deletingLastPathComponent)) -- then remove "
+                + "\(quoted(path))"
         case ENAMETOOLONG:
-            // MEASURED on 2026-08-22: a 5000-character path returns errno 63 here. No remove
-            // command can name what this process could not name.
-            return "no remove command can name it either, so clearing it is not the fix: the "
-                + "state root itself has to be shortened"
+            // The *absolute* path is too long, not the directory. MEASURED on 2026-08-22
+            // against a real 1344-character path: `rm -rf <absolute>` exits 0 and removes
+            // nothing -- `rm -f` treats `ENAMETOOLONG` the way it treats a missing file -- while
+            // `rm -rf layers` run from inside the parent exits 0 and removes it. Advising the
+            // absolute form here would have handed the operator a command that reports success
+            // and does nothing, which is worse than the branch below.
+            return "`rm -rf` on that absolute path exits 0 and removes nothing, because the "
+                + "path is what is too long. Change directory into its parent and remove the "
+                + "short relative name -- cd into "
+                + "\(quoted((path as NSString).deletingLastPathComponent)) and "
+                + "rm -rf \((path as NSString).lastPathComponent) -- then shorten the state "
+                + "root so the next start does not land here again"
         case ELOOP, ENOTDIR:
-            // The fault is in the parent chain, above the child this reclaim is about.
-            return "the fault is above this path, in "
+            // The offending component can be any prefix component, not the immediate parent:
+            // with `/a/notadir/b/layers` the named parent `/a/notadir/b` does not exist at all.
+            return "the fault is in a component of the path above this one, somewhere in the "
+                + "prefix chain at or above "
                 + "\(quoted((path as NSString).deletingLastPathComponent)); fix that and start "
                 + "again"
         default:

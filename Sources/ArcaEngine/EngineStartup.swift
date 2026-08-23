@@ -8,9 +8,12 @@ import Logging
 /// image-rootfs/, volumes/, logs/. (`layers/` was in this list until the
 /// single-composed-rootfs revert; `image-rootfs/` replaced it, and `volumes/`
 /// was dropped from the sentence by mistake in the same edit --
-/// `EnginePaths.volumesRoot` never went anywhere.) Sharing it with a live
-/// ArcaDaemon is the hazard the C1 review finding named -- ContainerManager's restore loop marks persisted "running"
-/// containers exited 137 and writes that back.
+/// `EnginePaths.volumesRoot` never went anywhere. The list names the children
+/// this sentence is about and is not an inventory of `EnginePaths.init`, which
+/// also assigns `vminit-digest` and `arca.sock`.) Sharing it with a live
+/// ArcaDaemon is the hazard the C1 review finding named -- ContainerManager's
+/// restore loop marks persisted "running" containers exited 137 and writes that
+/// back.
 ///
 /// `kernelPath` and `vminitLayout` are read-only inputs. A file two processes
 /// read is safe to share; a state root is not. They are separate options so
