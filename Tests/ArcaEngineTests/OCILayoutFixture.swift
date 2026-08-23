@@ -285,9 +285,10 @@ enum OCILayoutFixture {
     /// `a5803b6` pointer this repository now carries; `EXT4Unpacker` is the unpacker in its
     /// place, and it raises the same `UnpackError.sourceIsNotDeclaredArchive` from the same
     /// `EXT4.Formatter.unpack` call. An earlier version of this paragraph cited
-    /// `OverlayFSUnpacker.swift:84` for the report; line 84 at `6ede1d5` is
-    /// `var collected: [(Int, URL)] = []`, so the offset was wrong and has been dropped
-    /// rather than guessed at.)
+    /// `OverlayFSUnpacker.swift:84` for the report. At `6ede1d5` that offset lands on the
+    /// `let layerPaths = try await withThrowingTaskGroup(...)` binding that fans the layer
+    /// walk out -- not on a throw site and nowhere near the refusal. It is dropped rather
+    /// than replaced with a second number: naming the type is what survives the next edit.)
     ///
     /// **The quoted text is what `6ede1d5` reported and is no longer what a
     /// reader at HEAD sees**, because the refusal is now wrapped with the layer's

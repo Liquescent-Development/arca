@@ -270,11 +270,26 @@ public struct ImageRootfsUnpacker: Sendable {
     /// remainder ran, and no `Executed N tests` line was ever printed. Restoring the check
     /// returned the same filter to `Executed 12 tests, with 0 failures` and exit 0.
     ///
+    /// **It is a SIGTRAP, and the trapping process exits 133 (128 + 5).** `swift test`
+    /// reports its own exit 1, so 133 is not visible through it -- but SwiftPM names the
+    /// signal in the same run:
+    ///
+    /// ```
+    /// error: Process '... /ArcaPackageTests.xctest' exited with unexpected signal code 5
+    /// ```
+    ///
+    /// The 133 itself is MEASURED separately, in a standalone binary rather than inferred
+    /// from that 5: compiled `-Onone` into a verified-empty directory, seek to 1024 in a
+    /// 1536-byte file, `read(upToCount: 1024)` returns 512 bytes, `load(as:)` a 1024-byte
+    /// struct prints the same `Fatal error: UnsafeRawBufferPointer.load out of bounds` and
+    /// exits **133**. Control, same binary against a 2048-byte file: the read returns 1024
+    /// bytes, the load returns, exit 0.
+    ///
     /// The process dies and takes the whole test bundle with it; no `catch` can see it and
-    /// no `XCTAssert` reports it. **Do not read `Fatal error: … load out of bounds` and a
-    /// bundle that stops mid-run as an unrelated environment fault and call the mutation
-    /// inconclusive** -- it is the mutation working. Restoring the check makes the trap go
-    /// away, which is the confirmation.
+    /// no `XCTAssert` reports it. **Do not read `Fatal error: … load out of bounds` plus
+    /// SIGTRAP, or a bundle that simply stops mid-run, as an unrelated environment fault and
+    /// call the mutation inconclusive** -- it is the mutation working. Restoring the check
+    /// makes the trap go away, which is the confirmation.
     ///
     /// That is the *debug* outcome, and `swift test` builds debug. `_debugPrecondition` is
     /// `@inlinable` and so evaluated in the client's build configuration, so a **release**
@@ -300,8 +315,13 @@ public struct ImageRootfsUnpacker: Sendable {
     /// of this comment claimed the `EXT4Reader` tree walk caught a file truncated between
     /// the floor and its true length. MEASURED against a promoted artefact from the test
     /// fixture -- `capacityInBytes` 2 MiB, real file 128 MiB, because the formatter pads out
-    /// to one whole block group (`contentRequiredSize = blocksPerGroup * blockSize`, in
-    /// `EXT4.Formatter.close()`) -- `EXT4.EXT4Reader` ACCEPTED that artefact truncated
+    /// to one whole block group. `EXT4.Formatter.close()` normally computes
+    /// `contentRequiredBlocks = (blockGroups - 1) * blocksPerGroup + 1`; this fixture takes
+    /// its `if blockGroups == 1` branch instead, where `contentRequiredBlocks =
+    /// blocksPerGroup` and so `contentRequiredSize = blocksPerGroup * blockSize`. The
+    /// formula only reads that simply in the single-block-group case, which is the case
+    /// measured here (4096-byte blocks x 32768 blocks per group = the 128 MiB observed).
+    /// `EXT4.EXT4Reader` ACCEPTED that artefact truncated
     /// to 2 MiB (1.5% of it), truncated to 50%, truncated 4 KiB short of full length, and
     /// with 1 MiB of zeros written over the metadata region at offsets 4096, 8192 and 32768.
     /// It refused only artefacts with no valid superblock magic: 2 MiB of zeros and 2 MiB of
