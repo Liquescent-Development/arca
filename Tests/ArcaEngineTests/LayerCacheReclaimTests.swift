@@ -184,15 +184,18 @@ final class LayerCacheReclaimTests: XCTestCase {
         XCTAssertThrowsError(try LayerCacheReclaim.run(stateRoot: root))
     }
 
-    /// The bound on the `lstat`-then-`removeItem` race, pinned rather than assumed.
+    /// **Half** of the `lstat`-then-`removeItem` race: a symbolic link swapped into the name
+    /// costs the link and nothing else, because `removeItem` unlinks a link rather than
+    /// descending it.
     ///
-    /// The two calls are not atomic, so the name can be repointed in between and the delete
-    /// can be handed something the check never saw. What keeps that inside the scope is
-    /// `removeItem`'s own behaviour on a symbolic link: it unlinks the link and does not
-    /// descend through it. This test drives `FileManager` directly, because the property being
-    /// pinned is `FileManager`'s and not this module's -- the reclaim's own refusal means it
-    /// never reaches `removeItem` with a link, so a test through `LayerCacheReclaim` could not
-    /// establish it.
+    /// Read this together with `testAPathRenamedOverByARealDirectoryIsRemovedInFull`, which is
+    /// the other half and goes the other way. An earlier revision of this suite pinned only
+    /// this case and the surrounding documentation generalised it into a bound on the whole
+    /// race. It is not one.
+    ///
+    /// Drives `FileManager` directly, because the property is `FileManager`'s and not this
+    /// module's -- the reclaim refuses a link before it ever reaches `removeItem`, so a test
+    /// through `LayerCacheReclaim` could not establish it.
     func testRemovingASymbolicLinkUnlinksItWithoutFollowingIt() throws {
         let root = try Self.temporaryRoot()
         let victim = root.appendingPathComponent("victim")
@@ -208,6 +211,48 @@ final class LayerCacheReclaimTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: link.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: victim.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: hostage.path))
+    }
+
+    /// The other half of the race, and the counterexample to the bound this suite used to
+    /// imply: a **real directory** `rename(2)`d into the name between the check and the
+    /// removal is deleted in full.
+    ///
+    /// Nothing in `removeItem` can tell it from the directory `lstat` examined -- it looks the
+    /// name up again -- so it recurses. MEASURED with a standalone probe on 2026-08-22 before
+    /// this test was written: the check saw a directory, `rename` returned 0, and the file
+    /// three levels inside the renamed-in tree was gone afterwards.
+    ///
+    /// This test asserts the *unsafe* behaviour on purpose. It exists so that the race note in
+    /// `LayerCacheReclaim` cannot drift back to "the residue is bounded" without a test going
+    /// red, and it will need rewriting rather than deleting if the reclaim ever moves to
+    /// `openat`/`unlinkat`, which is what would actually close this.
+    func testAPathRenamedOverByARealDirectoryIsRemovedInFull() throws {
+        let base = try Self.temporaryRoot()
+        let root = base.appendingPathComponent("root")
+        let layers = root.appendingPathComponent("layers")
+        try FileManager.default.createDirectory(at: layers, withIntermediateDirectories: true)
+
+        let precious = base.appendingPathComponent("precious")
+        let deep = precious.appendingPathComponent("deep")
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        let treasure = deep.appendingPathComponent("treasure")
+        try Data("do not delete".utf8).write(to: treasure)
+
+        // The check the reclaim makes, made here, so the ordering under test is the real one.
+        var status = stat()
+        XCTAssertEqual(lstat(layers.path, &status), 0)
+        XCTAssertEqual(status.st_mode & S_IFMT, S_IFDIR)
+
+        // The swap. `layers` is empty, which is what lets `rename` replace it.
+        XCTAssertEqual(rename(precious.path, layers.path), 0, "rename failed: errno \(errno)")
+
+        try FileManager.default.removeItem(at: layers)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: treasure.path),
+            "if this now survives, the reclaim gained a real bound and the race note in "
+                + "LayerCacheReclaim should be rewritten to claim it"
+        )
     }
 
     // MARK: - The root the reclaim is handed
@@ -259,8 +304,64 @@ final class LayerCacheReclaimTests: XCTestCase {
         XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "/a/../b"))
         XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "/a/./b"))
         XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "/"))
+
+        // Every all-slashes spelling of the filesystem root, not just the one-character one.
+        // MEASURED on 2026-08-22: `URL(fileURLWithPath:)` maps `"//"` and `"///"` to `"/"`.
+        // While this rule compared against `"/"` by string, `"//"` passed the boundary and was
+        // stopped only by the reclaim's own copy of the check.
+        XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "//"))
+        XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "///"))
+        XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "/a//b"))
+
+        // `~/...` is refused, and this is a narrowing: `URL` expands the tilde against `$HOME`
+        // -- MEASURED on 2026-08-22, `URL(fileURLWithPath: "~/foo").path` is
+        // `/Users/<user>/foo` -- so this form used to be accepted and to work.
+        XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "~/foo"))
+        XCTAssertNotNil(LayerCacheReclaim.rootRefusal(for: "~"))
+
         XCTAssertNil(LayerCacheReclaim.rootRefusal(for: "/Users/someone/.arca"))
         XCTAssertNil(LayerCacheReclaim.rootRefusal(for: "/var/folders/x/arca-engine-1"))
+        // A trailing slash names the same directory and stays accepted; the refusals above are
+        // refusing forms that resolve to somewhere else, not cosmetics.
+        XCTAssertNil(LayerCacheReclaim.rootRefusal(for: "/var/folders/x/arca-engine-1/"))
+    }
+
+    /// The reason a non-absolute value is refused has to be true of every non-absolute value,
+    /// and the one this rule gave was true of relative paths only: it said such a value
+    /// resolves against the working directory, which is wrong for `~/...`.
+    func testTheNonAbsoluteReasonCoversBothWaysAValueWouldHaveResolved() {
+        let reason = LayerCacheReclaim.rootRefusal(for: "~/foo")
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason?.contains("working directory") == true, "got: \(reason ?? "nil")")
+        XCTAssertTrue(reason?.contains("$HOME") == true, "got: \(reason ?? "nil")")
+    }
+
+    /// `rm -rf` reaches a path the same way this process did, so for the errnos that stopped
+    /// `lstat` because of the path itself, offering it costs the operator a cycle before they
+    /// start thinking. The remedy is branched on why.
+    func testAnUnreadablePathIsNotOfferedARemovalThatCannotReachItEither() throws {
+        try XCTSkipIf(geteuid() == 0, "root bypasses the permission bits this test relies on")
+
+        let root = try Self.temporaryRoot()
+        try Self.plantLayers(under: root)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: root.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: root.path
+            )
+        }
+
+        XCTAssertThrowsError(try LayerCacheReclaim.run(stateRoot: root)) { error in
+            let message = "\(error)"
+            XCTAssertTrue(
+                message.contains("cannot reach it either"), "no limit stated in: \(message)"
+            )
+            XCTAssertTrue(message.contains("chmod u+rx"), "no usable remedy in: \(message)")
+            XCTAssertFalse(
+                message.contains("To clear it and let the next start proceed"),
+                "offered the blanket remedy anyway: \(message)"
+            )
+        }
     }
 
     // MARK: - Refusals carry a remedy

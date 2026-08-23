@@ -66,6 +66,19 @@ public enum LayerCacheReclaim {
     ///     non-canonical and filesystem-root forms; this catches those, and it cannot catch
     ///     the four above, which is why the boundary check is not redundant.
     ///
+    /// **What is accepted, stated rather than left to be inferred from the refusals.** A value
+    /// is accepted when it begins with `/`, consists of more than slashes, and carries no `.`,
+    /// `..` or empty component. Everything else is refused, and two of those refusals narrow
+    /// what the engine took before this rule existed:
+    ///
+    ///   - `~/...` is now refused. MEASURED on 2026-08-22: `URL(fileURLWithPath: "~/foo").path`
+    ///     is `/Users/<user>/foo` -- `URL` expands the tilde, resolving against `$HOME` and not
+    ///     the working directory -- so this form used to be accepted and to work. It is refused
+    ///     now because a shell expands `~` before the process sees it, so a `~` that arrives
+    ///     here arrived quoted, and this is the option a directory is deleted out of.
+    ///   - A trailing slash is still accepted (`/var/arca/` is fine): it names the same
+    ///     directory, and refusing it would buy nothing here.
+    ///
     /// Returns a reason rather than throwing, so each caller can raise it in its own error
     /// type -- `EngineStartupError`, which names the CLI option, or `ContainerizationError`
     /// here -- without either owning the other's vocabulary.
@@ -74,17 +87,26 @@ public enum LayerCacheReclaim {
             return "is empty"
         }
         guard path.hasPrefix("/") else {
-            return "is not an absolute path (it must begin with `/`); a relative root resolves "
-                + "against whatever working directory the process happened to start in"
+            return "is not an absolute path (it must begin with `/`). `URL` would resolve it "
+                + "for us -- a relative value against the working directory the process "
+                + "happened to start in, and a `~` value against `$HOME` -- and this is the "
+                + "option a directory is deleted out of, so it is taken literally or refused"
+        }
+        // Slashes and nothing else. `"/"`, `"//"` and `"///"` all name the filesystem root --
+        // MEASURED on 2026-08-22, `URL(fileURLWithPath:)` maps every one of them to `"/"` --
+        // and only the first was caught while this was a `path != "/"` comparison, so `"//"`
+        // reached the reclaim's own check instead of stopping at the boundary.
+        if path.allSatisfy({ $0 == "/" }) {
+            return "is the filesystem root"
+        }
+        if path.contains("//") {
+            return "is not canonical: it contains an empty component (`//`)"
         }
         for component in path.split(separator: "/", omittingEmptySubsequences: true) {
             if component == "." || component == ".." {
                 return "is not canonical: it contains a `\(component)` component, which the "
                     + "filesystem resolves after this check rather than before it"
             }
-        }
-        guard path != "/" else {
-            return "is the filesystem root"
         }
         return nil
     }
@@ -97,16 +119,36 @@ public enum LayerCacheReclaim {
     /// as absent and the reclaim would report success over a directory it never saw. `lstat`
     /// separates `ENOENT` from every other errno, and only `ENOENT` is silent. It also does
     /// not follow symbolic links, which `fileExists` does -- that difference is what lets the
-    /// refusal below name a link at all, but it is not what bounds the blast radius; see the
-    /// race note.
+    /// refusal below name a link at all. It is not a guarantee about what the removal that
+    /// follows will open; see the race note.
     ///
-    /// **The `lstat`-then-`removeItem` pair is not atomic, and the residue is bounded.** The
-    /// name can be repointed between the two calls, so the check passing is not a guarantee
-    /// about what `removeItem` opens. What keeps that from reaching outside the scope is
-    /// `removeItem`'s own behaviour: handed a symbolic link, it unlinks the link and does not
-    /// descend through it, so a name repointed at a live tree costs the link and nothing else.
-    /// `LayerCacheReclaimTests.testRemovingASymbolicLinkUnlinksItWithoutFollowingIt` pins that
-    /// property rather than leaving this paragraph to assert it.
+    /// **The `lstat`-then-`removeItem` pair is not atomic, and the residue is NOT bounded.**
+    /// The name can be repointed between the two calls, so the check passing says nothing about
+    /// what `removeItem` then opens. Two swaps, measured on 2026-08-22, and they do not have
+    /// the same answer:
+    ///
+    ///   - **A symbolic link swapped into the name costs the link and nothing else.**
+    ///     `removeItem` unlinks a symbolic link rather than descending it.
+    ///     `LayerCacheReclaimTests.testRemovingASymbolicLinkUnlinksItWithoutFollowingIt` pins
+    ///     it.
+    ///   - **A real directory `rename(2)`d into the name is deleted in full.** There is nothing
+    ///     in `removeItem` that could tell it from the directory `lstat` saw, and it recurses.
+    ///     Probed directly: the check saw a directory, `rename(precious, layers)` returned 0,
+    ///     and after the removal the file three levels inside `precious` was gone.
+    ///     `LayerCacheReclaimTests.testAPathRenamedOverByARealDirectoryIsRemovedInFull` pins
+    ///     that this is what happens, so the paragraph cannot quietly revert to the softer
+    ///     claim.
+    ///
+    /// An earlier revision of this comment said the residue was bounded, full stop. It is
+    /// bounded for the symlink swap alone, and generalising that half to the whole race was
+    /// wrong. Closing the race needs `openat` on the parent and `unlinkat` against that
+    /// descriptor, so that the delete operates on the inode the check examined rather than on
+    /// a name looked up again -- a larger change than this revert, and not attempted here.
+    ///
+    /// The precondition is worth stating and is not a reason to soften any of the above:
+    /// winning the race needs write access to the parent of `<root>/layers`, which is the
+    /// engine's own state root or `~/.arca`. Anyone holding that is already in a strong
+    /// position.
     ///
     /// Absence -- `ENOENT` -- is the one condition that is not an error: this runs on every
     /// start, and the second start has nothing left to reclaim.
@@ -130,8 +172,7 @@ public enum LayerCacheReclaim {
                     message: "could not inspect \(quoted(layers.path)): "
                         + "\(String(cString: strerror(failure))) (errno \(failure)). That path "
                         + "holds the orphaned per-layer cache and no other code path reads or "
-                        + "removes it. To clear it and let the next start proceed: "
-                        + "rm -rf \(quoted(layers.path))"
+                        + "removes it. \(inspectionRemedy(for: failure, path: layers.path))"
                 )
             }
             return
@@ -166,6 +207,39 @@ public enum LayerCacheReclaim {
         logger?.info(
             "reclaimed the orphaned per-layer cache", metadata: ["path": "\(layers.path)"]
         )
+    }
+
+    /// What to do about a path this process could not `lstat`, branched on why.
+    ///
+    /// `rm -rf` was offered for every errno until round 2 of review, and for some of them it
+    /// cannot work: `rm` reaches the path the same way this process did, so whatever stopped
+    /// `lstat` stops `rm` as well. An unhelpful remedy is worse than none, because it costs the
+    /// operator a cycle before they start thinking.
+    ///
+    /// The three branches below are the errnos where the remedy has to change, not an
+    /// enumeration of everything `lstat` can return; anything else falls to the last line,
+    /// where `rm -rf` is the right first move.
+    private static func inspectionRemedy(for failure: Int32, path: String) -> String {
+        switch failure {
+        case EACCES, EPERM:
+            // The parent cannot be traversed, so nothing run as this user can remove the child
+            // either. The permission is the thing to change.
+            return "`rm -rf` cannot reach it either, for the same reason. Make the parent "
+                + "traversable -- chmod u+rx \(quoted((path as NSString).deletingLastPathComponent)) "
+                + "-- or run as its owner, then remove \(quoted(path))"
+        case ENAMETOOLONG:
+            // MEASURED on 2026-08-22: a 5000-character path returns errno 63 here. No remove
+            // command can name what this process could not name.
+            return "no remove command can name it either, so clearing it is not the fix: the "
+                + "state root itself has to be shortened"
+        case ELOOP, ENOTDIR:
+            // The fault is in the parent chain, above the child this reclaim is about.
+            return "the fault is above this path, in "
+                + "\(quoted((path as NSString).deletingLastPathComponent)); fix that and start "
+                + "again"
+        default:
+            return "To clear it and let the next start proceed: rm -rf \(quoted(path))"
+        }
     }
 
     /// The file type as an operator would recognise it, so a refusal says what is actually

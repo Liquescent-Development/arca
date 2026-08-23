@@ -26,7 +26,10 @@ final class EngineStartupTests: XCTestCase {
     /// every one of them against the working directory, so a `URL`-typed input would arrive
     /// here indistinguishable from a state root the operator meant.
     func testAnEmptyOrRelativeStateRootIsRefusedAndNamesTheOption() throws {
-        for value in ["", ".", "..", "relative/root"] {
+        // `~/foo` is here rather than among the absolute forms because `URL` would have
+        // resolved it too -- against `$HOME`, MEASURED on 2026-08-22 -- so it belongs to the
+        // same class: a value the engine would not have taken literally.
+        for value in ["", ".", "..", "relative/root", "~/foo", "~"] {
             let root = temporaryRoot()
             let kernelPath = root.appendingPathComponent("vmlinux")
             FileManager.default.createFile(atPath: kernelPath.path, contents: Data())
@@ -59,15 +62,21 @@ final class EngineStartupTests: XCTestCase {
         }
     }
 
-    /// An absolute state root is not enough: `.` and `..` components survive into the `URL`
-    /// verbatim and are resolved by the filesystem afterwards, so the path checked and the
-    /// path deleted from need not be the same directory. `/` is refused for its own reason.
+    /// An absolute state root is not enough: `.`, `..` and empty components survive into the
+    /// `URL` verbatim and are resolved by the filesystem afterwards, so the path checked and
+    /// the path deleted from need not be the same directory. The all-slashes spellings are
+    /// refused for their own reason -- they name the filesystem root.
     ///
     /// The kernel and layout here are deliberately absent. The assertion is that the
     /// state-root refusal comes first -- a `missingInput` for `--kernel-path` would mean the
     /// engine had already begun reading the filesystem on the strength of an unchecked root.
     func testANonCanonicalOrFilesystemRootStateRootIsRefusedBeforeAnyOtherCheck() {
-        for value in ["/a/../b", "/a/./b", "/"] {
+        // `"//"` and `"///"` are the reason this list grew in round 2: while the rule compared
+        // against `"/"` by string they returned nil here, passed the boundary, and were stopped
+        // only by the reclaim's own copy of the check -- which prevents the deletion but loses
+        // the ordering property this test is about. MEASURED on 2026-08-22:
+        // `URL(fileURLWithPath:)` maps both to `"/"`.
+        for value in ["/a/../b", "/a/./b", "/", "//", "///", "/a//b"] {
             XCTAssertThrowsError(
                 try validateEngineInputs(
                     EngineInputs(
