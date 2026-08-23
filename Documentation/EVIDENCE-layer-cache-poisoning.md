@@ -88,8 +88,7 @@ distinguishes it from a pass, and it is one line in a build log.
 swift test --disable-swift-testing --filter ImageRootfsUnpackerTests
 ```
 
-MEASURED on 2026-08-22 against the tree of the commit that carries this document
-(parent `1916f00`): exit 0,
+MEASURED on 2026-08-22 at `f95850e`: exit 0,
 `Executed 12 tests, with 0 failures (0 unexpected)`. **Check the count.** A green
 run with a number that is not 12 means the filter, not the code, is what changed —
 which is the whole point of the paragraph above.
@@ -181,7 +180,12 @@ ran against:
 | `69ad815` | 2026-08-21 | 7 tests | A–F re-run, plus H, I, J, K, L |
 | `8ae55a9` | 2026-08-21 | 8 tests | all twelve; F changed from surviving to killed; **M survived** |
 | `f1a7f28` | 2026-08-21 | 9 tests | C, F and M re-run after T9 was added to kill M |
-| `63b30ce` | 2026-08-22 | **12 tests** | A, B, C, F, M **re-derived at the commit that carries this document** |
+| `63b30ce` | 2026-08-22 | **12 tests** | A, B, C, F, M — the five re-derived rows |
+
+**Every SHA in that table is a commit the rows were MEASURED at. None of them is the
+commit that carries this document**, which is necessarily a later one — a document
+cannot name the commit that adds it. Why the rows nonetheless hold for that later
+commit is argued below, from the diff, rather than assumed.
 
 Every mutation, in every round, was applied to a restored copy of the source and
 **rebuilt** — `--skip-build` was never used for a mutation — then reverted, with
@@ -196,20 +200,24 @@ This table is the record. It is deliberately not a pointer at one, because the
 review notes it was assembled from are not in any repository — which is the failure
 the `!EVIDENCE-*.md` rule was written about.
 
-### Re-derived at this commit, against all twelve tests
+### Re-derived at `63b30ce`, against all twelve tests
 
-MEASURED on 2026-08-22 at `63b30ce`, this document's parent commit, against the
-twelve-test suite. Each mutation was applied to a restored copy of
-`ImageRootfsUnpacker.swift`, **rebuilt** (never `--skip-build`), and run with
+MEASURED on 2026-08-22 at `63b30ce`, against the twelve-test suite. Each mutation
+was applied to a restored copy of `ImageRootfsUnpacker.swift`, **rebuilt** (never
+`--skip-build`), and run with
 `swift test --disable-swift-testing --filter ImageRootfsUnpackerTests`; the file was
 then restored byte-identical (`shasum -a 256`
 `f09722d0b4ec4baf38150ae1854d8501f23488095eb4d55ff27f54a9d585489a`, checked before
 and after every mutation) and the restored suite re-run green.
 
-The commit carrying this document changes only doc comments in that test file — zero
-non-comment lines — so the failing sets hold for it too. Mutation A was re-run at
-this commit to check that rather than assume it, and gave the same two failures in
-the same one test.
+**Why those rows still hold for later commits.** Every commit that has touched
+`ImageRootfsUnpackerTests.swift` since `63b30ce` changed only doc comments in it —
+zero non-comment lines, checked mechanically against the diff — and none touched
+`ImageRootfsUnpacker.swift` at all. Failing sets are a function of the production
+source and the test bodies, and neither moved. Mutation A was re-run at `f95850e` to
+check that rather than assume it, and gave the same two failures in the same one
+test. Anyone extending this document should do the same rather than extend the
+argument.
 
 Assertions are named by what they say rather than by line offset, because a line
 offset in this plan has decayed twice inside a single round.
