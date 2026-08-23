@@ -279,9 +279,15 @@ enum OCILayoutFixture {
     /// valid, correctly labelled, empty `layer.ext4`. MEASURED after that commit,
     /// the same revert -- `Data($0.content.utf8)` in place of `layerArchive`,
     /// under this fixture's `MediaTypes.imageLayer` -- fails the same test
-    /// through production, `OverlayFSUnpacker.swift:84` reporting `the source is
+    /// through production, the then-current `OverlayFSUnpacker` reporting `the source is
     /// not a paxRestricted archive with filter none: … reading the next archive
-    /// header failed with code -30: Truncated tar archive`.
+    /// header failed with code -30: Truncated tar archive`. (That type is deleted at the
+    /// `a5803b6` pointer this repository now carries; `EXT4Unpacker` is the unpacker in its
+    /// place, and it raises the same `UnpackError.sourceIsNotDeclaredArchive` from the same
+    /// `EXT4.Formatter.unpack` call. An earlier version of this paragraph cited
+    /// `OverlayFSUnpacker.swift:84` for the report; line 84 at `6ede1d5` is
+    /// `var collected: [(Int, URL)] = []`, so the offset was wrong and has been dropped
+    /// rather than guessed at.)
     ///
     /// **The quoted text is what `6ede1d5` reported and is no longer what a
     /// reader at HEAD sees**, because the refusal is now wrapped with the layer's

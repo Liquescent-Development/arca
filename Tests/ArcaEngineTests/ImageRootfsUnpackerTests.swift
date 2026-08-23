@@ -183,19 +183,22 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// NOT.** An earlier version of this test asserted the flag made the attachment
     /// read-only. It does not. `LinuxContainer.create()` strips it before the VZ mount
     /// array is built -- VERIFIED against the pinned object,
-    /// `git show 6304122:Sources/Containerization/LinuxContainer.swift`:
-    /// `:639-640` `var modifiedRootfs = self.rootfs` /
-    /// `modifiedRootfs.options.removeAll(where: { $0 == "ro" })`, and `:652`/`:661` put
-    /// that stripped copy into `mountsByID`, which is the only thing
-    /// `VZVirtualMachineInstance.swift:585` turns into a storage device. So
-    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` (`Mount.swift:372`)
-    /// always gets `false` for the rootfs. Upstream does this on purpose (`:632-638`:
-    /// `EROFS` writing `/etc/hosts`). **The host-side hole is open and this test does not
-    /// close it.**
+    /// `git show a5803b6:Sources/Containerization/LinuxContainer.swift`. In
+    /// `LinuxContainer.create()`: `var modifiedRootfs = self.rootfs` /
+    /// `modifiedRootfs.options.removeAll(where: { $0 == "ro" })`, and the `containerMounts`
+    /// array built from it goes into `mountsByID`, which is the only thing
+    /// `VZVirtualMachineInstance.Configuration.mountAttachments(allocator:)` turns into a
+    /// storage device. So the
+    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` in
+    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)`
+    /// always gets `false` for the rootfs. Upstream does this on purpose -- see the comment
+    /// directly above `modifiedRootfs`: `EROFS` writing `/etc/hosts`. **The host-side hole
+    /// is open and this test does not close it.**
     ///
-    /// **What it does pin.** `LinuxContainer.swift:434` reads the UNSTRIPPED `self.rootfs`
-    /// for `spec.root?.readonly = … && self.writableLayer == nil`, so on upstream's
-    /// no-overlay path (`LinuxContainer.swift:617-621`) this option is what makes the OCI
+    /// **What it does pin.** `LinuxContainer.generateRuntimeSpec()` reads the UNSTRIPPED
+    /// `self.rootfs` for `spec.root?.readonly = … && self.writableLayer == nil`, so on
+    /// upstream's no-overlay path (the `else` branch of `LinuxContainer.mountRootfs(...)`,
+    /// "No writable layer. Mount rootfs directly.") this option is what makes the OCI
     /// runtime remount the guest root read-only. That is a real effect on a real supported
     /// path, it is free, and it is upstream's own stated preference -- so the flag stays
     /// and this test keeps it from being dropped as decoration.
@@ -226,15 +229,16 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// The rootfs mount declares `ext4`, on both paths.
     ///
     /// **`isBlock` cannot see this and neither can any other assertion in this file.**
-    /// `Mount.block(format:)` stores its `format` argument AS `type` (`Mount.swift:82`),
-    /// while `isBlock` tests `runtimeOptions` (`Mount.swift:446-451`) and is true for a
+    /// `Mount.block(format:source:destination:options:)` stores its `format` argument AS
+    /// `type`, while `Mount.isBlock` tests `runtimeOptions` and is true for a
     /// block device of any format. Nothing else here reads `type`, so before this test
     /// `blockMount`'s `"ext4"` could become `"ext3"` in silence.
     ///
     /// It is the half of the mount that reaches the guest intact. Upstream overwrites
-    /// `destination` before handing the mount to the agent -- `lowerMount.destination =
-    /// lowerPath` at `LinuxContainer.swift:590`, `upperMount.destination = upperMountPath`
-    /// at `:598` -- and never touches `type`, so `type` is what the guest tries to mount
+    /// `destination` before handing the mount to the agent -- in
+    /// `LinuxContainer.mountRootfs(...)`, `lowerMount.destination = lowerPath` and
+    /// `upperMount.destination = upperMountPath` -- and never touches `type`, so `type` is
+    /// what the guest tries to mount
     /// the device as. A wrong string there fails the mount inside the VM, which is the
     /// slowest place in this system to find a one-character defect.
     ///
@@ -644,10 +648,12 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// itself and `verifyReadable`'s size assertion could be deleted without any test
     /// noticing, before Task 12's bump and equally after it.
     ///
-    /// At 1536 the read succeeds SHORT. Today the fork's `data.count == superBlockSize`
-    /// guard (`containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`)
-    /// still refuses it, so nothing goes red now. After Task 12 removes that guard with the
-    /// volume-label work, upstream hands the 512-byte `Data` to `loadLittleEndian` for a
+    /// At 1536 the read succeeds SHORT. Before Task 12's bump the fork's
+    /// `data.count == superBlockSize` guard in `EXT4.SuperBlock.read(from:at:)`
+    /// (`git show 6304122:Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift`, line 63)
+    /// refused it, so nothing went red. Task 12 removed that guard with the volume-label
+    /// work -- `EXT4+VolumeLabel.swift` does not exist at `a5803b6` -- so upstream now hands
+    /// the 512-byte `Data` to `loadLittleEndian` for a
     /// 1024-byte struct, and the size check is the only thing left between the caller and an
     /// out-of-bounds load. Only at this length does the check become falsifiable.
     private static func fixtureWhoseStagedFileIsTruncated() async throws

@@ -4308,9 +4308,12 @@ public actor ContainerManager {
     ///
     /// **Options are empty and must stay empty, and unlike the rootfs this one is not
     /// stripped.** `LinuxContainer.create()` removes `"ro"` from the rootfs before building
-    /// the VZ mount array (`LinuxContainer.swift:639-640`) but inserts the writable layer
-    /// verbatim (`:654`), so `Mount.readonly` (`Mount.swift:441`) does reach
-    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` (`Mount.swift:372`) for this mount.
+    /// the VZ mount array (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`) but
+    /// inserts the writable layer verbatim (`containerMounts.insert(writableLayer, at: 1)`),
+    /// so `Mount.readonly` does reach the
+    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` built by
+    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)` for this
+    /// mount.
     /// A `"ro"` here would attach the overlay's upper layer read-only. The shared per-image
     /// rootfs is the one that carries the flag -- see `ImageRootfsUnpacker.blockMount(at:)`,
     /// which also records why it is inert there.
@@ -4320,15 +4323,16 @@ public actor ContainerManager {
     /// `Sources/ContainerBridge/OverlayFS/OverlayFSMounter.swift`, deleted at `2d1f8db` --
     /// because the guest composed the rootfs itself and had to tell one attached block device
     /// from another by reading its ext4 volume label. Upstream's `LinuxContainer` is handed
-    /// the writable layer as a named parameter and attaches it in a fixed position
-    /// (`LinuxContainer.swift:581`, `:597-599`), so there is nothing to identify.
+    /// the writable layer as a named parameter and attaches it in a fixed position --
+    /// `LinuxContainer.mountRootfs(...)` reads it as `attachments[1]` and mounts it at
+    /// `upperMountPath` -- so there is nothing to identify.
     ///
-    /// The label machinery itself is still in the submodule at the pointer this repository
-    /// carries: `git show 6304122:Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift` is a
-    /// 91-line file defining `volumeLabel` and `volumeLabel(ofBlockDevice:)`. This plan's
-    /// submodule revert removes it, and the parent picks that up at the pointer bump. Adding
-    /// a label here would compile today and stop compiling then, for a device nothing reads a
-    /// label off either way.
+    /// The label machinery is GONE at the pointer this repository carries. It was a 91-line
+    /// `EXT4+VolumeLabel.swift` defining `volumeLabel` and `volumeLabel(ofBlockDevice:)`
+    /// (`git show 6304122:Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift`); the
+    /// submodule revert deleted it and the parent picked that up at `a5803b6`. Adding a
+    /// `volumeLabel:` here would no longer compile, for a device nothing reads a label off
+    /// either way.
     ///
     /// `internal` rather than `private` so that `CreatePathSeamTests` can drive it: its only
     /// production caller is inside `createNativeContainer`, which no test in this repository

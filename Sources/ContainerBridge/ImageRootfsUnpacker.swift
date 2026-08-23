@@ -13,7 +13,8 @@ import SystemPackage
 /// **The cache slot is created only by a promotion, and that is not a style choice.**
 /// Upstream's `EXT4Unpacker` writes straight to the destination it is handed and closes
 /// the formatter in `defer { try? filesystem.close() }`
-/// (`containerization/Sources/Containerization/Image/Unpacker/EXT4Unpacker.swift:55`, `:85`).
+/// -- both `unpack` overloads in
+/// `containerization/Sources/Containerization/Image/Unpacker/EXT4Unpacker.swift` do it.
 /// A throw part-way through an unpack therefore leaves a valid, correctly sized, **empty**
 /// filesystem at that destination. This type treats "a block is at the final path" as a
 /// cache hit, so such a filesystem would be booted by every later container built from the
@@ -25,7 +26,7 @@ import SystemPackage
 /// cache path is now chosen -- rather than in the submodule, which this work is bringing
 /// back toward upstream.
 ///
-/// **The slot is shared, and the host cannot be stopped from writing to it at this pin.**
+/// **The slot is shared, and the host cannot be stopped from writing to it at `a5803b6`.**
 /// One file backs every container built from the image. The mount carries `"ro"`, but
 /// upstream strips that option before the device is attached, so the guarantee is a
 /// guest-side remount and not a hypervisor-level one. `blockMount(at:)` records the
@@ -198,7 +199,7 @@ public struct ImageRootfsUnpacker: Sendable {
     /// `EXT4.SuperBlock.read` asserted `data.count == superBlockSize`; that guard arrived
     /// with the volume-label work and went out with it.
     ///
-    /// On a short read, `EXT4+Reader.swift:59-61` reaches
+    /// On a short read, `EXT4.EXT4Reader`'s initializer reaches
     /// `data.withUnsafeBytes { $0.loadLittleEndian(as: EXT4.SuperBlock.self) }` on an
     /// undersized buffer. `UnsafeRawBufferPointer.load` bounds-checks with
     /// `_debugPrecondition`, which is `@inlinable` and so evaluated in the *client's*
@@ -223,47 +224,57 @@ public struct ImageRootfsUnpacker: Sendable {
     /// that upstream hands straight to `loadLittleEndian`. That range is why
     /// `fixtureWhoseStagedFileIsTruncated` truncates to 1536 rather than to 0.
     ///
-    /// The `s_magic` check at `:62` runs *after* that load, so it is no defence at all --
-    /// the out-of-bounds read has already happened, whether or not the magic survived.
-    /// Do not weaken the size assertion on the theory that magic narrows the window.
+    /// The `guard sb.magic == EXT4.SuperBlockMagic` check runs *after* that load, so it is
+    /// no defence at all -- the out-of-bounds read has already happened, whether or not the
+    /// magic survived. Do not weaken the size assertion on the theory that magic narrows the
+    /// window.
     ///
-    /// Nor could re-adding the fork's guard have closed the class: `:123`, `:141`, `:156`
-    /// and `:227` read group descriptors, inodes and data blocks with the same unchecked
-    /// pattern, all of it upstream. Asserting the file's size at the caller, before the
-    /// reader is constructed at all, is the right place for this.
+    /// Nor could re-adding the fork's guard have closed the class: `EXT4.EXT4Reader`'s
+    /// `readGroupDescriptor(_:)`, `readInode(_:)`, `getDirTree(_:)` and `getExtents(inode:)`
+    /// read group descriptors, inodes and data blocks with the same unchecked
+    /// `guard let ... = try handle.read(upToCount:)` pattern, all of it upstream. Asserting
+    /// the file's size at the caller, before the reader is constructed at all, is the right
+    /// place for this.
     ///
-    /// **Do not delete this as dead code.** At the submodule pointer this was written
-    /// against (`6304122`, before Task 12's bump) the fork's guard is still in the tree, at
-    /// `containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`
-    /// (`data.count == superBlockSize`), and *something* would refuse the truncated artefact
-    /// even with this check gone. MEASURED: weakening the guard below to `size >= 0` makes
-    /// the error `testAStagedFileWithNoReadableSuperblockIsNotPromoted` observes become
+    /// **Do not delete this as dead code, and do NOT conclude it is dead from a green
+    /// suite.** At the submodule pointer this was first written against (`6304122`, before
+    /// Task 12's bump) the fork's own guard was still in the tree -- `data.count ==
+    /// superBlockSize` in `EXT4.SuperBlock.read(from:at:)`, at
+    /// `containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63` -- and
+    /// *something* would have refused the truncated artefact even with this check gone.
+    /// MEASURED at `6304122`: weakening the guard below to `size >= 0` made the error
+    /// `testAStagedFileWithNoReadableSuperblockIsNotPromoted` observes become
     /// `could not read 1024 bytes of superblock from ... at offset 1024` -- the fork guard,
-    /// not this one.
+    /// not this one. So what that test pinned at `6304122` was which check reports, not
+    /// whether the artefact is refused.
     ///
-    /// **What that test pins TODAY is which check reports, not whether the artefact is
-    /// refused.** It asserts on this check's own message, so the weakening fails it; but the
-    /// safety property underneath is still being provided by the fork guard, and no test at
-    /// this pointer can show otherwise. The distinction matters because the fork guard goes
-    /// out with the volume-label work, and then nothing is underneath.
-    /// **Task 12: after the bump, weakening this check does not fail a test -- it TRAPS, and
-    /// the trap IS the kill.** The fixture's 1536-byte artefact reaches upstream's nil-check
-    /// as a 512-byte `Data`, the `guard let` succeeds, and `loadLittleEndian` -- which on a
-    /// little-endian host is literally `self.load(as: T.self)`
-    /// (`ContainerizationEXT4/UnsafeLittleEndianBytes.swift:54-57`) -- reads a 1024-byte
-    /// struct out of it. MEASURED by simulating the post-bump reader exactly (seek to 1024
-    /// in a 1536-byte file, `read(upToCount: 1024)`, `load(as:)` a 1024-byte struct):
+    /// **That is no longer the arrangement.** `EXT4+VolumeLabel.swift` is deleted at the
+    /// pointer this repository now carries (`a5803b6`), the fork guard went out with it, and
+    /// nothing is underneath this check any more. Weakening it does not fail a test -- it
+    /// TRAPS, and the trap IS the kill. The fixture's 1536-byte artefact reaches upstream's
+    /// nil-check as a 512-byte `Data`, the `guard let` succeeds, and `loadLittleEndian` --
+    /// which on a little-endian host is literally `self.load(as: T.self)`
+    /// (`UnsafeRawBufferPointer.loadLittleEndian(as:)` in
+    /// `ContainerizationEXT4/UnsafeLittleEndianBytes.swift`) -- reads a 1024-byte
+    /// struct out of it. MEASURED against the real code at the bumped pointer, not by
+    /// simulation: with `size >= capacityInBytes` weakened to `size >= 0` and the submodule
+    /// at `a5803b6`, `swift test --filter ImageRootfsUnpackerTests` exited 1 with
     ///
     /// ```
     /// Swift/UnsafeRawBufferPointer.swift:1446: Fatal error: UnsafeRawBufferPointer.load out of bounds
-    /// exit 133   (128 + 5, SIGTRAP)
     /// ```
     ///
+    /// as the last line of the bundle's output, printed after
+    /// `testAStagedFileWithNoReadableSuperblockIsNotPromoted` started and before it -- or any
+    /// of the tests after it -- reported anything. Eight test cases had started; none of the
+    /// remainder ran, and no `Executed N tests` line was ever printed. Restoring the check
+    /// returned the same filter to `Executed 12 tests, with 0 failures` and exit 0.
+    ///
     /// The process dies and takes the whole test bundle with it; no `catch` can see it and
-    /// no `XCTAssert` reports it. **Do not read `Fatal error: … load out of bounds` plus
-    /// SIGTRAP as an unrelated environment fault and call the mutation inconclusive** -- it
-    /// is the mutation working. Restoring the check makes the trap go away, which is the
-    /// confirmation.
+    /// no `XCTAssert` reports it. **Do not read `Fatal error: … load out of bounds` and a
+    /// bundle that stops mid-run as an unrelated environment fault and call the mutation
+    /// inconclusive** -- it is the mutation working. Restoring the check makes the trap go
+    /// away, which is the confirmation.
     ///
     /// That is the *debug* outcome, and `swift test` builds debug. `_debugPrecondition` is
     /// `@inlinable` and so evaluated in the client's build configuration, so a **release**
@@ -275,7 +286,8 @@ public struct ImageRootfsUnpacker: Sendable {
     /// **`capacityInBytes` is a FLOOR, and comparing against it is deliberate -- do not
     /// "fix" this into an exact-size comparison.** `EXT4.Formatter` treats its `minDiskSize`
     /// as usable capacity and writes more when the content or the journal needs it
-    /// (`EXT4+Formatter.swift:697-702`), so the artefact's true final size is not knowable
+    /// (`EXT4.Formatter.close()` starts from `self.size + journalByteCount` and raises it to
+    /// `contentRequiredSize`), so the artefact's true final size is not knowable
     /// here; upstream's `unpack` does not report it, and obtaining it would mean an upstream
     /// API change inside a plan whose purpose is converging *toward* upstream.
     ///
@@ -288,8 +300,8 @@ public struct ImageRootfsUnpacker: Sendable {
     /// of this comment claimed the `EXT4Reader` tree walk caught a file truncated between
     /// the floor and its true length. MEASURED against a promoted artefact from the test
     /// fixture -- `capacityInBytes` 2 MiB, real file 128 MiB, because the formatter pads out
-    /// to one whole block group (`contentRequiredSize = blocksPerGroup * blockSize`,
-    /// `EXT4+Formatter.swift:690-700`) -- `EXT4.EXT4Reader` ACCEPTED that artefact truncated
+    /// to one whole block group (`contentRequiredSize = blocksPerGroup * blockSize`, in
+    /// `EXT4.Formatter.close()`) -- `EXT4.EXT4Reader` ACCEPTED that artefact truncated
     /// to 2 MiB (1.5% of it), truncated to 50%, truncated 4 KiB short of full length, and
     /// with 1 MiB of zeros written over the metadata region at offsets 4096, 8192 and 32768.
     /// It refused only artefacts with no valid superblock magic: 2 MiB of zeros and 2 MiB of
@@ -310,9 +322,10 @@ public struct ImageRootfsUnpacker: Sendable {
     /// `defer { try? filesystem.close() }`, so a `close()` that fails part-way is swallowed
     /// and `unpack` returns normally, all of it before anything is promoted. What makes that
     /// safe is the ORDER `EXT4.Formatter.close()` writes in. The file is extended to its
-    /// final size early (`EXT4+Formatter.swift:738-750`, `lseek` + one-byte write) and the
-    /// superblock is written LAST, after the inode table, the bitmaps and the group
-    /// descriptors (`:906-908`). So a partial close leaves a correctly sized file with no
+    /// final size early (`if self.size < newSize { ... }`, an `lseek` + one-byte write) and
+    /// the superblock is written LAST, under that method's `// write superblock` step, after
+    /// the inode table, the bitmaps and the group
+    /// descriptors. So a partial close leaves a correctly sized file with no
     /// valid superblock -- which the reader refuses -- or a short file, which the size guard
     /// refuses. The two checks cover both realistic outcomes of the one failure mode that
     /// reaches this point.
@@ -354,41 +367,53 @@ public struct ImageRootfsUnpacker: Sendable {
     /// **`"ro"` here does NOT make the attachment read-only, and an earlier version of
     /// this comment claimed it did.** The option is stripped before the device reaches the
     /// hypervisor. VERIFIED against the pinned submodule object, not the worktree
-    /// (`git show 6304122:Sources/Containerization/LinuxContainer.swift`):
+    /// (`git show a5803b6:Sources/Containerization/LinuxContainer.swift`). Symbols rather
+    /// than line numbers below, because the numbers decayed once already across the Task 12
+    /// pointer bump. Inside `LinuxContainer.create()`:
     ///
     /// ```
-    /// :639   var modifiedRootfs = self.rootfs
-    /// :640   modifiedRootfs.options.removeAll(where: { $0 == "ro" })
-    /// :652   var containerMounts = [modifiedRootfs] + fileMountContext.transformedMounts
-    /// :661   mountsByID: [self.id: containerMounts],
+    /// var modifiedRootfs = self.rootfs
+    /// modifiedRootfs.options.removeAll(where: { $0 == "ro" })
+    /// ...
+    /// var containerMounts = [modifiedRootfs] + fileMountContext.transformedMounts
+    /// ...
+    /// mountsByID: [self.id: containerMounts],
     /// ```
     ///
     /// `mountsByID` is the only thing that becomes a VZ storage device for this path
-    /// (`VZVirtualMachineInstance.swift:585`; `grep -rn mountsByID Sources/` finds no other
-    /// producer besides `LinuxPod`, which arca does not use), and it carries the STRIPPED
-    /// copy. So `Mount.readonly` (`Mount.swift:441`) is false for the rootfs whatever this
-    /// function puts in `options`, and
-    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` (`Mount.swift:372`)
+    /// (`VZVirtualMachineInstance.Configuration.mountAttachments(allocator:)` is what turns
+    /// it into `AttachedFilesystem`s; MEASURED at `a5803b6`, `grep -rln mountsByID Sources/`
+    /// in the submodule names seven files, and the only two that BUILD the dictionary are
+    /// `LinuxContainer` and `LinuxPod` -- the CH and VZ managers just forward
+    /// `vmConfig.mountsByID` on, and arca does not use `LinuxPod`), and it carries the STRIPPED
+    /// copy. So `Mount.readonly` is false for the rootfs whatever this
+    /// function puts in `options`, and the
+    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` built by
+    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)`
     /// opens the shared slot read-write for every guest.
     ///
-    /// Upstream does this deliberately and says why at `:632-638`: a rootfs attached `ro`
+    /// Upstream does this deliberately and says why in the comment immediately above
+    /// `modifiedRootfs`: a rootfs attached `ro`
     /// gives `EROFS` when it writes `/etc/hosts` and `/etc/resolv.conf`, and it prefers to
     /// have the OCI runtime remount `ro` in the guest instead.
     ///
     /// **THE HOST-SIDE HOLE IS OPEN.** Nothing the parent can set on this mount closes it
-    /// at this pin, and closing it would mean diverging from the upstream this plan is
+    /// at `a5803b6`, and closing it would mean diverging from the upstream this plan is
     /// converging toward. `chmod 0444` on the slot is not the way round it either: the
     /// attachment is opened read-write, so a read-only file fails the attach.
     ///
-    /// **What the flag does buy, and why it stays.** `LinuxContainer.swift:434` reads the
-    /// UNSTRIPPED `self.rootfs`:
+    /// **What the flag does buy, and why it stays.** `LinuxContainer.generateRuntimeSpec()`
+    /// reads the UNSTRIPPED `self.rootfs`:
     /// `spec.root?.readonly = self.rootfs.options.contains("ro") && self.writableLayer == nil`.
-    /// So on a `writableLayer == nil` caller (`LinuxContainer.swift:617-621`, upstream's
-    /// supported no-overlay path) the option makes the OCI runtime remount the root
-    /// read-only inside the guest -- which is upstream's own stated preference. It costs
+    /// So on a `writableLayer == nil` caller (the `else` branch of
+    /// `LinuxContainer.mountRootfs(...)` -- "No writable layer. Mount rootfs directly." --
+    /// upstream's supported no-overlay path) the option makes the OCI runtime remount the
+    /// root read-only inside the guest -- which is upstream's own stated preference. It costs
     /// nothing, and it is behaviour-preserving today: arca always passes a writable layer,
-    /// so `spec.root?.readonly` stays false, and the lower-mount append at
-    /// `LinuxContainer.swift:591-593` was already going to add `"ro"` on that branch.
+    /// so `spec.root?.readonly` stays false, and the lower-mount append in the writable-layer
+    /// branch of the same function
+    /// (`if !lowerMount.options.contains("ro") { lowerMount.options.append("ro") }`) was
+    /// already going to add `"ro"` on that branch.
     ///
     /// NOT PROVEN HERE, and not provable in this target: anything about a running guest.
     /// Nothing here starts a VM. Task 13/14's 35-layer create-and-run is the instrument.

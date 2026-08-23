@@ -117,9 +117,11 @@ final class CreatePathSeamTests: XCTestCase {
     ///
     /// **`options` must be empty, and unlike the rootfs this mount is not stripped.**
     /// `LinuxContainer.create()` removes `"ro"` from the rootfs before the VZ mount array is
-    /// built (`LinuxContainer.swift:639-640`) but inserts the writable layer verbatim
-    /// (`:654`), so `Mount.readonly` (`Mount.swift:441`) does reach
-    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` (`Mount.swift:372`) here. A `"ro"`
+    /// built (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`) but inserts the
+    /// writable layer verbatim (`containerMounts.insert(writableLayer, at: 1)`), so
+    /// `Mount.readonly` does reach the
+    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` built by
+    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)` here. A `"ro"`
     /// on this mount attaches the overlay's upper layer read-only.
     ///
     /// **MEASURED that nothing else catches it:** with the helper's options changed from
@@ -155,11 +157,12 @@ final class CreatePathSeamTests: XCTestCase {
         )
         XCTAssertEqual(first.mount.source, path.path)
         XCTAssertTrue(first.mount.isBlock, "the writable layer must be a block device")
-        // `type` and not just `isBlock`: `Mount.block(format:)` stores `format` AS `type`
-        // (`Mount.swift:82`), while `isBlock` reads `runtimeOptions` (`:446-451`) and is
+        // `type` and not just `isBlock`: `Mount.block(format:source:destination:options:)`
+        // stores `format` AS `type`, while `Mount.isBlock` reads `runtimeOptions` and is
         // true for any format at all -- so `isBlock` alone cannot see "ext4" become
         // "ext3". The format is also the half that survives into the guest: upstream
-        // overwrites `destination` before mounting (`LinuxContainer.swift:597-599`) and
+        // overwrites `destination` before mounting (`upperMount.destination =
+        // upperMountPath` in `LinuxContainer.mountRootfs(...)`) and
         // leaves `type` alone, so it is what the guest actually tries to mount as.
         XCTAssertEqual(
             first.mount.type, "ext4",

@@ -68,7 +68,8 @@ extension ContainerManager: ExecContainerSource {}
 /// has to get right on teardown happens after `startExec` has a `LinuxProcess`,
 /// and a `LinuxProcess` comes from `LinuxContainer.exec` (`:310` below).
 /// `LinuxContainer` is `final` and vends processes only out of its `started`
-/// state (`LinuxContainer.swift:1087`), which is reached by booting a virtual
+/// state (`LinuxContainer.exec(_:configuration:)` records each one into
+/// `startedState.vendedProcesses`), which is reached by booting a virtual
 /// machine. So against the concrete actor, `execInfo.process` is nil in every
 /// VM-free test that can ever be written, `startExec` returns as soon as it
 /// finds no native container, and the one situation the teardown exists for --
