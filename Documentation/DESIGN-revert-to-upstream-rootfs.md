@@ -398,9 +398,16 @@ on any given machine is untracked local planning. Six files there describe the
 design being removed, and **only one of them is in the repository**:
 
 - Tracked, and must be updated by the same change that removes the code:
-  `EVIDENCE-layer-cache-poisoning.md` (3 matches), `ARCHITECTURE.md` (4) and
-  `VMINIT_BUILD.md` (1). `ARCHITECTURE.md` is the one a reader is most likely to
-  trust, so it is the one that most matters.
+  `EVIDENCE-layer-cache-poisoning.md` (3 matches) and `ARCHITECTURE.md` (4).
+  `ARCHITECTURE.md` is the one a reader is most likely to trust, so it is the one
+  that most matters.
+- **`VMINIT_BUILD.md` was listed here with 1 match and should not have been.**
+  That match is `arca-tap-forwarder - TAP forwarder for overlay networks` — a
+  network overlay, not OverlayFS. Re-derived after the revert landed: a sweep of
+  that file for `vdb|vdc|ArcaBoot|mountScratch|volume label|attachedOverlayLayers`
+  returns nothing, against a 347-line file. The count came from an unanchored grep
+  for `overlay`, which is the same defect this plan records fifteen further
+  instances of. The file correctly needs no change.
 - Untracked local files, and therefore not this change's business:
   `OVERLAYFS_CLEANUP_PLAN.md`, `OVERLAYFS_DEFINITIVE_PLAN.md`,
   `OVERLAYFS_IMPLEMENTATION_GUIDE.md`, `OVERLAYFS_SIMPLIFIED_APPROACH.md` and

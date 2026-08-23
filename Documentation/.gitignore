@@ -28,10 +28,9 @@
 # layer-cache record came to live in another repository's ignored scaffolding.
 !EVIDENCE-*.md
 
-# Designs another repository's documentation cites, for the same reason as the
-# evidence records above: a cross-repository citation into an ignored file points
-# at nothing the reader can fetch.
-!DESIGN-*.md
+# NOTE: `!DESIGN-*.md` is not repeated here. PR #61 merged first and added it above
+# the evidence block, with the same reasoning; a second negation would be a no-op in
+# the one file whose whole purpose is to be read as an inventory.
 
 # The implementation plan for a tracked design. It spans this repository, the
 # containerization submodule and gascan, so no single repository's ignored
