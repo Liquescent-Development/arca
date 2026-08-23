@@ -78,7 +78,8 @@ public actor ContainerManager {
     /// platform.
     ///
     /// A parameter and not a derivation, because the value differs by consumer and one of
-    /// them still hardcodes Arca's tree: `ArcaDaemon.swift:199` passes
+    /// them still hardcodes Arca's tree: `ArcaDaemon.start`'s `ContainerManager(...)`
+    /// construction passes `imageRootfsCachePath: arcaRoot/"image-rootfs"`, i.e.
     /// `~/.arca/image-rootfs`. `arca-engine` passes `EnginePaths.imageRootfs`, under
     /// whichever state root it was given. Before this was a parameter, every consumer got
     /// the daemon's value whatever root it owned.

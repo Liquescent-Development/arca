@@ -58,8 +58,9 @@ public enum LayerCacheReclaim {
     ///     distinguishable from a root the operator meant. MEASURED with a `swiftc` probe on
     ///     2026-08-22: `URL(fileURLWithPath:)` resolves `""`, `"."`, `".."` and
     ///     `"relative/root"` against the working directory, so all four reach a `URL` as
-    ///     ordinary absolute paths. MEASURED in this task's review round: with no rule here,
-    ///     `arca-engine serve --state-root ""` recursively removed `$CWD/layers`.
+    ///     ordinary absolute paths. MEASURED on 2026-08-22, in the round committed as
+    ///     `fc96ee1` on this branch: with no rule here, `arca-engine serve --state-root ""` recursively
+    ///     removed `$CWD/layers`.
     ///   - `reclaimLayersDirectory` applies it to the root it was actually handed, because
     ///     `ArcaDaemon` never passes through `validateEngineInputs` and because a future
     ///     caller should not have to know that it must. What survives into a `URL` is the
@@ -249,7 +250,9 @@ public enum LayerCacheReclaim {
             //
             //   - this branch fires once `<parent>/layers` reaches 1024 bytes, so from
             //     `strlen(parent) == 1017`;
-            //   - `chdir(2)` succeeds up to `strlen(parent) == 1023` and fails from 1025 --
+            //   - `chdir(2)` succeeds up to `strlen(parent) == 1023` and fails from 1025 (1024 was not
+    ///     probed, so the seven below counts it as failing on the trend and not on a
+    ///     measurement) --
             //     seven parent lengths where a `cd` to the absolute path would have worked;
             //   - and it is shell-dependent above that: at `strlen(parent) == 1421`, `/bin/zsh`
             //     `cd` SUCCEEDS -- it chunks the `chdir` -- while `/bin/bash` and `/bin/sh`

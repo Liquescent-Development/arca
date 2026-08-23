@@ -19,7 +19,8 @@ final class EngineStartupTests: XCTestCase {
     /// `--state-root` is the one option the engine deletes out of: `EngineManagers.init`
     /// reclaims `<state-root>/layers` on every start. Until this refusal existed the option
     /// was validated by nothing at all, and `arca-engine serve --state-root ""` recursively
-    /// removed `$CWD/layers` -- MEASURED in this task's review round.
+    /// removed `$CWD/layers` -- MEASURED on 2026-08-22, in the round committed as `fc96ee1`
+    /// on this branch.
     ///
     /// The four forms below are refused **before any check reads the filesystem**, which is
     /// what `EngineInputs` keeping the raw option text buys: `URL(fileURLWithPath:)` resolves

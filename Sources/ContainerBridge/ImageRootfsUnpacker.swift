@@ -82,6 +82,14 @@ public struct ImageRootfsUnpacker: Sendable {
     /// compile-time `#if arch(arm64)` switch and so a given cache root is only ever written
     /// by one platform; it becomes live the moment arca honours `--platform`, or a cache
     /// root is copied between machines.
+    ///
+    /// **The key is `os` and `architecture` only -- it does NOT carry `variant`**, while
+    /// `Platform.==` at `a5803b6` does compare `variant` (with an explicit `arm64` nil-vs-
+    /// `"v8"` shim). So two platforms that `manifest(for:)` distinguishes -- `linux/arm/v6`
+    /// and `linux/arm/v7` -- would map to the same `linux-arm` directory and share one slot.
+    /// Unreachable today for the same reason as above: `detectSystemPlatform()` builds its
+    /// `Platform` with no variant. Add `variant` to the path component before honouring
+    /// `--platform`.
     public func rootfsPath(forImageDigest digest: String, platform: ContainerizationOCI.Platform) -> URL {
         cacheRoot
             .appendingPathComponent(digest.replacingOccurrences(of: ":", with: "-"))
@@ -111,6 +119,14 @@ public struct ImageRootfsUnpacker: Sendable {
     /// delete the first's in-flight staging files, which is exactly the corrupt race this
     /// rule avoids everywhere else. Calling this is only safe while one process owns the
     /// cache root.
+    ///
+    /// **The second process is concrete, not hypothetical.** `ArcaDaemon` owns
+    /// `~/.arca`, a fixed and guessable path, and `LayerCacheReclaim.rootRefusal(for:)`
+    /// accepts it -- it refuses empty, relative, `~`-literal, non-canonical and
+    /// filesystem-root inputs, all of which `/Users/<user>/.arca` is not. So
+    /// `arca-engine --state-root ~/.arca` alongside a running daemon shares both `layers`
+    /// and `image-rootfs`, and the engine's sweep would delete the daemon's in-flight
+    /// staging files. Nothing separates them except that nobody passes that argument.
     public func reapOrphanedStagingFiles() throws {
         // Not an error: a cache root that has never been written holds no orphans. This is a
         // defined state of the cache, not a failure being swallowed -- every other error
@@ -350,11 +366,28 @@ public struct ImageRootfsUnpacker: Sendable {
     /// refuses. The two checks cover both realistic outcomes of the one failure mode that
     /// reaches this point.
     ///
-    /// Beyond that, the slot is only ever created by a promotion, so a crash at any point
-    /// during the unpack leaves the artefact at the staging path and never in the slot. For
-    /// a correctly sized but internally truncated filesystem to occupy the slot it would
-    /// have to be corrupted AFTER a successful promotion -- disk-level corruption, a
-    /// different threat, and not one this type is positioned to detect.
+    /// Beyond that, the slot is only ever *created* by a promotion, so a crash at any point
+    /// during the unpack leaves the artefact at the staging path and never in the slot.
+    ///
+    /// **It is not the only writer to the slot afterwards, and an earlier revision of this
+    /// comment was wrong to say the remaining threat was disk-level corruption.** The slot
+    /// is handed to upstream's `create(_:image:rootfs:writableLayer:...)` as the `rootfs`
+    /// argument, and `LinuxContainer.create()` at `a5803b6` strips `"ro"` from it
+    /// (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`), so
+    /// `Mount.readonly` is false and the device is attached
+    /// `VZDiskImageStorageDeviceAttachment(readOnly: false)`. **Every running guest holds
+    /// the shared slot open read-write at the hypervisor.**
+    ///
+    /// What bounds it: `LinuxContainer.mountRootfs` appends `"ro"` to the lower mount
+    /// inside the guest before mounting it, so the ordinary filesystem path in a container
+    /// is read-only. The exposure is at the raw block-device layer only. Post-promotion
+    /// corruption is therefore reachable from inside a container with block-device access,
+    /// and this type re-verifies nothing on the cache-hit path -- so such corruption is
+    /// permanent for that digest and silent.
+    ///
+    /// This is a behaviour change against the pre-revert design, where
+    /// `OverlayFSMounter.buildMounts` attached each shared layer cache file as a
+    /// **non-rootfs** mount with `options: ["ro"]`, which upstream did not strip.
     private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
         let size = try FileManager.default.attributesOfItem(atPath: path.path)[.size] as? UInt64
         guard let size, size >= capacityInBytes else {

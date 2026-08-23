@@ -120,10 +120,16 @@ final class ContainerBridgePathsTests: XCTestCase {
     /// cache on every start: each `gascan up` silently pays a full 35-layer unpack, and
     /// nothing else in the suite goes red.
     ///
-    /// MEASURED, which is why this test exists at all: with `EnginePaths.swift:90` reverted
-    /// to `stateRoot.appendingPathComponent("layers")` and a clean `.build`,
+    /// MEASURED, which is why this test exists at all: with the `self.imageRootfs`
+    /// assignment in `EnginePaths.init(stateRoot:)` reverted to
+    /// `stateRoot.appendingPathComponent("layers")` and a clean `.build`,
     /// `swift test --filter ArcaEngineTests` reported `Executed 260 tests, with 0
-    /// failures`. Neither of the two tests through the wiring can see it -- `<root>/layers`
+    /// failures` -- measured at `115e83f`, where the suite was 260; it is 274 at the tip of
+    /// this branch. Name the assignment, never a line number: earlier revisions of this
+    /// docstring cited `EnginePaths.swift:90`, which is a **blank line** and has been one
+    /// since the docstring was written. Mutating a blank line changes nothing and prints
+    /// the same all-green result, so the wrong anchor reproduced the recorded outcome for
+    /// the wrong reason. Neither of the two tests through the wiring can see it -- `<root>/layers`
     /// is under the state root, does not end in `.arca/image-rootfs`, and is as distinct
     /// from `images`/`volumes`/`logs` as `image-rootfs` is.
     ///

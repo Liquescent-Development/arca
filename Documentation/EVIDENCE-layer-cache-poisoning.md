@@ -21,17 +21,22 @@ task-scoped reviews had passed. Fixed at Arca `4134b54`, published in
 
 ## The defect
 
-`EXT4.Formatter` writes the superblock **and the volume label** in `close()`
-(`ContainerizationEXT4/EXT4+Formatter.swift:645`, `:970-972`). The formatter was
-pointed at the final cache path and `close()` was deferred, so an unpack that
-*threw* — which is exactly what a mistyped layer made it do — still left a valid,
+At `6304122` — the submodule pointer this repository carried while the defect was live —
+`EXT4.Formatter.close()` wrote the superblock **and the volume label**. That machinery is
+gone at `a5803b6`, the pointer this repository carries now: `grep volumeLabel` over
+`a5803b6:Sources/ContainerizationEXT4/EXT4+Formatter.swift` exits 1 with no output, against
+10 hits at `6304122`. This section is written in the past tense
+throughout, because every mechanism it describes is gone at the pointer this branch ships.
+
+The formatter was pointed at the final cache path and `close()` was deferred, so an unpack
+that *threw* — which is exactly what a mistyped layer made it do — still left a valid,
 correctly labelled, **empty** `layer.ext4` in the cache slot.
 
-The next create's reuse predicate tests **the label alone**, so it hit.
+The next create's reuse predicate tested **the label alone**, so it hit.
 
-An attached-layer count could not see it. The poisoned device is a real ext4,
-carries `.overlayLayer`, is attached, *is* counted, and `ArcaLayerAttachment.resolve`
-sees `attached == identified` and resolves `.complete`. **The first create failed
+An attached-layer count could not see it. The poisoned device was a real ext4, carried
+`.overlayLayer`, was attached, *was* counted, and `ArcaLayerAttachment.resolve` saw
+`attached == identified` and resolved `.complete`. **The first create failed
 loudly; every create after it booted a container on a rootfs built from none of
 that layer, with `Start` succeeding.**
 
@@ -101,12 +106,12 @@ The idea is the same. What changed is where it lives, and that it now takes
 The original fix, at layer granularity, unpacked into a sibling staging path and
 promoted onto `layer.ext4` with `rename(2)` only after `formatter.close()`
 returned; `close()` was deliberately no longer deferred, because it was the commit
-point. That code is `OverlayFSUnpacker.promoteStagedLayer` in the submodule, still
-present at the pointer this repository carries
-(`git show 6304122:Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift`,
-`promoteStagedLayer` at `:215`, staging at `:352`, promotion at `:377`, cleanup at
-`:379`). The submodule revert deletes it, and this repository stops carrying it at
-the pointer bump.
+point. That code is `OverlayFSUnpacker.promoteStagedLayer` in the submodule. It was present at
+`6304122` (`git show 6304122:Sources/Containerization/Image/Unpacker/OverlayFSUnpacker.swift`,
+`promoteStagedLayer` at `:215`, staging at `:352`, promotion at `:377`, cleanup at `:379` —
+all four verified at that SHA). **It is gone at `a5803b6`**, the pointer this repository
+carries as of `b325bc5`: `git ls-tree a5803b6 Sources/Containerization/Image/Unpacker/`
+returns three files and `OverlayFSUnpacker.swift` is not among them.
 
 Staging was chosen over the smaller catch-and-discard because it closes the hole by
 never creating the slot, which holds for a cancellation arriving mid-unpack as well
@@ -148,11 +153,13 @@ restate it.
 
 ## Upstream's `EXT4Unpacker` is still poisonable, and that is not fixed here
 
-At the pinned submodule pointer, both public `unpack` overloads write straight to
-the destination path they are handed and close the formatter in
+At `a5803b6`, the pinned submodule pointer, both public `unpack` overloads write straight
+to the destination path they are handed and close the formatter in
 `defer { try? filesystem.close() }`
-(`git show 6304122:Sources/Containerization/Image/Unpacker/EXT4Unpacker.swift`,
-`:55` and `:85`). Nothing in that type stages, verifies or promotes.
+(`git show a5803b6:Sources/Containerization/Image/Unpacker/EXT4Unpacker.swift`, the two
+`defer` lines at `:55` and `:85`, under the `func unpack` declarations at `:44` and `:70`).
+Verified at `a5803b6` and unchanged from `6304122` — the revert did not touch this type.
+Nothing in it stages, verifies or promotes.
 
 So any caller that treats "a file is at the destination" as a cache hit reproduces
 this defect. `ImageRootfsUnpacker` is safe because it never hands `EXT4Unpacker`
@@ -210,14 +217,24 @@ then restored byte-identical (`shasum -a 256`
 `f09722d0b4ec4baf38150ae1854d8501f23488095eb4d55ff27f54a9d585489a`, checked before
 and after every mutation) and the restored suite re-run green.
 
-**Why those rows still hold for later commits.** Every commit that has touched
-`ImageRootfsUnpackerTests.swift` since `63b30ce` changed only doc comments in it —
-zero non-comment lines, checked mechanically against the diff — and none touched
-`ImageRootfsUnpacker.swift` at all. Failing sets are a function of the production
-source and the test bodies, and neither moved. Mutation A was re-run at `f95850e` to
-check that rather than assume it, and gave the same two failures in the same one
-test. Anyone extending this document should do the same rather than extend the
-argument.
+**Why those rows still hold for later commits, and where they stop holding.** Every
+commit that has touched `ImageRootfsUnpacker.swift` or `ImageRootfsUnpackerTests.swift`
+since `63b30ce` — `f95850e`, `b325bc5` and `b3d47b5` — changed **only comment lines in
+them**: zero non-comment lines either way, checked mechanically against the diff. So the
+production source and the test bodies have not moved.
+
+**But a failing set is a function of the submodule pointer too, and that DID move.**
+`b325bc5` bumped it from `6304122` to `a5803b6`, after every row below was measured.
+Row **F** is invalidated by that bump and is superseded by the measurement in
+`verifyReadable`'s doc comment — see "The bounds on two of these rows". Rows **A, B, C and
+M have not been re-derived at `a5803b6`** by the round that wrote this table.
+
+Mutation A was re-run at `f95850e` to check the source-and-tests half rather than assume it,
+and gave the same two failures in the same one test. A was **also** re-derived at `b3d47b5`,
+with the submodule at `a5803b6`, by the final whole-branch review: same kill, same single
+test, and T1 passing exactly as the note below describes. Anyone extending this document
+should re-run rather than extend the argument — and should state the submodule pointer the
+run used, which is the input this paragraph originally omitted.
 
 Assertions are named by what they say rather than by line offset, because a line
 offset in this plan has decayed twice inside a single round.
@@ -227,7 +244,7 @@ offset in this plan has decayed twice inside a single round.
 | **A** `let staging = slot` | **T5 only — T1 PASSES** | both of T5's: "the unpack wrote the cache slot directly" and "the cache slot existed before the promotion" |
 | **B** drop the `catch` cleanup | T2 | T2's one: "a refused unpack left … in the image's cache directory" |
 | **C** delete the `verifyReadable` call | **T3 and T9** | all four: each test's "was expected to be refused" and each test's "was promoted into the cache slot" |
-| **F** `size >= capacityInBytes` → `size >= 0` | T3 | **only T3's error-identity assertion** ("the refusal must be `verifyReadable`'s size assertion and not some earlier error"). T3's slot assertion PASSES |
+| **F** `size >= capacityInBytes` → `size >= 0` | T3 — **at submodule `6304122` only** | **only T3's error-identity assertion** ("the refusal must be `verifyReadable`'s size assertion and not some earlier error"). T3's slot assertion PASSES. **Superseded at `a5803b6`:** the fork guard underneath is gone, so this mutation no longer fails an assertion — it traps and kills the bundle. See "The bounds on two of these rows" |
 | **M** delete only the `EXT4Reader` line | T9 | both of T9's |
 
 **A's result is the one to read twice.** Mechanism 1 is pinned by T5 and by nothing
@@ -236,8 +253,9 @@ into the slot, because the error-path cleanup then deletes it and hides that it 
 ever the destination. A maintainer who trims T5 as an incidental test reintroduces
 upstream's write-straight-to-the-destination behaviour with nothing going red.
 
-**F's result confirms the bound stated below**, at HEAD rather than by transcription:
-the artefact is still refused with the size guard weakened — the failure message
+**F's result confirms the bound stated below** — measured, not transcribed, but measured
+**at `63b30ce` with the submodule at `6304122`**, which is no longer the pointer this
+branch ships. At that pointer the artefact is still refused with the size guard weakened — the failure message
 carries the fork guard's own `could not read 1024 bytes of superblock … at offset
 1024` — so what T3 pins today is which check reports, not whether the slot is
 protected.
@@ -307,16 +325,15 @@ T7 and T8, while J and L kill one each.
 
 ### The bounds on two of these rows
 
-**Read F narrowly.** At the pinned submodule pointer it pins *which check reports*,
-not *whether the artefact is refused*. Confirmed at `63b30ce` in the table above and
+**Read F narrowly, and note it is now historical.** At `6304122` it pinned *which check
+reports*, not *whether the artefact is refused*. Confirmed at `63b30ce` in the table above and
 not merely transcribed: under F only T3's error-identity assertion fails, and T3's
 slot assertion — that the artefact was not promoted — still passes, because the
 fork's own guard in
 `containerization/Sources/ContainerizationEXT4/EXT4+VolumeLabel.swift:63`
-(`data.count == superBlockSize`) refuses the truncated artefact underneath. That
-guard goes out with the volume-label work at the pointer bump, and then nothing is
-underneath — after which weakening the check does not fail an assertion at all, it
-traps. `verifyReadable`'s doc comment carries that measurement, including the
+(`data.count == superBlockSize`) refuses the truncated artefact underneath. That guard **went out** with the volume-label work at the pointer bump, `b325bc5` on this
+branch, and nothing is underneath it at `a5803b6` — so weakening the check no longer fails
+an assertion at all, it traps. `verifyReadable`'s doc comment carries that measurement, including the
 `exit 133` and why a SIGTRAP there is the mutation working rather than an
 environment fault.
 
@@ -333,7 +350,8 @@ because it was run, not as a result about the fix.
 of the source and **rebuilt** — `--skip-build` was never used for a mutation, so no
 probe ran against a stale object — then the file was restored and
 `git status --porcelain` checked clean. The submodule pointer was verified
-unchanged at `6304122` before and after. One instrumented run, used to confirm that
+unchanged at `6304122` before and after — which is the pre-bump pointer, and the reason
+row F does not survive `b325bc5`. One instrumented run, used to confirm that
 T9's error-identity assertion is exercised rather than merely present, was reverted
 from a byte-identical backup.
 

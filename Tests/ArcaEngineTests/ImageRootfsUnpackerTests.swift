@@ -558,8 +558,9 @@ final class ImageRootfsUnpackerTests: XCTestCase {
 
     /// The platform every test here requests, and deliberately NOT `Platform.current`.
     ///
-    /// `OCILayoutFixture` writes `architecture: "arm64", os: "linux"` with no variant
-    /// (`OCILayoutFixture.swift:167`). `Platform.current` reads `uname` and hardcodes
+    /// `OCILayoutFixture` writes `architecture: "arm64", os: "linux"` with no variant --
+    /// the `ContainerizationOCI.Image(architecture:os:)` literal in
+    /// `OCILayoutFixture.write(at:reference:layers:)`. `Platform.current` reads `uname` and hardcodes
     /// `os: "linux"` (`ContainerizationOCI/Platform.swift:38-48`), so on this arm64 host it
     /// supplies `variant: "v8"` and matches the fixture only through the `arm64`+`nil`
     /// versus `arm64`+`"v8"` special case in `Platform.==` (`:252-266`) -- the suite's

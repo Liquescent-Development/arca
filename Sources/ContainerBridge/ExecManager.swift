@@ -66,7 +66,8 @@ extension ContainerManager: ExecContainerSource {}
 /// made `ExecManager`'s own guards reachable without a VM. It cannot make
 /// `SandboxEngineService.runSession` reachable, because everything that session
 /// has to get right on teardown happens after `startExec` has a `LinuxProcess`,
-/// and a `LinuxProcess` comes from `LinuxContainer.exec` (`:310` below).
+/// and a `LinuxProcess` comes from the `nativeContainer.exec(_:configuration:)` call
+/// below.
 /// `LinuxContainer` is `final` and vends processes only out of its `started`
 /// state (both `exec(_:configuration:)` overloads open with
 /// `state.startedState("exec")` and record the process into that state's

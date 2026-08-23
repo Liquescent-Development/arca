@@ -453,9 +453,12 @@ before attaching it, so the device reaches the guest writable; a caller that pas
 no writable layer would get the shared slot mounted read-write.
 `ImageRootfsUnpacker.blockMount(at:)` records the mechanism and what stays open.
 
-The cache is keyed on **image digest and platform together**, not on the digest
+The cache is keyed on **image digest plus `os` and `architecture`**, not on the digest
 alone: a multi-platform image has one index digest and a different layer set per
-platform, so a digest-only key would hand an arm64 rootfs to an amd64 request.
+platform, so a digest-only key would hand an arm64 rootfs to an amd64 request. The key
+does **not** include the platform `variant`, so `linux/arm/v6` and `linux/arm/v7` would
+share a slot -- unreachable while `detectSystemPlatform()` emits no variant, and a thing
+to fix before arca honours `--platform`.
 
 Two properties of that cache are load-bearing and are worth knowing before
 changing it:
@@ -475,10 +478,20 @@ overlay inside the guest at boot. It capped images at roughly 24 layers, because
 the engine allocates block device tags from a 26-letter alphabet, and that ceiling
 is why it was reverted to upstream's model.
 
-The host side of it is gone from this repository. The guest-side boot code still
-exists in the `containerization/` submodule at the pointer this repository carries,
-and goes with the pointer bump; it composes nothing in the meantime, because the
-host no longer attaches per-layer devices for it to find.
+The host side of it is gone from this repository, and so is the guest side. The
+guest-side boot code went out with the submodule pointer bump — `b325bc5`, which moved
+the pointer from `6304122` to `a5803b6` — removing 343 lines from
+`vminitd/Sources/VminitdCore` (`ArcaBoot.swift`, `AgentCommand.swift`,
+`Server+GRPC.swift`, per `git diff --numstat 6304122 a5803b6`). `ArcaBoot` retains only
+`startServices(log:)`.
+
+**That guest code has not been executed by anything, and the ceiling is NOT yet proven
+gone.** All 343 removed lines sit inside `#if os(Linux)`, which macOS compiles none of,
+and cross-compiling is unavailable on the development host (the installed Static Linux SDK
+carries only an x86_64 slice). Nothing in this repository can settle it. It gets verified
+by the 35-layer workspace image creating and running against a released engine, and by
+that alone — never by a unit test asserting a device count. The test that used to make
+that assertion was deleted for exactly this reason.
 
 ## Container Lifecycle Integration
 
@@ -572,19 +585,32 @@ RPCs — `Ready`, `SyncFilesystem`, `EnumerateUpperdir`, `ReadArchive`,
 `Sources/ContainerBridge/Generated/filesystem.grpc.swift`.
 **Two of them are OverlayFS-based, and those two do not work** — and did not
 work before the revert to a single composed rootfs either. They are broken in
-different ways, not one way. Verified against the pinned submodule object
-(`git show 6304122:vminitd/extensions/arca-services/internal/filesystem/filesystem.go`):
+different ways, not one way. Verified against
+`git show a5803b6:vminitd/extensions/arca-services/internal/filesystem/filesystem.go`, the
+pinned submodule object. The file is **byte-identical at `6304122` and `a5803b6`**
+(`git diff --stat 6304122 a5803b6 --` over that path is empty), so the offsets below hold
+at both pointers — the revert does not touch this Go tree:
 
 - `EnumerateUpperdir`, which `docker diff` reaches, looks for `/mnt/vdb/upper`
   (`:151`) and answers `upperdir not found at /mnt/vdb/upper` (`:157`) when it is
   absent. The fork's guest-side overlay mounted at `/mnt/writable`, so that path
   never resolved.
-- `CreateVolumeOverlay` has no caller at all, and scans `/proc/mounts` for a
-  literal `/dev/vdb` (`:836-837`) under a comment asserting the miss "shouldn't
-  happen".
+- `CreateVolumeOverlay` has **no hand-written caller** — every reference to it under
+  `Sources/` is in `Sources/ContainerBridge/Generated/` — so it is unreachable rather
+  than observed failing. Its `/proc/mounts` scan for a literal `/dev/vdb` is in
+  `findWritableMountPath()`, which `CreateDirectMount` also calls, so that scan is **not**
+  evidence about this RPC specifically; unreachability is the whole of the evidence here.
 
 The revert changes which way this subsystem is broken, not whether it is. Wiring
 named volumes and `docker diff` onto the single composed rootfs is separate work.
+
+**Also not done, and named here so it is an absence rather than an oversight:** nothing
+evicts the per-image rootfs cache. `docker rmi` removes the image; its
+`<root>/image-rootfs/sha256-<digest>/<os>-<arch>/rootfs.ext4` stays on disk indefinitely.
+`ImageManager` never sees the cache path, and `LayerCacheReclaim` deletes only the
+orphaned `layers` tree. This is not a regression -- the `layer_cache` table this revert
+drops had no production caller that evicted anything either -- but the revert is the point
+at which even the accounting for it went away.
 
 ## HTTP Streaming
 
@@ -678,9 +704,17 @@ graph LR
 **Why?** A block device per layer exhausts the engine's 26-letter device alphabet at
 roughly 24 layers, and it is fork-local divergence from upstream Containerization
 **Trade-off:** The first create for an image stacks every layer serially where the
-fork unpacked them in parallel. The fork's unpack of 36 layers measured
-`duration_seconds=14.83` on 2026-08-21; the composed equivalent has not been
-measured, and the number belongs here once it is
+fork unpacked them in parallel (`EXT4Unpacker.unpack` at `a5803b6` is a serial
+`for (index, resolved) in resolvedLayers.enumerated()`; the fork's
+`OverlayFSUnpacker` used a `withThrowingTaskGroup` with a stated concurrency limit of 3,
+read at `6ede1d5`). The fork's unpack measured
+`duration_seconds=14.83 layers=36` on 2026-08-21, on host `newcombe`, with the engine
+built from arca `c545612`, against the gascan workspace image — the same run that produced
+`no free indices are available for allocation`. The **36** is the engine's own log field,
+quoted as emitted; the image is described elsewhere in this repository as 35 layers, and
+nothing in this tree explains the difference of one. Do not reconcile the two by arithmetic
+— re-derive both from a run. The composed equivalent has not been measured,
+and the number belongs here once it is
 
 ## Development Architecture
 
