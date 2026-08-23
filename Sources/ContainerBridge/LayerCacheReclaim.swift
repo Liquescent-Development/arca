@@ -139,10 +139,10 @@ public enum LayerCacheReclaim {
     ///   - **A real directory `rename(2)`d into the name is deleted in full.** There is nothing
     ///     in `removeItem` that could tell it from the directory `lstat` saw, and it recurses.
     ///     Probed directly: the check saw a directory, `rename(precious, layers)` returned 0,
-    ///     and after the removal the file three levels inside `precious` was gone.
-    ///     `LayerCacheReclaimTests.testAPathRenamedOverByARealDirectoryIsRemovedInFull` pins
-    ///     that this is what happens, so the paragraph cannot quietly revert to the softer
-    ///     claim.
+    ///     and after the removal the file two levels inside `precious` was gone.
+    ///     `LayerCacheReclaimTests.testAPathRenamedOverByARealDirectoryIsRemovedInFull` runs
+    ///     the reclaim over exactly that swap and asserts the tree is gone. It does not guard
+    ///     this paragraph: prose can be reverted without any test noticing.
     ///
     /// An earlier revision of this comment said the residue was bounded, full stop. It is
     /// bounded for the symlink swap alone, and generalising that half to the whole race was
@@ -239,18 +239,31 @@ public enum LayerCacheReclaim {
                 + "\(quoted((path as NSString).deletingLastPathComponent)) -- then remove "
                 + "\(quoted(path))"
         case ENAMETOOLONG:
-            // The *absolute* path is too long, not the directory. MEASURED on 2026-08-22
-            // against a real 1344-character path: `rm -rf <absolute>` exits 0 and removes
-            // nothing -- `rm -f` treats `ENAMETOOLONG` the way it treats a missing file -- while
-            // `rm -rf layers` run from inside the parent exits 0 and removes it. Advising the
-            // absolute form here would have handed the operator a command that reports success
-            // and does nothing, which is worse than the branch below.
-            return "`rm -rf` on that absolute path exits 0 and removes nothing, because the "
-                + "path is what is too long. Change directory into its parent and remove the "
-                + "short relative name -- cd into "
-                + "\(quoted((path as NSString).deletingLastPathComponent)) and "
-                + "rm -rf \((path as NSString).lastPathComponent) -- then shorten the state "
-                + "root so the next start does not land here again"
+            // **This branch deliberately prints no command.** Three have now been tried here
+            // and each failed at a different boundary: `rm -rf <absolute>` exits 0 having done
+            // nothing (`rm -f` treats `ENAMETOOLONG` as a missing file), and `cd <absolute>`
+            // works only in a window so narrow it is a coin flip.
+            //
+            // MEASURED on 2026-08-22, descending with short relative names to build the
+            // fixture, `chk.c` calling `lstat` and `chdir` directly:
+            //
+            //   - this branch fires once `<parent>/layers` reaches 1024 bytes, so from
+            //     `strlen(parent) == 1017`;
+            //   - `chdir(2)` succeeds up to `strlen(parent) == 1023` and fails from 1025 --
+            //     seven parent lengths where a `cd` to the absolute path would have worked;
+            //   - and it is shell-dependent above that: at `strlen(parent) == 1421`, `/bin/zsh`
+            //     `cd` SUCCEEDS -- it chunks the `chdir` -- while `/bin/bash` and `/bin/sh`
+            //     both fail with `File name too long`.
+            //
+            // That last line is why round 3's measurement looked like a working remedy: it was
+            // run in zsh. A remedy whose success depends on which shell the operator happens to
+            // be in is not one, and no one-liner exists for an arbitrarily deep path. So this
+            // says what is true and stops there.
+            return "no ordinary tool can name that path at this length -- `rm -rf` on it exits "
+                + "0 without removing anything, and whether `cd` reaches it depends on the "
+                + "shell. Removing it means descending into the tree a component at a time "
+                + "using short relative names. The durable fix is a shorter state root, which "
+                + "is also what stops the next start landing here"
         case ELOOP, ENOTDIR:
             // The offending component can be any prefix component, not the immediate parent:
             // with `/a/notadir/b/layers` the named parent `/a/notadir/b` does not exist at all.

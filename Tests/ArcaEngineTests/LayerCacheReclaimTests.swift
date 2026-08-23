@@ -239,10 +239,20 @@ final class LayerCacheReclaimTests: XCTestCase {
     /// and asserted a path `rename` had already emptied, so it read identically whether the
     /// removal happened or not and stayed green with the reclaim disabled entirely.
     ///
-    /// This test asserts the *unsafe* behaviour on purpose. It exists so that the race note in
-    /// `LayerCacheReclaim` cannot drift back to "the residue is bounded" without a test going
-    /// red, and it will need rewriting rather than deleting if the reclaim ever moves to
-    /// `openat`/`unlinkat`, which is what would actually close this.
+    /// This test asserts the *unsafe* behaviour on purpose, and it is worth being exact about
+    /// what that buys, because an earlier revision of this docstring claimed more than it
+    /// delivers.
+    ///
+    /// **It pins:** that the reclaim, as it stands, removes in full a real directory sitting at
+    /// `<root>/layers`. Mutation-checked -- disabling the reclaim entirely turns this red.
+    ///
+    /// **It does not guard the race note in `LayerCacheReclaim`.** That note is prose, and
+    /// prose can be softened back to "the residue is bounded" without any test noticing. Nor
+    /// would this test object to the fix: moving the reclaim to `openat`/`unlinkat` would
+    /// genuinely bound the race, and this test would still pass, because the swap here happens
+    /// *before* `run` is called rather than inside it. On that day the test wants rewriting to
+    /// drive the new mechanism, not deleting -- but nothing here will prompt that, so this
+    /// paragraph is the prompt.
     func testAPathRenamedOverByARealDirectoryIsRemovedInFull() throws {
         let base = try Self.temporaryRoot()
         let root = base.appendingPathComponent("root")
