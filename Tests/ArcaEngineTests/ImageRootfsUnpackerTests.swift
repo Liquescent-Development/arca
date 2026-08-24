@@ -179,35 +179,36 @@ final class ImageRootfsUnpackerTests: XCTestCase {
     /// The mount this type hands out carries `"ro"`, on BOTH the fresh-unpack and the
     /// cache-hit path.
     ///
-    /// **READ THIS BEFORE CONCLUDING THE SHARED SLOT IS PROTECTED FROM THE HOST. IT IS
-    /// NOT.** An earlier version of this test asserted the flag made the attachment
-    /// read-only. It does not. `LinuxContainer.create()` strips it before the VZ mount
-    /// array is built -- VERIFIED against the pinned object,
-    /// `git show a5803b6:Sources/Containerization/LinuxContainer.swift`. In
-    /// `LinuxContainer.create()`: `var modifiedRootfs = self.rootfs` /
-    /// `modifiedRootfs.options.removeAll(where: { $0 == "ro" })`, and the `containerMounts`
-    /// array built from it goes into `mountsByID`, which is the only thing
-    /// `VZVirtualMachineInstance.Configuration.mountAttachments(allocator:)` turns into a
-    /// storage device. So the
-    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` in
-    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)`
-    /// always gets `false` for the rootfs. Upstream does this on purpose -- see the comment
-    /// directly above `modifiedRootfs`: `EROFS` writing `/etc/hosts`. **The host-side hole
-    /// is open and this test does not close it.**
+    /// **This assertion has meant two different things, and it means the second one now.**
+    /// At `a5803b6`, `LinuxContainer.create()` stripped `"ro"` unconditionally before the VZ
+    /// mount array was built, so the flag asserted here reached no attachment and the shared
+    /// slot was opened read-write for every guest. An earlier version of this comment said so
+    /// at length and ended "**the host-side hole is open and this test does not close it**".
+    /// That is no longer the state.
     ///
-    /// **What it does pin.** `LinuxContainer.generateRuntimeSpec()` reads the UNSTRIPPED
-    /// `self.rootfs` for `spec.root?.readonly = … && self.writableLayer == nil`, so on
-    /// upstream's no-overlay path (the `else` branch of `LinuxContainer.mountRootfs(...)`,
-    /// "No writable layer. Mount rootfs directly.") this option is what makes the OCI
-    /// runtime remount the guest root read-only. That is a real effect on a real supported
-    /// path, it is free, and it is upstream's own stated preference -- so the flag stays
-    /// and this test keeps it from being dropped as decoration.
+    /// `LinuxContainer.create()` now strips only when `writableLayer == nil` and asserts
+    /// `"ro"` otherwise, so on arca's path -- which always passes a writable layer -- the
+    /// slot is attached `VZDiskImageStorageDeviceAttachment(readOnly: true)`.
+    ///
+    /// **What this test pins is therefore NOT the attachment.** `create()` would add `"ro"`
+    /// back if `blockMount(at:)` returned none, so this assertion cannot fail in a way that
+    /// reopens the hole. Two things still make it worth keeping:
+    ///
+    /// - `LinuxContainer.generateRuntimeSpec()` reads the UNSTRIPPED `self.rootfs` for
+    ///   `spec.root?.readonly = … && self.writableLayer == nil`, so on upstream's no-overlay
+    ///   path (the `else` branch of `LinuxContainer.mountRootfs(...)`, "No writable layer.
+    ///   Mount rootfs directly.") this option makes the OCI runtime remount the guest root
+    ///   read-only. arca never takes that branch, but the flag is free and is upstream's own
+    ///   stated preference.
+    /// - It keeps arca's declaration honest: this slot is shared per image and must never be
+    ///   written, and the mount should say so rather than lean on a framework default.
     ///
     /// Both calls are asserted because the two paths build the mount through the same
     /// helper today and need not tomorrow.
     ///
     /// WHAT THIS DOES NOT PROVE: anything about a running guest. Nothing in this target
-    /// starts a VM. That is Task 13/14's 35-layer create-and-run.
+    /// starts a VM. gascan's `warm_cache::concurrent_same_image` is the instrument that can,
+    /// and it is what found the read-write attachment -- by failing on it.
     func testTheRootfsMountCarriesReadOnlyOnBothTheUnpackAndTheCacheHit() async throws {
         let (unpacker, image, _) = try await Self.fixtureThatUnpacksCleanly()
 
