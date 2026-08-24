@@ -4307,17 +4307,19 @@ public actor ContainerManager {
     /// The container's writable upper layer. Created once; reused if the container is
     /// recreated from state, which is why an existing file is a hit and not an error.
     ///
-    /// **Options are empty and must stay empty, and unlike the rootfs this one is not
-    /// stripped.** `LinuxContainer.create()` removes `"ro"` from the rootfs before building
-    /// the VZ mount array (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`) but
-    /// inserts the writable layer verbatim (`containerMounts.insert(writableLayer, at: 1)`),
-    /// so `Mount.readonly` does reach the
-    /// `VZDiskImageStorageDeviceAttachment(readOnly:)` built by
+    /// **Options are empty and must stay empty, and the rootfs's handling is now the exact
+    /// opposite of this one's.** `LinuxContainer.create()` inserts the writable layer
+    /// verbatim (`containerMounts.insert(writableLayer, at: 1)`), so `Mount.readonly` reaches
+    /// the `VZDiskImageStorageDeviceAttachment(readOnly:)` built by
     /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)` for this
-    /// mount.
-    /// A `"ro"` here would attach the overlay's upper layer read-only. The shared per-image
-    /// rootfs is the one that carries the flag -- see `ImageRootfsUnpacker.blockMount(at:)`,
-    /// which also records why it is inert there.
+    /// mount, and a `"ro"` here would attach the overlay's upper layer read-only.
+    ///
+    /// The rootfs goes the other way: because this function supplies a writable layer,
+    /// `create()` ASSERTS `"ro"` on it rather than stripping it, and the shared per-image
+    /// slot is attached read-only. That is what lets two containers from one image exist at
+    /// once. See `ImageRootfsUnpacker.blockMount(at:)`, which records why -- and note that
+    /// this comment used to say the flag was "inert there", which was true at `a5803b6` and
+    /// is not now.
     ///
     /// No `volumeLabel:`, and the reason is that nothing has to search for this device any
     /// more. The fork's host-side mounter passed one -- `createWritableFilesystem` in

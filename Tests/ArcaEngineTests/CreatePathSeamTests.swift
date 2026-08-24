@@ -115,14 +115,16 @@ final class CreatePathSeamTests: XCTestCase {
 
     /// The container's writable layer is created once, reused after, and mounted writable.
     ///
-    /// **`options` must be empty, and unlike the rootfs this mount is not stripped.**
-    /// `LinuxContainer.create()` removes `"ro"` from the rootfs before the VZ mount array is
-    /// built (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`) but inserts the
-    /// writable layer verbatim (`containerMounts.insert(writableLayer, at: 1)`), so
-    /// `Mount.readonly` does reach the
+    /// **`options` must be empty, and the rootfs beside it is now handled the opposite way.**
+    /// `LinuxContainer.create()` inserts the writable layer verbatim
+    /// (`containerMounts.insert(writableLayer, at: 1)`), so `Mount.readonly` reaches the
     /// `VZDiskImageStorageDeviceAttachment(readOnly:)` built by
-    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)` here. A `"ro"`
-    /// on this mount attaches the overlay's upper layer read-only.
+    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)` here, and a
+    /// `"ro"` on this mount attaches the overlay's upper layer read-only.
+    ///
+    /// The rootfs is ASSERTED `"ro"` on this path, not stripped: because a writable layer is
+    /// supplied, `create()` keeps the shared per-image slot read-only so more than one guest
+    /// can attach it. At `a5803b6` it stripped unconditionally, and this comment said so.
     ///
     /// **MEASURED that nothing else catches it:** with the helper's options changed from
     /// `[]` to `["ro"]` and a clean `.build`, `swift test --filter ArcaEngineTests` reported
@@ -172,9 +174,9 @@ final class CreatePathSeamTests: XCTestCase {
         XCTAssertTrue(
             first.mount.options.isEmpty,
             "the writable layer must attach writable -- it is the overlay's upper layer and "
-                + "the guest writes to it. Unlike the rootfs, \"ro\" here is NOT stripped by "
-                + "LinuxContainer.create() and does reach the VZ attachment. Got "
-                + "\(first.mount.options)"
+                + "the guest writes to it. \"ro\" here reaches the VZ attachment verbatim, "
+                + "unlike the rootfs, which create() asserts \"ro\" on so the shared slot "
+                + "stays shareable. Got \(first.mount.options)"
         )
 
         let second = try ContainerManager.writableLayer(at: path, sizeInBytes: 2 * 1024 * 1024)

@@ -369,23 +369,34 @@ public struct ImageRootfsUnpacker: Sendable {
     /// Beyond that, the slot is only ever *created* by a promotion, so a crash at any point
     /// during the unpack leaves the artefact at the staging path and never in the slot.
     ///
-    /// **It is not the only writer to the slot afterwards, and an earlier revision of this
-    /// comment was wrong to say the remaining threat was disk-level corruption.** The slot
-    /// is handed to upstream's `create(_:image:rootfs:writableLayer:...)` as the `rootfs`
-    /// argument, and `LinuxContainer.create()` at `a5803b6` strips `"ro"` from it
-    /// (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`), so
-    /// `Mount.readonly` is false and the device is attached
-    /// `VZDiskImageStorageDeviceAttachment(readOnly: false)`. **Every running guest holds
-    /// the shared slot open read-write at the hypervisor.**
+    /// **The slot used to be writable from every running guest. It is not any more, and two
+    /// earlier revisions of this comment described states that no longer hold.** The slot is
+    /// handed to upstream's `create(_:image:rootfs:writableLayer:...)` as the `rootfs`
+    /// argument. At `a5803b6`, `LinuxContainer.create()` stripped `"ro"` from it
+    /// unconditionally (`modifiedRootfs.options.removeAll(where: { $0 == "ro" })`), so
+    /// `Mount.readonly` was false and the device was attached
+    /// `VZDiskImageStorageDeviceAttachment(readOnly: false)`. Post-promotion corruption was
+    /// therefore reachable from inside a container with block-device access, and this type
+    /// re-verifies nothing on the cache-hit path, so it would have been permanent for that
+    /// digest and silent.
     ///
-    /// What bounds it: `LinuxContainer.mountRootfs` appends `"ro"` to the lower mount
-    /// inside the guest before mounting it, so the ordinary filesystem path in a container
-    /// is read-only. The exposure is at the raw block-device layer only. Post-promotion
-    /// corruption is therefore reachable from inside a container with block-device access,
-    /// and this type re-verifies nothing on the cache-hit path -- so such corruption is
-    /// permanent for that digest and silent.
+    /// **That is closed.** `LinuxContainer.create()` now strips `"ro"` only when
+    /// `writableLayer == nil` and asserts it otherwise, so on arca's path -- which always
+    /// passes a writable layer -- the slot is attached `readOnly: true` and no guest can
+    /// write the block device at all.
     ///
-    /// This is a behaviour change against the pre-revert design, where
+    /// It was not closed for that reason, and the reason matters more than the effect. A
+    /// read-write attachment is **exclusive**: MEASURED, the second container created from
+    /// any one image failed outright with
+    /// `VZErrorDomain Code=2 "The storage device attachment is invalid."`, and attaching the
+    /// slot read-only is what makes it succeed. An exclusive write lock on the backing file
+    /// is the evident mechanism; the error and the fix are what was observed, not the lock.
+    /// Closing the corruption exposure was the fix's second effect.
+    ///
+    /// What bounds the ordinary filesystem path either way: `LinuxContainer.mountRootfs`
+    /// appends `"ro"` to the lower mount inside the guest before mounting it.
+    ///
+    /// The pre-revert design reached the same place differently:
     /// `OverlayFSMounter.buildMounts` attached each shared layer cache file as a
     /// **non-rootfs** mount with `options: ["ro"]`, which upstream did not strip.
     private static func verifyReadable(_ path: URL, expecting capacityInBytes: UInt64) throws {
@@ -417,59 +428,52 @@ public struct ImageRootfsUnpacker: Sendable {
         }
     }
 
-    /// **`"ro"` here does NOT make the attachment read-only, and an earlier version of
-    /// this comment claimed it did.** The option is stripped before the device reaches the
-    /// hypervisor. VERIFIED against the pinned submodule object, not the worktree
-    /// (`git show a5803b6:Sources/Containerization/LinuxContainer.swift`). Symbols rather
-    /// than line numbers below, because the numbers decayed once already across the Task 12
-    /// pointer bump. Inside `LinuxContainer.create()`:
+    /// **`"ro"` here DOES make the attachment read-only now, and this comment has claimed
+    /// both answers before -- read the history, not just the current sentence.**
     ///
-    /// ```
-    /// var modifiedRootfs = self.rootfs
-    /// modifiedRootfs.options.removeAll(where: { $0 == "ro" })
-    /// ...
-    /// var containerMounts = [modifiedRootfs] + fileMountContext.transformedMounts
-    /// ...
-    /// mountsByID: [self.id: containerMounts],
-    /// ```
+    /// At `a5803b6` it did not. `LinuxContainer.create()` stripped the option
+    /// unconditionally, so the STRIPPED copy is what reached `mountsByID` and became a VZ
+    /// storage device, `Mount.readonly` was false whatever this function put in `options`,
+    /// and `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)` opened
+    /// the shared slot read-write for every guest. Upstream stripped it deliberately and says
+    /// why in the comment above `modifiedRootfs`: a rootfs attached `ro` gives `EROFS` when
+    /// it writes `/etc/hosts` and `/etc/resolv.conf`.
     ///
-    /// `mountsByID` is the only thing that becomes a VZ storage device for this path
-    /// (`VZVirtualMachineInstance.Configuration.mountAttachments(allocator:)` is what turns
-    /// it into `AttachedFilesystem`s; MEASURED at `a5803b6`, `grep -rln mountsByID Sources/`
-    /// in the submodule names seven files, and the only two that BUILD the dictionary are
-    /// `LinuxContainer` and `LinuxPod` -- the CH and VZ managers just forward
-    /// `vmConfig.mountsByID` on, and arca does not use `LinuxPod`), and it carries the STRIPPED
-    /// copy. So `Mount.readonly` is false for the rootfs whatever this
-    /// function puts in `options`, and the
-    /// `VZDiskImageStorageDeviceAttachment(readOnly: mount.readonly)` built by
-    /// `VZDiskImageStorageDeviceAttachment.mountToVZAttachment(mount:options:)`
-    /// opens the shared slot read-write for every guest.
+    /// **That reasoning does not apply to a caller with a writable layer, and arca always
+    /// passes one.** `LinuxContainer.mountRootfs` makes the rootfs the overlay's `lowerdir`
+    /// and appends `"ro"` to it itself; `/etc/hosts` and `/etc/resolv.conf` are written
+    /// through the overlay mountpoint, into the upper. `LinuxContainer.create()` now strips
+    /// only when `writableLayer == nil`, and asserts `"ro"` otherwise.
     ///
-    /// Upstream does this deliberately and says why in the comment immediately above
-    /// `modifiedRootfs`: a rootfs attached `ro`
-    /// gives `EROFS` when it writes `/etc/hosts` and `/etc/resolv.conf`, and it prefers to
-    /// have the OCI runtime remount `ro` in the guest instead.
+    /// **So the option this function sets is no longer what decides the attachment** --
+    /// `create()` would add it back if this returned none. It is kept because it is true:
+    /// this slot is shared per image and must never be written. Deleting it is not the
+    /// regression it once would have been, but it would make the declaration disagree with
+    /// the fact.
     ///
-    /// **THE HOST-SIDE HOLE IS OPEN.** Nothing the parent can set on this mount closes it
-    /// at `a5803b6`, and closing it would mean diverging from the upstream this plan is
-    /// converging toward. `chmod 0444` on the slot is not the way round it either: the
-    /// attachment is opened read-write, so a read-only file fails the attach.
+    /// **Why it changed, which is not the reason you would guess.** Not to close the
+    /// corruption exposure -- to make the slot attachable at all by more than one guest. A
+    /// read-write attachment is exclusive, so the second container created from any one
+    /// image failed with `VZErrorDomain Code=2 "The storage device attachment is invalid."`
     ///
-    /// **What the flag does buy, and why it stays.** `LinuxContainer.generateRuntimeSpec()`
+    /// `InitImage.initBlock(at:for:)` is the in-repo precedent for the other half: it sets
+    /// `fs.options = ["ro"]` on the vminitd block file, and one engine's `initfs.ext4` is
+    /// attached by every container it runs. MEASURED rather than assumed --
+    /// gascan's `warm_cache::concurrent_two_images` holds two containers alive at once on one
+    /// engine, both attached to that one file, and it passes. Read-only attachments of a
+    /// single image file are shareable; read-write ones are not.
+    ///
+    /// **What the flag buys on the other branch.** `LinuxContainer.generateRuntimeSpec()`
     /// reads the UNSTRIPPED `self.rootfs`:
     /// `spec.root?.readonly = self.rootfs.options.contains("ro") && self.writableLayer == nil`.
     /// So on a `writableLayer == nil` caller (the `else` branch of
     /// `LinuxContainer.mountRootfs(...)` -- "No writable layer. Mount rootfs directly." --
     /// upstream's supported no-overlay path) the option makes the OCI runtime remount the
-    /// root read-only inside the guest -- which is upstream's own stated preference. It costs
-    /// nothing, and it is behaviour-preserving today: arca always passes a writable layer,
-    /// so `spec.root?.readonly` stays false, and the lower-mount append in the writable-layer
-    /// branch of the same function
-    /// (`if !lowerMount.options.contains("ro") { lowerMount.options.append("ro") }`) was
-    /// already going to add `"ro"` on that branch.
+    /// root read-only inside the guest. arca never takes that branch.
     ///
     /// NOT PROVEN HERE, and not provable in this target: anything about a running guest.
-    /// Nothing here starts a VM. Task 13/14's 35-layer create-and-run is the instrument.
+    /// Nothing here starts a VM. gascan's `warm_cache::concurrent_same_image` is the
+    /// instrument that can see it, and it is the one that found the failure.
     private static func blockMount(at path: URL) -> Containerization.Mount {
         .block(format: "ext4", source: path.path, destination: "/", options: ["ro"])
     }
